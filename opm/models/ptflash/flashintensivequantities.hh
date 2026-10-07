@@ -31,8 +31,13 @@
 #include <dune/common/fmatrix.hh>
 #include <dune/common/fvector.hh>
 
+#include <opm/common/OpmLog/OpmLog.hpp>
+
+#include <opm/input/eclipse/EclipseState/Grid/FaceDir.hpp>
+
 #include <opm/material/Constants.hpp>
 #include <opm/material/common/Valgrind.hpp>
+#include <opm/material/constraintsolvers/PTFlashMethod.hpp>
 #include <opm/material/fluidstates/CompositionalFluidState.hpp>
 
 #include <opm/models/common/energymodule.hh>
@@ -43,8 +48,10 @@
 #include <opm/models/ptflash/flashindices.hh>
 #include <opm/models/ptflash/flashparameters.hh>
 
+#include <fmt/format.h>
+
 #include <array>
-#include <iostream>
+#include <iterator>
 #include <string>
 
 namespace Opm {
@@ -85,6 +92,7 @@ class FlashIntensiveQuantities
     static constexpr bool waterEnabled = Indices::waterEnabled;
 
     using Scalar = GetPropType<TypeTag, Properties::Scalar>;
+
     using Evaluation = GetPropType<TypeTag, Properties::Evaluation>;
     using FluidSystem = GetPropType<TypeTag, Properties::FluidSystem>;
     using FlashSolver = GetPropType<TypeTag, Properties::FlashSolver>;
@@ -99,6 +107,15 @@ class FlashIntensiveQuantities
 public:
     //! The type of the object returned by the fluidState() method
     using FluidState = CompositionalFluidState<Evaluation, FluidSystem, enableEnergy>;
+
+    /// Minimum overall mole fraction of a component; the flash needs every
+    /// component present.
+    static constexpr Scalar compositionFloor = 1.0e-8;
+
+    /// Minimum hydrocarbon share of the pore space, including cells that would
+    /// otherwise hold water alone. Component-storage derivatives scale with this
+    /// share, so it cannot vanish. The value matches the composition floor.
+    static constexpr Scalar hydrocarbonFloor = compositionFloor;
 
     FlashIntensiveQuantities() = default;
 
@@ -119,11 +136,9 @@ public:
 
         const Scalar flashTolerance = Parameters::Get<Parameters::FlashTolerance<Scalar>>();
         const int flashVerbosity = Parameters::Get<Parameters::FlashVerbosity>();
-        const std::string flashTwoPhaseMethod = Parameters::Get<Parameters::FlashTwoPhaseMethod>();
-        // TODO: the formulation here is still to begin with XMF and YMF values to derive ZMF value
-        // TODO: we should check how we update ZMF in the newton update, since it is the primary variables.
-
-        // extract the total molar densities of the components
+        const auto ptFlashMethod =
+            ptFlashMethodFromString(Parameters::Get<Parameters::FlashTwoPhaseMethod>());
+        // Extract the overall component mole fractions; the last fraction is dependent.
         ComponentVector z(0.);
         {
             Evaluation lastZ = 1.0;
@@ -135,7 +150,13 @@ public:
 
             Evaluation sumz = 0.0;
             for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                z[compIdx] = max(z[compIdx], 1e-8);
+                // Clamp only the value; preserve derivatives. Replacing the Evaluation with
+                // max() when the bound applies removes composition derivatives from a
+                // vanished component's conservation equation and makes the cell Jacobian
+                // block singular.
+                if (z[compIdx] < compositionFloor) {
+                    z[compIdx].setValue(compositionFloor);
+                }
                 sumz += z[compIdx];
             }
             z /= sumz;
@@ -183,45 +204,32 @@ public:
         // Compute the phase compositions and densities
         /////////////
         if (flashVerbosity >= 1) {
-            const int spatialIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
-            std::cout << " updating the intensive quantities for Cell " << spatialIdx << std::endl;
+            OpmLog::debug(fmt::format("Updating the intensive quantities for cell {}",
+                                      elemCtx.globalSpaceIndex(dofIdx, timeIdx)));
         }
         const auto& eos_type = problem.getEosType();
-        FlashSolver::solve(fluidState_, flashTwoPhaseMethod, flashTolerance, eos_type, flashVerbosity);
+        FlashSolver::solve(fluidState_, ptFlashMethod, flashTolerance, eos_type, flashVerbosity);
 
         if (flashVerbosity >= 5) {
-            // printing of flash result after solve
-            const int spatialIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
-            std::cout << " \n After flash solve for cell " << spatialIdx << std::endl;
-            ComponentVector x, y;
-            for (unsigned comp_idx = 0; comp_idx < numComponents; ++comp_idx) {
-                x[comp_idx] = fluidState_.moleFraction(FluidSystem::oilPhaseIdx, comp_idx);
-                y[comp_idx] = fluidState_.moleFraction(FluidSystem::gasPhaseIdx, comp_idx);
+            std::string phaseCompositions;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                fmt::format_to(
+                    std::back_inserter(phaseCompositions),
+                    "  component {}: x = {}, y = {}\n",
+                    compIdx,
+                    getValue(fluidState_.moleFraction(FluidSystem::oilPhaseIdx, compIdx)),
+                    getValue(fluidState_.moleFraction(FluidSystem::gasPhaseIdx, compIdx)));
             }
-            for (unsigned comp_idx = 0; comp_idx < numComponents; ++comp_idx) {
-                std::cout << " x for component: " << comp_idx << " is:" << std::endl;
-                std::cout << x[comp_idx] << std::endl;
-
-                std::cout << " y for component: " << comp_idx << "is:" << std::endl;
-                std::cout << y[comp_idx] << std::endl;
-            }
-            const Evaluation& L = fluidState_.L();
-            std::cout << " L is:" << std::endl;
-            std::cout << L << std::endl;
+            OpmLog::debug(fmt::format("After the flash for cell {}: liquid fraction = {}\n{}",
+                                      elemCtx.globalSpaceIndex(dofIdx, timeIdx),
+                                      getValue(fluidState_.L()),
+                                      phaseCompositions));
         }
 
         // Update phases
         typename FluidSystem::template ParameterCache<Evaluation> paramCache(eos_type);
         paramCache.updatePhase(fluidState_, FluidSystem::oilPhaseIdx);
-
-        const Scalar R = Opm::Constants<Scalar>::R;
-        const Evaluation Z_L = (paramCache.molarVolume(FluidSystem::oilPhaseIdx) *
-                                fluidState_.pressure(FluidSystem::oilPhaseIdx)) /
-                               (R * fluidState_.temperature(FluidSystem::oilPhaseIdx));
         paramCache.updatePhase(fluidState_, FluidSystem::gasPhaseIdx);
-        const Evaluation Z_V = (paramCache.molarVolume(FluidSystem::gasPhaseIdx) *
-                                fluidState_.pressure(FluidSystem::gasPhaseIdx)) /
-                               (R * fluidState_.temperature(FluidSystem::gasPhaseIdx));
 
         // Update saturation
         Evaluation Sw = 0.0;
@@ -229,8 +237,25 @@ public:
             Sw = priVars.makeEvaluation(water0Idx, timeIdx);
         }
         const Evaluation L = fluidState_.L();
-        Evaluation So = max((1 - Sw) * (L * Z_L / ( L * Z_L + (1 - L) * Z_V)), 0.0);
-        Evaluation Sg = max(1 - So - Sw, 0.0);
+        const Evaluation Vm_L = paramCache.correctedMolarVolume(FluidSystem::oilPhaseIdx);
+        const Evaluation Vm_V = paramCache.correctedMolarVolume(FluidSystem::gasPhaseIdx);
+
+        // Every component storage term is proportional to the pore-space share
+        // occupied by hydrocarbons. If a cell holds only water, a zero share
+        // removes the composition from the residual: the component equations
+        // then depend on no composition variable, and the cell's diagonal
+        // Jacobian block is singular. Every equilibrated cell below the
+        // water-oil contact starts in that state. Floor the value while retaining
+        // its derivatives, as for the composition above.
+        Evaluation hydrocarbon = 1 - Sw;
+        // Remember physical presence before regularization. A positive share,
+        // even below the floor, still represents hydrocarbon in the cell.
+        hasHydrocarbon_ = getValue(hydrocarbon) > Scalar{0};
+        if (hydrocarbon < hydrocarbonFloor) {
+            hydrocarbon.setValue(hydrocarbonFloor);
+        }
+        Evaluation So = max(hydrocarbon * (L * Vm_L / ( L * Vm_L + (1 - L) * Vm_V)), 0.0);
+        Evaluation Sg = max(hydrocarbon - So, 0.0);
         const Scalar sumS = getValue(So) + getValue(Sg) + getValue(Sw);
         So /= sumS;
         Sg /= sumS;
@@ -242,16 +267,28 @@ public:
             fluidState_.setSaturation(FluidSystem::waterPhaseIdx, Sw);
         }
 
+        // The compressibility factor comes from the unshifted EOS root, unlike
+        // the saturations above.
+        const Scalar R = Opm::Constants<Scalar>::R;
+        const Evaluation Z_L = (paramCache.molarVolume(FluidSystem::oilPhaseIdx) *
+                                fluidState_.pressure(FluidSystem::oilPhaseIdx)) /
+                               (R * fluidState_.temperature(FluidSystem::oilPhaseIdx));
+        const Evaluation Z_V = (paramCache.molarVolume(FluidSystem::gasPhaseIdx) *
+                                fluidState_.pressure(FluidSystem::gasPhaseIdx)) /
+                               (R * fluidState_.temperature(FluidSystem::gasPhaseIdx));
         fluidState_.setCompressFactor(FluidSystem::oilPhaseIdx, Z_L);
         fluidState_.setCompressFactor(FluidSystem::gasPhaseIdx, Z_V);
 
-        // Print saturation
         if (flashVerbosity >= 5) {
-             std::cout << "So = " << So << std::endl;
-             std::cout << "Sg = " << Sg << std::endl;
-             std::cout << "Z_L = " << Z_L << std::endl;
-             std::cout << "Z_V = " << Z_V << std::endl;
-         }
+            OpmLog::debug(fmt::format("Flash phase properties for cell {}: "
+                                      "oil saturation = {}, gas saturation = {}, "
+                                      "oil molar volume = {}, gas molar volume = {}",
+                                      elemCtx.globalSpaceIndex(dofIdx, timeIdx),
+                                      getValue(So),
+                                      getValue(Sg),
+                                      getValue(Vm_L),
+                                      getValue(Vm_V)));
+        }
 
         /////////////
         // Compute rel. perm and viscosity and densities
@@ -309,6 +346,28 @@ public:
     const FluidState& fluidState() const
     { return fluidState_; }
 
+    /// Whether the primary variables leave any pore space for hydrocarbons,
+    /// before the numerical floor is applied. Recomputed on every update.
+    bool hasHydrocarbon() const
+    { return hasHydrocarbon_; }
+
+    /// Saturation for reporting. The solver keeps the regularized saturations
+    /// in fluidState(); a cell with no hydrocarbon reports water alone.
+    Scalar saturationForOutput(unsigned phaseIdx) const
+    {
+        if (!FluidSystem::phaseIsActive(phaseIdx)) {
+            return Scalar{0};
+        }
+        if (!hasHydrocarbon_) {
+            return phaseIdx == FluidSystem::waterPhaseIdx ? Scalar{1} : Scalar{0};
+        }
+        return getValue(fluidState_.saturation(phaseIdx));
+    }
+
+    /// Presence for reporting, independent of the numerical hydrocarbon floor.
+    bool phaseIsPresent(unsigned phaseIdx) const
+    { return saturationForOutput(phaseIdx) > Scalar{0}; }
+
     /*!
      * \copydoc ImmiscibleIntensiveQuantities::intrinsicPermeability
      */
@@ -328,12 +387,27 @@ public:
     { return mobility_[phaseIdx]; }
 
     /*!
+     * \brief Mobility across a face. Directional relative permeabilities are
+     *        not supported, so the face direction is not used.
+     */
+    const Evaluation& mobility(unsigned phaseIdx, FaceDir::DirEnum) const
+    { return mobility_[phaseIdx]; }
+
+    /*!
+     * \brief Transmissibility multiplier from rock compaction. Compositional runs
+     *        reject ROCKCOMP, so it is one.
+     */
+    Scalar rockCompTransMultiplier() const
+    { return 1.0; }
+
+    /*!
      * \copydoc ImmiscibleIntensiveQuantities::porosity
      */
     const Evaluation& porosity() const
     { return porosity_; }
 
 private:
+    bool hasHydrocarbon_{true};
     DimMatrix intrinsicPerm_;
     FluidState fluidState_;
     Evaluation porosity_;

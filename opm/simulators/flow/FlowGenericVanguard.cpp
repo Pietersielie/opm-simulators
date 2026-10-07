@@ -68,6 +68,7 @@
 #include <opm/input/eclipse/Schedule/UDQ/UDQState.hpp>
 #include <opm/input/eclipse/Schedule/Well/NameOrder.hpp>
 #include <opm/input/eclipse/Schedule/Well/WDFAC.hpp>
+#include <opm/input/eclipse/Schedule/Well/WELDRAW.hpp>
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellBrineProperties.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellConnections.hpp>
@@ -317,21 +318,14 @@ void FlowGenericVanguard::init()
 
         // compute the base name of the input file name
         const char directorySeparator = '/';
-        long int i;
-        for (i = fileName_.size(); i >= 0; -- i)
-            if (fileName_[i] == directorySeparator)
-                break;
-        std::string baseName = fileName_.substr(i + 1, fileName_.size());
+        const auto sepPos = fileName_.find_last_of(directorySeparator);
+        const auto baseName = sepPos != std::string::npos
+            ? fileName_.substr(sepPos + 1, fileName_.size())
+            : fileName_;
 
         // remove the extension from the input file
-        for (i = baseName.size(); i >= 0; -- i)
-            if (baseName[i] == '.')
-                break;
-        std::string rawCaseName;
-        if (i < 0)
-            rawCaseName = baseName;
-        else
-            rawCaseName = baseName.substr(0, i);
+        const auto dotPos = baseName.find_last_of('.');
+        const auto rawCaseName = dotPos == std::string::npos ? baseName : baseName.substr(0, dotPos);
 
         // transform the result to ALL_UPPERCASE
         caseName_ = rawCaseName;
@@ -358,43 +352,36 @@ void FlowGenericVanguard::init()
     }
 
     // Initialize parallelWells with all local wells
-    const auto& schedule_wells = schedule().getWellsatEnd();
-    parallelWells_.reserve(schedule_wells.size());
+    this->parallelWells_.reserve(this->schedule().back().well_order().size());
 
-    for (const auto& well: schedule_wells)
-    {
-        parallelWells_.emplace_back(well.name(), true);
+    for (const auto& wellName : this->schedule().back().well_order()) {
+        this->parallelWells_.emplace_back(wellName, true);
     }
-    std::ranges::sort(parallelWells_);
+    std::ranges::sort(this->parallelWells_);
 
     // Check whether allowing distribute wells makes sense
-    if (enableDistributedWells() )
-    {
-        int hasMsWell = false;
+    if (this->enableDistributedWells()) {
         const auto& comm = FlowGenericVanguard::comm();
 
-        if (useMultisegmentWell_)
-        {
-            if (comm.rank() == 0)
-            {
-                const auto& wells = this->schedule().getWellsatEnd();
-                hasMsWell = std::ranges::any_of(wells,
-                                                [](const auto& well)
-                                                { return well.isMultiSegment(); });
-            }
+        int hasMsWell = 0;
+        if (this->useMultisegmentWell_ && (comm.rank() == 0)) {
+            const auto& sched = this->schedule().back();
+
+            hasMsWell = std::ranges::any_of
+                (sched.well_order(),
+                 [&sched](const auto& wellName)
+                 { return sched.wells(wellName).isMultiSegment(); })
+                ? 1 : 0;
         }
 
-        hasMsWell = comm.max(hasMsWell);
-
-        if (hasMsWell)
-        {
-            if (comm.rank() == 0)
-            {
+        if (comm.max(hasMsWell) != 0) {
+            if (comm.rank() == 0) {
                 OpmLog::info("Option --allow-distributed-wells=true in a model with\n"
                              "multisegment wells. This feature is still experimental. You can\n"
                              "set --use-multisegment-well=false to treat the existing\n"
                              "multisegment wells as standard wells.");
             }
+
             comm.barrier();
         }
     }
@@ -474,9 +461,9 @@ void FlowGenericVanguard::registerParameters_()
          "low (try to apply all keywords, beware: the simulation outcome might be incorrect).");
     Parameters::Register<Parameters::InputSkipMode>
         ("Set compatibility mode for the SKIP100/SKIP300 keywords. Options are "
-         "100 (skip SKIP100..ENDSKIP, keep SKIP300..ENDSKIP) [default], "
+         "100 (skip SKIP100..ENDSKIP, keep SKIP300..ENDSKIP), "
          "300 (skip SKIP300..ENDSKIP, keep SKIP100..ENDSKIP) and "
-         "all (skip both SKIP100..ENDSKIP and SKIP300..ENDSKIP) ");
+         "all (skip both SKIP100..ENDSKIP and SKIP300..ENDSKIP).");
     Parameters::Register<Parameters::SchedRestart>
         ("When restarting: should we try to initialize wells and "
          "groups from historical SCHEDULE section.");
@@ -544,6 +531,10 @@ void FlowGenericVanguard::registerParameters_()
     // register here for the use in the tests without BlackoilModelParameters
     Parameters::Register<Parameters::UseMultisegmentWell>
         ("Use the well model for multi-segment wells instead of the one for single-segment wells");
+    Parameters::Register<Parameters::ConvertToMultisegmentWell>
+        ("Convert plain single-segment wells into multisegment wells so the "
+         "wellbore hydrostatic head is handled implicitly. 'none' (default) "
+         "or 'per-connection' (one linear tubing, a segment per connection)");
 }
 
 template void FlowGenericVanguard::registerParameters_<double>();

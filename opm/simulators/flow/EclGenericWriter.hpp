@@ -33,9 +33,11 @@
 #include <opm/output/data/Groups.hpp>
 
 #include <opm/simulators/flow/CollectDataOnIORank.hpp>
+#include <opm/simulators/flow/LgrOutputTransGather.hpp>
 #include <opm/simulators/flow/Transmissibility.hpp>
 #include <opm/simulators/timestepping/SimulatorReport.hpp>
 
+#include <array>
 #include <map>
 #include <memory>
 #include <optional>
@@ -51,6 +53,7 @@ class InterRegFlowMap;
 class Inplace;
 template <class Grid> class LevelCartesianIndexMapper;
 struct NNCdata;
+class RegionVariableCollection;
 class Schedule;
 class SummaryConfig;
 class SummaryState;
@@ -58,9 +61,13 @@ class UDQState;
 
 } // namespace Opm
 
-namespace Opm { namespace Action {
+namespace Opm::Action {
 class State;
-}} // namespace Opm::Action
+} // namespace Opm::Action
+
+namespace Opm::data {
+class RegionVariableMapping;
+} // namespace Opm::data
 
 namespace Opm {
 
@@ -93,6 +100,15 @@ public:
         globalTrans_ = globalTrans;
     }
 
+    // Parallel LGR INIT output: connection transmissibilities gathered from the
+    // ranks' own (distributed) simulator transmissibilities. When set,
+    // computeTrans_ / exportNncStructure_ take values from these instead of
+    // querying a whole-grid transmissibility object. Complete on the I/O rank only.
+    void setGatheredLgrTrans(std::optional<GatheredLgrOutputTrans> gatheredTrans)
+    {
+        gatheredLgrTrans_ = std::move(gatheredTrans);
+    }
+
     void setSubStepReport(const SimulatorReportSingle& report)
     {
         sub_step_report_ = report;
@@ -117,6 +133,21 @@ public:
 protected:
     const TransmissibilityType& globalTrans() const;
     unsigned int gridEquilIdxToGridIdx(unsigned int elemIndex) const;
+
+    // Value for `key` from the gathered records, or nullptr when the key is
+    // absent or no gathered records are set. N = 3 selects the same-level
+    // records, N = 4 the level-crossing (NNC) ones -- see GatheredLgrOutputTrans.
+    template <std::size_t N>
+    const double* findGatheredTrans_(const std::array<int,N>& key) const;
+
+    // Output transmissibility value for a connection: from the gathered per-rank
+    // simulator transmissibilities when set (parallel LGR runs; a missing key is
+    // a hard error), otherwise from the whole-grid transmissibility object
+    // (c1, c2). Key shape as in findGatheredTrans_.
+    template <std::size_t N>
+    double gatheredOrGlobalTrans_(const std::array<int,N>& key,
+                                  unsigned c1,
+                                  unsigned c2) const;
 
     void doWriteOutput(const int                          reportStepNum,
                        const std::optional<int>           timeStepNum,
@@ -146,8 +177,11 @@ protected:
                      const data::GroupAndNetworkValues&                   localGroupAndNetworkData,
                      const std::map<int,data::AquiferData>&               localAquiferData,
                      const std::map<std::pair<std::string, int>, double>& blockData,
+                     const std::map<std::tuple<std::string, int, int>, double>& lgrBlockData,
                      const std::map<std::string, double>&                 miscSummaryData,
                      const std::map<std::string, std::vector<double>>&    regionData,
+                     const data::RegionVariableMapping&                   regVarMap,
+                     const RegionVariableCollection&                      regVars,
                      const Inplace&                                       inplace,
                      const Inplace*                                       initialInPlace,
                      const InterRegFlowMap&                               interRegFlows,
@@ -164,6 +198,7 @@ protected:
     std::unique_ptr<TaskletRunner> taskletRunner_;
     Scalar restartTimeStepSize_;
     const TransmissibilityType* globalTrans_ = nullptr;
+    std::optional<GatheredLgrOutputTrans> gatheredLgrTrans_;
     const Dune::CartesianIndexMapper<Grid>& cartMapper_;
     const Dune::CartesianIndexMapper<EquilGrid>* equilCartMapper_;
     const EquilGrid* equilGrid_;

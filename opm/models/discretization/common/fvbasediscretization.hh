@@ -38,13 +38,11 @@
 #include <opm/material/densead/Math.hpp>
 
 #include <opm/models/discretization/common/baseauxiliarymodule.hh>
-#include <opm/models/discretization/common/fvbaseadlocallinearizer.hh>
 #include <opm/models/discretization/common/fvbaseboundarycontext.hh>
 #include <opm/models/discretization/common/fvbaseconstraints.hh>
 #include <opm/models/discretization/common/fvbaseconstraintscontext.hh>
 #include <opm/models/discretization/common/fvbaseelementcontext.hh>
 #include <opm/models/discretization/common/fvbaseextensivequantities.hh>
-#include <opm/models/discretization/common/fvbasefdlocallinearizer.hh>
 #include <opm/models/discretization/common/fvbasegradientcalculator.hh>
 #include <opm/models/discretization/common/fvbaseintensivequantities.hh>
 #include <opm/models/discretization/common/fvbaselinearizer.hh>
@@ -69,8 +67,10 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <exception>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <sstream>
 #include <string>
@@ -728,49 +728,86 @@ public:
     {
         invalidateIntensiveQuantitiesCache(timeIdx);
 
+        // exceptions must not escape the parallel block below (that calls
+        // std::terminate()); tuck any exception away and rethrow it after the
+        // block, so that e.g. a failed flash in the property evaluation leads
+        // to a time step chop instead of an abort
+        std::mutex exceptionLock;
+        std::exception_ptr exceptionPtr = nullptr;
+
         // loop over all elements...
         ThreadedEntityIterator<GridView, /*codim=*/0> threadedElemIt(gridView_);
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
         {
-            ElementContext elemCtx(simulator_);
-            ElementIterator elemIt = threadedElemIt.beginParallel();
-            for (; !threadedElemIt.isFinished(elemIt); elemIt = threadedElemIt.increment()) {
-                const Element& elem = *elemIt;
-                elemCtx.updatePrimaryStencil(elem);
-                elemCtx.updatePrimaryIntensiveQuantities(timeIdx);
+            try {
+                ElementContext elemCtx(simulator_);
+                for (ElementIterator elemIt = threadedElemIt.beginParallel();
+                     !threadedElemIt.isFinished(elemIt);
+                     elemIt = threadedElemIt.increment())
+                {
+                    const Element& elem = *elemIt;
+                    elemCtx.updatePrimaryStencil(elem);
+                    elemCtx.updatePrimaryIntensiveQuantities(timeIdx);
+                }
             }
+            catch (...) {
+                std::lock_guard<std::mutex> take(exceptionLock);
+                exceptionPtr = std::current_exception();
+                threadedElemIt.setFinished();
+            }
+        }
+
+        if (exceptionPtr) {
+            std::rethrow_exception(exceptionPtr);
         }
     }
 
     template <class GridViewType>
     void invalidateAndUpdateIntensiveQuantities(unsigned timeIdx, const GridViewType& gridView) const
     {
+        // see the overload above for why exceptions are bridged out of the
+        // parallel block like this
+        std::mutex exceptionLock;
+        std::exception_ptr exceptionPtr = nullptr;
+
         // loop over all elements...
         ThreadedEntityIterator<GridViewType, /*codim=*/0> threadedElemIt(gridView);
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
         {
-
-            ElementContext elemCtx(simulator_);
-            auto elemIt = threadedElemIt.beginParallel();
-            for (; !threadedElemIt.isFinished(elemIt); elemIt = threadedElemIt.increment()) {
-                if (elemIt->partitionType() != Dune::InteriorEntity) {
-                    continue;
+            try {
+                ElementContext elemCtx(simulator_);
+                for (auto elemIt = threadedElemIt.beginParallel();
+                     !threadedElemIt.isFinished(elemIt);
+                     elemIt = threadedElemIt.increment())
+                {
+                    if (elemIt->partitionType() != Dune::InteriorEntity) {
+                        continue;
+                    }
+                    const Element& elem = *elemIt;
+                    elemCtx.updatePrimaryStencil(elem);
+                    // Mark cache for this element as invalid.
+                    const std::size_t numPrimaryDof = elemCtx.numPrimaryDof(timeIdx);
+                    for (unsigned dofIdx = 0; dofIdx < numPrimaryDof; ++dofIdx) {
+                        const unsigned globalIndex = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
+                        setIntensiveQuantitiesCacheEntryValidity(globalIndex, timeIdx, false);
+                    }
+                    // Update for this element.
+                    elemCtx.updatePrimaryIntensiveQuantities(timeIdx);
                 }
-                const Element& elem = *elemIt;
-                elemCtx.updatePrimaryStencil(elem);
-                // Mark cache for this element as invalid.
-                const std::size_t numPrimaryDof = elemCtx.numPrimaryDof(timeIdx);
-                for (unsigned dofIdx = 0; dofIdx < numPrimaryDof; ++dofIdx) {
-                    const unsigned globalIndex = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
-                    setIntensiveQuantitiesCacheEntryValidity(globalIndex, timeIdx, false);
-                }
-                // Update for this element.
-                elemCtx.updatePrimaryIntensiveQuantities(timeIdx);
             }
+            catch (...) {
+                std::lock_guard<std::mutex> take(exceptionLock);
+                exceptionPtr = std::current_exception();
+                threadedElemIt.setFinished();
+            }
+        }
+
+        if (exceptionPtr) {
+            std::rethrow_exception(exceptionPtr);
         }
     }
 
@@ -1024,48 +1061,63 @@ public:
         storage = 0;
 
         std::mutex mutex;
-        ThreadedEntityIterator<GridView, /*codim=*/0> threadedElemIt(gridView());
+        forEachStorageTerm(timeIdx, [&storage, &mutex](const auto&, const EqVector& value) {
+            std::lock_guard lock(mutex);
+            storage += value;
+        });
+
+        storage = gridView_.comm().sum(storage);
+    }
+
+    void rebuildStorageCache(const unsigned timeIdx) const
+    {
+        if (!enableStorageCache() || timeIdx >= historySize) {
+            return;
+        }
+
+        forEachStorageTerm(timeIdx, [this, timeIdx](const auto& globalDofIdx, const EqVector& value) {
+            updateCachedStorage(globalDofIdx, timeIdx, value);
+        });
+    }
+
+private:
+    template<class Callback>
+    void forEachStorageTerm(const unsigned timeIdx, Callback&& callback) const
+    {
+        ThreadedEntityIterator<GridView, /*codim=*/0> threadedElemIt(gridView_);
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
         {
-            // Attention: the variables below are thread specific and thus cannot be
-            // moved in front of the #pragma!
             const unsigned threadId = ThreadManager::threadId();
             ElementContext elemCtx(simulator_);
-            ElementIterator elemIt = threadedElemIt.beginParallel();
             LocalEvalBlockVector elemStorage;
-
-            // in this method, we need to disable the storage cache because we want to
-            // evaluate the storage term for other time indices than the most recent one
             elemCtx.setEnableStorageCache(false);
-
+            auto elemIt = threadedElemIt.beginParallel();
             for (; !threadedElemIt.isFinished(elemIt); elemIt = threadedElemIt.increment()) {
-                const Element& elem = *elemIt;
+                const auto& elem = *elemIt;
                 if (elem.partitionType() != Dune::InteriorEntity) {
-                    continue; // ignore ghost and overlap elements
+                    continue;
                 }
 
                 elemCtx.updateStencil(elem);
                 elemCtx.updatePrimaryIntensiveQuantities(timeIdx);
-
                 const std::size_t numPrimaryDof = elemCtx.numPrimaryDof(timeIdx);
                 elemStorage.resize(numPrimaryDof);
-
                 localResidual(threadId).evalStorage(elemStorage, elemCtx, timeIdx);
 
-                mutex.lock();
-                for (unsigned dofIdx = 0; dofIdx < numPrimaryDof; ++dofIdx) {
+                for (std::size_t dofIdx = 0; dofIdx < numPrimaryDof; ++dofIdx) {
+                    EqVector storage(0.0);
                     for (unsigned eqIdx = 0; eqIdx < numEq; ++eqIdx) {
-                        storage[eqIdx] += Toolbox::value(elemStorage[dofIdx][eqIdx]);
+                        storage[eqIdx] = Toolbox::value(elemStorage[dofIdx][eqIdx]);
                     }
+                    callback(elemCtx.globalSpaceIndex(dofIdx, timeIdx), storage);
                 }
-                mutex.unlock();
             }
         }
-
-        storage = gridView_.comm().sum(storage);
     }
+
+public:
 
     /*!
      * \brief Ensure that the difference between the storage terms of the last and of the

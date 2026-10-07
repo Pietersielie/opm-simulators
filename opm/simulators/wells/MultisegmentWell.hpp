@@ -24,8 +24,12 @@
 
 #include <opm/models/common/multiphasebaseproperties.hh>
 
+#include <opm/common/Exceptions.hpp>
 #include <opm/simulators/wells/WellInterface.hpp>
 #include <opm/simulators/wells/MultisegmentWellEval.hpp>
+
+#include <limits>
+#include <string_view>
 
 namespace Opm {
 
@@ -56,11 +60,29 @@ namespace Opm {
 
         using Base::has_solvent;
         using Base::has_polymer;
+        using Base::has_energy;
+        using Base::has_brine;
         using Base::Water;
         using Base::Oil;
         using Base::Gas;
 
         using typename Base::Scalar;
+
+        // True when the composition switch primary variable is active, i.e. both oil and
+        // gas phases are present so that Rs/Rv are stored in the fluid state. Matches the
+        // fluid state's enableDissolution flag (see WellInterface::BlackOilFluidStateType).
+        static constexpr bool compositionSwitchEnabled =
+            Indices::compositionSwitchIdx != std::numeric_limits<unsigned>::max();
+
+        // True when the segment fluid state stores a temperature. This includes thermal modes
+        // without a fully implicit energy equation.
+        static constexpr bool enable_temperature =
+            Base::energyModuleType != EnergyModules::NoTemperature;
+
+        // Scales the well-side energy equation onto the mass-balance residual
+        // scale. Reuses the reservoir energy factor so both live on the same scale.
+        static constexpr Scalar energy_scaling_factor_ =
+            getPropValue<TypeTag, Properties::BlackOilEnergyScalingFactor>();
 
         /// the matrix and vector types for the reservoir
         using typename Base::BVector;
@@ -71,7 +93,23 @@ namespace Opm {
         using typename MSWEval::BVectorWell;
         using MSWEval::SPres;
         using typename Base::PressureMatrix;
-        using FSInfo = std::tuple<Scalar, Scalar>;
+        using FSInfo = typename Base::FSInfo;
+
+        using BMatrix = typename Base::BMatrix;
+        using CMatrix = typename Base::CMatrix;
+        using DMatrix = typename Base::DMatrix;
+        using WVector = typename Base::WVector;
+
+        // a fluid state to calculate the properties inside the wellbore for each segment
+        // it will be probably used for more things, but at the moment, it is for the enthalpy
+        // calculation in the wellbore.
+        template <typename ValueType>
+        using SegmentFluidState = Base::template BlackOilFluidStateType<ValueType>;
+
+        // The segment fluid state type depends on the TypeTag, which MultisegmentWellSegments
+        // does not have. Extract the values it needs so its property calculations can stay in
+        // the .cpp file.
+        using SegmentPvt = typename MultisegmentWellSegments<FluidSystem, Indices>::SegmentPvt;
 
         MultisegmentWell(const Well& well,
                          const ParallelWellInfo<Scalar>& pw_info,
@@ -163,6 +201,21 @@ namespace Opm {
         std::vector<Scalar> getPrimaryVars() const override;
 
         int setPrimaryVars(typename std::vector<Scalar>::const_iterator it) override;
+        void addBCDMatrix(std::vector<typename Base::BMatrix>& b_matrices,
+                          std::vector<typename Base::CMatrix>& c_matrices,
+                          std::vector<typename Base::DMatrix>& d_matrices,
+                          Opm::SparseTable<int>& wcells) const override
+        {
+            // System_cpr preconditioner is only supported when well DOF dimensions
+            // match between WellInterface and MultisegmentWellEval (standard 3-phase blackoil).
+            if constexpr (Base::numWellDofs == MSWEval::numWellDofs) {
+                MSWEval::addBCDMatrix(b_matrices, c_matrices, d_matrices, wcells);
+            } else {
+                OPM_THROW(std::runtime_error,
+                          "system_cpr preconditioner with multisegment wells is only supported for standard "
+                          "3-phase blackoil (Indices::numEq == 3). This model has different equation count.");
+            }
+        }
 
         void getScaledWellFractions(std::vector<Scalar>& scaled_fractions,
                                     DeferredLogger& deferred_logger) const override;
@@ -171,8 +224,22 @@ namespace Opm {
         // regularize msw equation
         bool regularize_;
 
-        // the intial amount of fluids in each segment under surface condition
+        // the initial amount of fluids in each segment under surface condition
         std::vector<std::vector<Scalar> > segment_fluid_initial_;
+        // total energy inside the segments at the beginning of the time step
+        std::vector<Scalar> segment_initial_energy_;
+
+        // segment fluid state
+        std::vector<SegmentFluidState<EvalWell>> segment_fluid_state_;
+
+        // the values MultisegmentWellSegments needs from the segment fluid states, refilled
+        // from segment_fluid_state_ before the segment properties are computed
+        std::vector<SegmentPvt> segment_pvt_;
+
+        // fluid state under the wellhead condition, it is used to calculate the enthalpy
+        // under operation condition for energy injection
+        // because BHP will be involved, we use EvalWell type here
+        SegmentFluidState<EvalWell> wellhead_fluid_state_;
 
         mutable int debug_cost_counter_ = 0;
 
@@ -183,8 +250,9 @@ namespace Opm {
                              WellStateType& well_state,
                              const Scalar relaxation_factor = 1.0);
 
-        // computing the accumulation term for later use in well mass equations
-        void computeInitialSegmentFluids(const Simulator& simulator, DeferredLogger& deferred_logger);
+        // Compute the initial segment inventory for well equations. Requires an up-to-date
+        // segment fluid state (see updateSegmentFluidState()).
+        void computeInitialSegmentInventory(DeferredLogger& deferred_logger);
 
         // compute the pressure difference between the perforation and cell center
         void computePerfCellPressDiffs(const Simulator& simulator);
@@ -289,9 +357,9 @@ namespace Opm {
 
         void updateWaterThroughput(const double dt, WellStateType& well_state) const override;
 
-        EvalWell getSegmentSurfaceVolume(const Simulator& simulator,
-                                         const int seg_idx,
-                                         DeferredLogger& deferred_logger) const;
+        // Compute segment surface volume from the given volume ratio.
+        EvalWell getSegmentSurfaceVolume(const int seg_idx,
+                                         const EvalWell& volume_ratio) const;
 
         // turn on crossflow to avoid singular well equations
         // when the well is banned from cross-flow and the BHP is not properly initialized,
@@ -331,10 +399,64 @@ namespace Opm {
         void updateIPR(const Simulator& ebos_simulator,
                        DeferredLogger& deferred_logger) const override;
 
-        FSInfo getFirstPerforationFluidStateInfo(const Simulator& simulator) const;
+        // this function can potentially be shared between multisegment wells and standard wells
+        template <typename ValueType = EvalWell>
+        SegmentFluidState<ValueType>
+        createFluidState(const std::vector<ValueType>& fluid_composition,
+                         const ValueType& pressure,
+                         const ValueType& temperature,
+                         const ValueType& saltConcentration,
+                         DeferredLogger& deferred_logger) const;
+
+        SegmentFluidState<EvalWell>
+        createSegmentFluidState(int seg, const FSInfo& info, DeferredLogger& deferred_logger) const;
+
+        SegmentPvt segmentPvt(const SegmentFluidState<EvalWell>& fluid_state) const;
+
+        // assemble the energy equation contribution for a single perforation/connection
+        void assemblePerforationEnergyEq(const IntensiveQuantities& int_quants,
+                                         const std::vector<EvalWell>& cq_s,
+                                         const int seg,
+                                         const int local_perf_index,
+                                         DeferredLogger& deferred_logger);
+
+        void updateWellHeadCondition(const Simulator& simulator,
+                                     const Scalar first_perf_temperature,
+                                     const Scalar first_perf_salt_concentration,
+                                     DeferredLogger& deferred_logger);
+
+        void updateSegmentFluidState(const FSInfo& info, DeferredLogger& deferred_logger);
+
+        template <typename ValueType = EvalWell>
+        ValueType computeSegmentEnergy(int seg) const;
+
+        // Convert per-component surface volumetric rates to a phase reservoir
+        // volumetric rate, using @p fs (upwind) for the rs/rv coupling. If
+        // (1 - rs*rv) <= 0, falls back to rate / invB (drops the cross-terms but
+        // keeps @p fs's invB; Rs/Rv unchanged) and logs a @p context debug message.
+        // @p fs may be a wellbore SegmentFluidState (EvalWell) or a reservoir-cell
+        // fluid state (Eval, extended to EvalWell on the fly).
+        // @return the reservoir volumetric rate of @p phaseIdx.
+        template <typename FluidStateT>
+        EvalWell surfaceToReservoirRate(unsigned phaseIdx,
+                                        const FluidStateT& fs,
+                                        const std::vector<EvalWell>& surface_rates,
+                                        int seg,
+                                        std::string_view context,
+                                        DeferredLogger& deferred_logger) const;
+
+        // Compute the energy flux carried by fluid flowing from segment
+        // @p seg toward its outlet, using @p upwind_fs as the upwind
+        // fluid state. @p context is used in diagnostic messages.
+        // @return the energy flux as sum_phases(reservoir_rate * enthalpy * density).
+        EvalWell computeSegmentEnergyRate(int seg,
+                                          int upwind_seg,
+                                          const SegmentFluidState<EvalWell>& upwind_fs,
+                                          std::string_view context,
+                                          DeferredLogger& deferred_logger) const;
     };
 
-}
+} // namespace Opm
 
 #include "MultisegmentWell_impl.hpp"
 

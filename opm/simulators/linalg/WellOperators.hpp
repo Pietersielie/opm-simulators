@@ -262,6 +262,8 @@ public:
 
     const matrix_type& getmat() const override { return A_; }
 
+    const LinearOperatorExtra<X, Y>& getwellOper() const { return wellOper_; }
+
     void addWellPressureEquations(PressureMatrix& jacobian,
                                   const X& weights,
                                   const bool use_well_weights) const
@@ -357,6 +359,8 @@ public:
 
     const matrix_type& getmat() const override { return A_; }
 
+    const LinearOperatorExtra<X, Y>& getwellOper() const { return wellOper_; }
+
     void addWellPressureEquations(PressureMatrix& jacobian,
                                   const X& weights,
                                   const bool use_well_weights) const
@@ -429,7 +433,7 @@ public:
         interiorSize_ = setInteriorSize(comm_);
     }
 
-    virtual void apply( const X& x, Y& y ) const override
+    void apply( const X& x, Y& y ) const override
     {
         for (auto row = A_->begin(); row.index() < interiorSize_; ++row)
         {
@@ -443,7 +447,7 @@ public:
     }
 
     // y += \alpha * A * x
-    virtual void applyscaleadd (field_type alpha, const X& x, Y& y) const override
+    void applyscaleadd (field_type alpha, const X& x, Y& y) const override
     {
         for (auto row = A_->begin(); row.index() < interiorSize_; ++row)
         {
@@ -455,7 +459,7 @@ public:
         ghostLastProject( y );
     }
 
-    virtual const matrix_type& getmat() const override { return *A_; }
+    const matrix_type& getmat() const override { return *A_; }
 
     size_t getInteriorSize() const { return interiorSize_;}
 
@@ -470,6 +474,8 @@ private:
     size_t setInteriorSize(const communication_type& comm) const
     {
         auto indexSet = comm.indexSet();
+        if (indexSet.size() == 0)
+            return 0;
 
         size_t is = 0;
         // Loop over index set
@@ -484,7 +490,7 @@ private:
                 }
             }
         }
-        return is + 1; //size is plus 1 since we start at 0
+        return is + 1; //size is plus 1 since we start at 0, except when indexSet is empty
     }
     const std::shared_ptr<const matrix_type> A_ ;
     const communication_type&  comm_;

@@ -28,6 +28,8 @@
 #include <dune/common/dynmatrix.hh>
 #include <dune/common/fvector.hh>
 
+#include <opm/common/utility/SymmTensor.hpp>
+#include <opm/common/utility/VoigtArray.hpp>
 #include <opm/material/densead/Math.hpp>
 
 #include <opm/models/io/baseoutputmodule.hh>
@@ -64,7 +66,7 @@ class VtkTpsaModule : public BaseOutputModule<TypeTag>
     using VectorBuffer = typename ParentType::VectorBuffer;
     using TensorBuffer = typename ParentType::TensorBuffer;
 
-    using SymTensor = Dune::FieldVector<Scalar, 6>;
+    using SymTensor = SymmTensor<Scalar>;
     using Tensor = Dune::DynamicMatrix<Scalar>;
 
 public:
@@ -119,9 +121,29 @@ public:
                 this->resizeScalarBuffer_(solidPres_, BufferType::Dof);
             }
 
+            // Potential pressure force
+            if (params_.potPresForceOutput_) {
+                this->resizeScalarBuffer_(potPresForce_, BufferType::Dof);
+            }
+
             // Stress
             if (params_.stressOutput_) {
                 this->resizeTensorBuffer_(stress_, BufferType::Dof);
+            }
+
+            // Stress (without potential fracture contributions)
+            if (params_.delStressOutput_) {
+                this->resizeTensorBuffer_(delStress_, BufferType::Dof);
+            }
+
+            // Stress (without potential pressure/temperature/fracture forces)
+            if (params_.linStressOutput_) {
+                this->resizeTensorBuffer_(linStress_, BufferType::Dof);
+            }
+
+            // Strain
+            if (params_.strainOutput_) {
+                this->resizeTensorBuffer_(strain_, BufferType::Dof);
             }
         }
     }
@@ -165,11 +187,38 @@ public:
                     solidPres_[globalDofIdx] = scalarValue(materialState.solidPressure());
                 }
 
+                // Potential pressure force
+                if (params_.potPresForceOutput_) {
+                    potPresForce_[globalDofIdx] =
+                        geoMechModel.mechPotentialPressForce(globalDofIdx);
+                }
+
                 // Stress
                 if (params_.stressOutput_ && !faceStressInfo.empty()) {
-                    SymTensor stressSymTensor = geoMechModel.stress(globalDofIdx, false);
+                    SymTensor stressSymTensor = geoMechModel.stress(globalDofIdx, true);
                     Tensor& stressTensor = stress_[globalDofIdx];
                     setTensorFromVoigt_(stressTensor, stressSymTensor);
+                }
+
+                // Stress (without potential fracture contributions)
+                if (params_.delStressOutput_ && !faceStressInfo.empty()) {
+                    SymTensor delStressSymTensor = geoMechModel.delstress(globalDofIdx);
+                    Tensor& delStressTensor = delStress_[globalDofIdx];
+                    setTensorFromVoigt_(delStressTensor, delStressSymTensor);
+                }
+
+                // Stress (without potential pressure/temperature/fracture forces)
+                if (params_.linStressOutput_ && !faceStressInfo.empty()) {
+                    SymTensor linStressSymTensor = geoMechModel.linstress(globalDofIdx);
+                    Tensor& linStressTensor = linStress_[globalDofIdx];
+                    setTensorFromVoigt_(linStressTensor, linStressSymTensor);
+                }
+
+                // Strain
+                if (params_.strainOutput_ && !faceStressInfo.empty()) {
+                    SymTensor strainSymTensor = geoMechModel.strain(globalDofIdx, true);
+                    Tensor& strainTensor = strain_[globalDofIdx];
+                    setTensorFromVoigt_(strainTensor, strainSymTensor);
                 }
             }
         }
@@ -203,8 +252,27 @@ public:
                 this->commitScalarBuffer_(baseWriter, "solid_pressure", solidPres_, BufferType::Dof);
             }
 
+            if (params_.potPresForceOutput_) {
+                this->commitScalarBuffer_(baseWriter,
+                                          "potentialPressureForce",
+                                          potPresForce_,
+                                          BufferType::Dof);
+            }
+
             if (params_.stressOutput_) {
                 this->commitTensorBuffer_(baseWriter, "stress", stress_, BufferType::Dof);
+            }
+
+            if (params_.delStressOutput_) {
+                this->commitTensorBuffer_(baseWriter, "delStress", delStress_, BufferType::Dof);
+            }
+
+            if (params_.linStressOutput_) {
+                this->commitTensorBuffer_(baseWriter, "linStress", linStress_, BufferType::Dof);
+            }
+
+            if (params_.strainOutput_) {
+                this->commitTensorBuffer_(baseWriter, "strain", strain_, BufferType::Dof);
             }
         }
     }
@@ -213,14 +281,15 @@ private:
     static void setTensorFromVoigt_(Tensor& tensor, const SymTensor& symTensor)
     {
         // Diagonal terms
+        constexpr auto& ind = SymTensor::diag_indices;
         for (std::size_t i = 0; i < 3; ++i) {
-            tensor[i][i] = symTensor[i];
+            tensor[i][i] = symTensor[ind[i]];
         }
 
         // Off-diagonal terms
-        tensor[0][1] = symTensor[5];
-        tensor[0][2] = symTensor[4];
-        tensor[1][2] = symTensor[3];
+        tensor[0][1] = symTensor[VoigtIndex::XY];
+        tensor[0][2] = symTensor[VoigtIndex::XZ];
+        tensor[1][2] = symTensor[VoigtIndex::YZ];
         for (std::size_t i = 0; i < 3; ++i) {
             for (std::size_t j = 0; j < 3; ++j) {
                 if (i > j) {
@@ -234,8 +303,14 @@ private:
 
     VectorBuffer displacement_{};
     VectorBuffer rotation_{};
+
     ScalarBuffer solidPres_{};
+    ScalarBuffer potPresForce_{};
+
     TensorBuffer stress_{};
+    TensorBuffer delStress_{};
+    TensorBuffer linStress_{};
+    TensorBuffer strain_{};
 }; // class VtkTpsaModule
 
 } // namespace Opm

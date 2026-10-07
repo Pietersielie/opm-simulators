@@ -32,9 +32,11 @@
 
 #include <opm/input/eclipse/Schedule/ScheduleTypes.hpp>
 #include <opm/input/eclipse/Schedule/Well/WDFAC.hpp>
+#include <opm/input/eclipse/Schedule/Well/WELDRAW.hpp>
 
 #include <opm/simulators/utils/DeferredLoggingErrorHelpers.hpp>
 
+#include <opm/simulators/wells/EconomicLimitsMessage.hpp>
 #include <opm/simulators/wells/GroupState.hpp>
 #include <opm/simulators/wells/TargetCalculator.hpp>
 #include <opm/simulators/wells/WellBhpThpCalculator.hpp>
@@ -282,6 +284,98 @@ namespace Opm
     }
 
     template<typename TypeTag>
+    void
+    WellInterface<TypeTag>::
+    updateWeldrawMaxRate(const Simulator& simulator,
+                         WellStateType& well_state,
+                         DeferredLogger& deferred_logger) const
+    {
+        if (!this->isProducer()) {
+            return;
+        }
+
+        auto& ws = well_state.well(this->index_of_well_);
+        const auto& weldraw = this->well_ecl_.getWELDRAW();
+        if (!weldraw.active()) {
+            ws.weldraw_max_rate.reset();
+            ws.weldraw_cmode.reset();
+            return;
+        }
+
+        const auto& summary_state = simulator.vanguard().summaryState();
+        const Scalar max_draw = this->well_ecl_.weldrawMaxDrawdown(summary_state);
+        if (!(max_draw > 0.0)) {
+            ws.weldraw_max_rate.reset();
+            ws.weldraw_cmode.reset();
+            return;
+        }
+
+        // The IPR b-coefficients are the surface-rate coefficients with
+        // respect to the drawdown, sum_j Tw_j * mob_j / B_j, summed over the
+        // well's connections.  A standard well leaves crossflowing
+        // connections out of that sum while a multisegment well does not, so
+        // the cap of a multisegment well with crossflow is the more lenient
+        // of the two.  The terms are non-negative either way, so this cannot
+        // change the sign of the sum below.
+        this->updateIPR(simulator, deferred_logger);
+
+        auto phase_coeff = [this](const unsigned phase_idx) -> Scalar {
+            const unsigned comp_idx = FluidSystem::canonicalToActiveCompIdx(
+                FluidSystem::solventComponentIndex(phase_idx));
+            return this->ipr_b_[comp_idx];
+        };
+
+        Scalar coeff = 0.0;
+        const bool gas_target = (weldraw.targetPhase() == WELDRAW::TargetPhase::GAS);
+        if (gas_target) {
+            if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx)) {
+                coeff += phase_coeff(FluidSystem::gasPhaseIdx);
+            }
+        }
+        else {
+            if (FluidSystem::phaseIsActive(FluidSystem::oilPhaseIdx)) {
+                coeff += phase_coeff(FluidSystem::oilPhaseIdx);
+            }
+            if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
+                coeff += phase_coeff(FluidSystem::waterPhaseIdx);
+            }
+        }
+
+        if (!(coeff > 0.0)) {
+            // The target phase cannot flow at any drawdown, because it is
+            // inactive, because it has no mobility in any connection, or,
+            // for a standard well, because every connection is crossflowing
+            // and hence left out of the sum.  Imposing Qmax = 0 would
+            // silently stop the well, so treat the limit as inactive.
+            deferred_logger.warning("WELDRAW_NO_TARGET_PHASE_MOBILITY",
+                fmt::format("Well {}: the WELDRAW target phase ({}) has no "
+                            "producible mobility; the drawdown limit is ignored.",
+                            this->name(), gas_target ? "GAS" : "LIQ"));
+            ws.weldraw_max_rate.reset();
+            ws.weldraw_cmode.reset();
+            return;
+        }
+
+        const Scalar max_rate = max_draw * coeff;
+        ws.weldraw_max_rate = max_rate;
+
+        // Remember the rate control the limit is imposed through, but only
+        // while the limit is the more restrictive of the two: a well already
+        // held at a tighter target of its own is not under drawdown control.
+        const auto controls = this->well_ecl_.productionControls(summary_state);
+        const auto cmode = gas_target ? Well::ProducerCMode::GRAT
+                                      : Well::ProducerCMode::LRAT;
+        const Scalar own_target = gas_target ? controls.gas_rate
+                                             : controls.liquid_rate;
+        if (!controls.hasControl(cmode) || (max_rate <= own_target)) {
+            ws.weldraw_cmode = cmode;
+        }
+        else {
+            ws.weldraw_cmode.reset();
+        }
+    }
+
+    template<typename TypeTag>
     bool
     WellInterface<TypeTag>::
     updateWellControlAndStatusLocalIteration(const Simulator& simulator,
@@ -414,7 +508,18 @@ namespace Opm
         OPM_TIMEFUNCTION();
         auto& deferred_logger = groupStateHelper.deferredLogger();
         const auto& group_state = groupStateHelper.groupState();
-        deferred_logger.info(" well " + this->name() + " is being tested");
+        // A well test is run at the start of the time step, so this is also the
+        // instant the well resumes flowing if the test succeeds -- the mirror of
+        // the economic-limit messages, which report when a well stops flowing.
+        const auto& unit_system = simulator.vanguard().eclState().getUnits();
+        const auto start_time = simulator.vanguard().schedule().getStartTime();
+        const auto when =
+            fmt::format("at time {:.2f} {} (date = {})",
+                        unit_system.from_si(UnitSystem::measure::time, simulation_time),
+                        unit_system.name(UnitSystem::measure::time),
+                        economicLimitDateString(start_time, simulation_time));
+
+        deferred_logger.info(fmt::format("Well {} is being tested {}.", this->name(), when));
 
         GroupStateHelperType groupStateHelper_copy = groupStateHelper;
         WellStateType well_state_copy = well_state;
@@ -452,6 +557,21 @@ namespace Opm
         }
 
         WellTestState welltest_state_temp;
+        // Why a limit closed the well again. Empty when there is no reason to give.
+        std::string closure_reason;
+
+        // The test can fail to re-open the well at several points below, and they
+        // all report it through here. The outcome goes to the PRT; the reason only
+        // to the debug log, because a shut well is re-tested at every interval and
+        // this message recurs for as long as it stays shut.
+        auto notReopened = [this, &when, &deferred_logger](const std::string_view reason)
+        {
+            deferred_logger.info(
+                fmt::format("Well {} is not re-opened {}.", this->name(), when));
+            if (!reason.empty()) {
+                deferred_logger.debug(fmt::format("Because {}.", reason));
+            }
+        };
 
         bool testWell = true;
         // if a well is closed because all completions are closed, we need to check each completion
@@ -461,26 +581,21 @@ namespace Opm
             const std::size_t original_number_closed_completions = welltest_state_temp.num_closed_completions();
             bool converged = solveWellForTesting(simulator, groupStateHelper_copy, well_state_copy);
             if (!converged) {
-                const auto msg = fmt::format("WTEST: Well {} is not solvable (physical)", this->name());
-                deferred_logger.debug(msg);
+                notReopened("the well equations could not be solved");
                 return;
             }
 
 
             updateWellOperability(simulator, well_state_copy, groupStateHelper_copy);
             if ( !this->isOperableAndSolvable() ) {
-                const auto msg = fmt::format("WTEST: Well {} is not operable (physical)", this->name());
-                deferred_logger.debug(msg);
+                notReopened("the well is not operable");
                 return;
             }
             std::vector<Scalar> potentials;
             try {
                 computeWellPotentials(simulator, well_state_copy, groupStateHelper_copy, potentials);
             } catch (const std::exception& e) {
-                const std::string msg = fmt::format("well {}: computeWellPotentials() "
-                                                    "failed during testing for re-opening: ",
-                                                    this->name(), e.what());
-                deferred_logger.info(msg);
+                notReopened(fmt::format("computing the well potentials failed: {}", e.what()));
                 return;
             }
             const int np = well_state_copy.numPhases();
@@ -491,9 +606,13 @@ namespace Opm
             this->updateWellTestState(well_state_copy.well(this->indexOfWell()),
                                      simulation_time,
                                       /*writeMessageToOPMLog=*/ false,
+                                      /*during_well_test=*/ true,
                                       under_zero_target,
                                       welltest_state_temp,
-                                      deferred_logger);
+                                      simulator.vanguard().eclState().getUnits(),
+                                      simulator.vanguard().schedule().getStartTime(),
+                                      deferred_logger,
+                                      &closure_reason);
             this->closeCompletions(welltest_state_temp);
 
             // Stop testing if the well is closed or shut due to all completions shut
@@ -510,8 +629,10 @@ namespace Opm
         if (!welltest_state_temp.well_is_closed(this->name())) {
             well_test_state.open_well(this->name());
 
-            std::string msg = std::string("well ") + this->name() + std::string(" is re-opened");
-            deferred_logger.info(msg);
+            const std::string& sep = economicLimitMessageSeparator();
+            deferred_logger.info(
+                fmt::format("{}\nWell {} is re-opened {}.\n{}",
+                            sep, this->name(), when, sep));
 
             // also reopen completions
             for (const auto& completion : this->well_ecl_.getCompletions()) {
@@ -520,6 +641,10 @@ namespace Opm
             }
             well_state = well_state_copy;
             open_times.try_emplace(this->name(), well_test_state.lastTestTime(this->name()));
+        }
+        else {
+            // A limit closed the well again: discard the tested state, stay shut.
+            notReopened(closure_reason);
         }
     }
 
@@ -538,9 +663,9 @@ namespace Opm
         auto& deferred_logger = groupStateHelper.deferredLogger();
 
         const auto& summary_state = simulator.vanguard().summaryState();
-        const auto inj_controls = this->well_ecl_.isInjector() ? this->well_ecl_.injectionControls(summary_state) : Well::InjectionControls(0);
-        const auto prod_controls = this->well_ecl_.isProducer() ? this->well_ecl_.productionControls(summary_state) : Well::ProductionControls(0);
         const auto& ws = well_state.well(this->indexOfWell());
+        const auto inj_controls = this->well_ecl_.isInjector() ? this->well_ecl_.injectionControls(summary_state) : Well::InjectionControls(0);
+        const auto prod_controls = this->well_ecl_.isProducer() ? this->productionControlsWithWeldraw(summary_state, ws) : Well::ProductionControls(0);
         const auto pmode_orig = ws.production_cmode;
         const auto imode_orig = ws.injection_cmode;
         bool converged = false;
@@ -989,7 +1114,9 @@ namespace Opm
         OPM_TIMEFUNCTION();
         const auto& summary_state = simulator.vanguard().summaryState();
         const auto inj_controls = this->well_ecl_.isInjector() ? this->well_ecl_.injectionControls(summary_state) : Well::InjectionControls(0);
-        const auto prod_controls = this->well_ecl_.isProducer() ? this->well_ecl_.productionControls(summary_state) : Well::ProductionControls(0);
+        const auto prod_controls = this->well_ecl_.isProducer()
+            ? this->productionControlsWithWeldraw(summary_state, well_state.well(this->index_of_well_))
+            : Well::ProductionControls(0);
         // TODO: the reason to have inj_controls and prod_controls in the arguments, is that we want to change the control used for the well functions
         // TODO: maybe we can use std::optional or pointers to simplify here
         assembleWellEqWithoutIteration(simulator, groupStateHelper, dt, inj_controls, prod_controls, well_state, solving_with_zero_rate);
@@ -1493,7 +1620,7 @@ namespace Opm
         else
         {
             const auto current = ws.production_cmode;
-            const auto& controls = well.productionControls(summaryState);
+            const auto controls = this->productionControlsWithWeldraw(summaryState, ws);
             switch (current) {
             case Well::ProducerCMode::ORAT:
             {
@@ -1701,11 +1828,6 @@ namespace Opm
                     for (int p = 0; p<np; ++p) {
                         ws.surface_rates[p] *= scale;
                     }
-                    ws.trivial_group_target = false;
-                } else {
-                    // If group target is trivial we dont want to flip to other controls. To avoid oscillation we store
-                    // this information in the well state and explicitly check for this condition when evaluating well controls.
-                    ws.trivial_group_target = true;
                 }
                 break;
             }
@@ -1918,6 +2040,19 @@ namespace Opm
         // either of the WDFAC or the WDFACCOR keywords.
         if (static_cast<std::size_t>(perf) >= this->well_cells_.size()) {
             OPM_THROW(std::invalid_argument,"The perforation index exceeds the size of the local containers - possibly wellIndex was called with a global instead of a local perforation index!");
+        }
+
+        // Contribution from dynamically created fracture perforations, if a
+        // fracture model has registered any (see addFracturePerforations();
+        // the container is empty otherwise and this is a no-op).
+        if (!this->well_index_fracture_.empty()) {
+            const auto frac_wi = this->well_index_fracture_[perf]
+                .wellIndex(ws.perf_data.pressure[perf]);
+            if (frac_wi > 0.0) {
+                for (auto& tw : Tw) {
+                    tw += frac_wi;
+                }
+            }
         }
 
         if constexpr (! Indices::gasEnabled) {
@@ -2364,6 +2499,34 @@ namespace Opm
                                                     comm,
                                                     false);
 
+    }
+
+
+    template <typename TypeTag>
+    typename WellInterface<TypeTag>::FSInfo
+    WellInterface<TypeTag>::getFirstPerfCellConditions(const Simulator& simulator) const
+    {
+        FSInfo info{};
+
+        // If this process does not contain active perforations, this->well_cells_ is empty.
+        if (this->well_cells_.size() > 0) {
+            // The cell of the first perforation *on this process*. For a distributed well
+            // this is the first perforation of the well only on the process holding it;
+            // the broadcast below replaces the values on all the other processes.
+            const int cell_idx = this->well_cells_[0];
+            const auto& intQuants = simulator.model().intensiveQuantities(cell_idx, /*timeIdx=*/0);
+            const auto& fs = intQuants.fluidState();
+
+            info.temperature = getValue(fs.temperature(FluidSystem::oilPhaseIdx));
+            info.saltConcentration = getValue(fs.saltConcentration());
+        }
+
+        // Broadcast from the process holding the first open connection of the well
+        // (ParallelWellInfo::communicateFirstPerforation), so that all processes use the
+        // conditions of the same cell.
+        return this->parallel_well_info_.communication().size() == 1
+            ? info
+            : this->parallel_well_info_.broadcastFirstPerforationValue(info);
     }
 
 } // namespace Opm

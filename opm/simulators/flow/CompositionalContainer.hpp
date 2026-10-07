@@ -21,14 +21,17 @@
 */
 /*!
  * \file
- * \copydoc Opm::OutputBlackOilModule
+ * \brief Restart-output buffers specific to compositional simulations.
  */
 #ifndef OPM_COMPOSITIONAL_CONTAINER_HPP
 #define OPM_COMPOSITIONAL_CONTAINER_HPP
 
+#include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
+
 #include <array>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -50,8 +53,15 @@ class CompositionalContainer
     static constexpr int waterPhaseIdx = FluidSystem::waterPhaseIdx;
 
 public:
+    enum class RestartOutput { Disabled, Enabled };
+
+    /// Allocate compositional restart fields requested by \p rstKeywords.
+    /// PSAT is currently consumed only by restart output. Allocate it only
+    /// for passes that will write restart data because filling the buffer
+    /// requires a nonlinear solve for each single-phase cell.
     void allocate(const unsigned bufferSize,
-                  std::map<std::string, int>& rstKeywords);
+                  std::map<std::string, int>& rstKeywords,
+                  RestartOutput restartOutput);
 
     using AssignFunction = std::function<Scalar(const unsigned)>;
 
@@ -64,8 +74,56 @@ public:
     void assignOilFractions(const unsigned globalDofIdx,
                             const AssignFunction& fractions);
 
+    void assignPhasePressures(const unsigned globalDofIdx,
+                              const Scalar oilPressure,
+                              const Scalar gasPressure);
+
+    void assignSaturationPressure(const unsigned globalDofIdx,
+                                  const Scalar psat);
+
+    /// Return the oil-phase pressure for two hydrocarbon phases, or the
+    /// bubble/dew pressure of the total composition for a single phase. Return
+    /// std::nullopt if the solver cannot determine a saturation pressure.
+    ///
+    /// \p liquidFraction is the flash liquid fraction L: exactly one denotes
+    /// liquid only, exactly zero vapour only, and other values denote two phases.
+    /// Use L because computed phase saturations can contain round-off residuals.
+    /// Plain-value arguments allow testing phase selection without a simulator.
+    [[nodiscard]] static std::optional<Scalar>
+    cellSaturationPressure(const Scalar liquidFraction,
+                           const Scalar oilPressure,
+                           const std::array<Scalar, numComponents>& moleFractions,
+                           const Scalar temperature,
+                           const CompositionalConfig::EOSType eosType);
+
+    void assignVaporFraction(const unsigned globalDofIdx,
+                             const Scalar vmf);
+
     void outputRestart(data::Solution& sol,
                        ScalarBuffer& oil_saturation);
+
+    bool moleFractionsAllocated() const
+    { return !moleFractions_[0].empty(); }
+
+    bool gasFractionsAllocated() const
+    { return !phaseMoleFractions_[gasPhaseIdx][0].empty(); }
+
+    bool oilFractionsAllocated() const
+    { return !phaseMoleFractions_[oilPhaseIdx][0].empty(); }
+
+    bool phasePressuresAllocated() const
+    { return !oilPressure_.empty() || !gasPressure_.empty(); }
+
+    bool vaporFractionAllocated() const
+    { return !vaporFraction_.empty(); }
+
+    bool saturationPressureAllocated() const
+    { return !saturationPressure_.empty(); }
+
+    /// Whether PSAT was requested in this allocation pass. Unlike the buffer
+    /// state above, this remains true on MPI ranks with no local cells.
+    bool saturationPressureRequested() const
+    { return saturationPressureRequested_; }
 
     bool allocated() const
     { return allocated_; }
@@ -76,6 +134,14 @@ private:
     std::array<ScalarBuffer, numComponents> moleFractions_;
     // mole fractions for each component in each phase
     std::array<std::array<ScalarBuffer, numComponents>, numPhases> phaseMoleFractions_;
+    // phase pressures (POIL, PGAS)
+    ScalarBuffer oilPressure_;
+    ScalarBuffer gasPressure_;
+    // saturation pressure (PSAT)
+    ScalarBuffer saturationPressure_;
+    bool saturationPressureRequested_ = false;
+    // vapour mole fraction of the total mixture (VMF)
+    ScalarBuffer vaporFraction_;
 };
 
 } // namespace Opm

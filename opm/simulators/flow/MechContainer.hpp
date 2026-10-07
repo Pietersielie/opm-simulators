@@ -28,6 +28,7 @@
 
 #include <dune/common/fvector.hh>
 
+#include <opm/common/utility/SymmTensor.hpp>
 #include <opm/common/utility/VoigtArray.hpp>
 
 #include <array>
@@ -53,7 +54,7 @@ public:
                             const Dune::FieldVector<Scalar,3>& disp);
 
     void assignDelStress(const unsigned globalDofIdx,
-                         const Dune::FieldVector<Scalar,6>& delStress);
+                         const SymmTensor<Scalar>& delStress);
 
     void assignPotentialForces(const unsigned globalDofIdx,
                                const Scalar force,
@@ -61,24 +62,31 @@ public:
                                const Scalar tempForce);
 
     void assignFracStress(const unsigned globalDofIdx,
-                          const Dune::FieldVector<Scalar,6>& fracStress);
+                          const SymmTensor<Scalar>& fracStress);
 
     void assignLinStress(const unsigned globalDofIdx,
-                         const Dune::FieldVector<Scalar,6>& linStress);
+                         const SymmTensor<Scalar>& linStress);
 
     void assignStrain(const unsigned globalDofIdx,
-                      const Dune::FieldVector<Scalar,6>& strain);
+                      const SymmTensor<Scalar>& strain);
 
     void assignStress(const unsigned globalDofIdx,
-                      const Dune::FieldVector<Scalar,6>& stress);
+                      const SymmTensor<Scalar>& stress);
+
+    void assignTraction(const unsigned globalDofIdx,
+                        const std::array<Dune::FieldVector<Scalar,3>, 6>& traction);
 
     void outputRestart(data::Solution& sol);
 
     bool allocated() const
     { return allocated_; }
 
+    bool enableTraction() const
+    { return enableTraction_; }
+
 private:
     bool allocated_ = false;
+    bool enableTraction_{false};
     ScalarBuffer potentialForce_;
     ScalarBuffer potentialPressForce_;
     ScalarBuffer potentialTempForce_;
@@ -89,6 +97,8 @@ private:
     VoigtArray<Scalar> linstress_;
     VoigtArray<Scalar> strain_;
     VoigtArray<Scalar> stress_;
+
+    std::array<std::array<ScalarBuffer, 6>, 3> traction_;
 };
 
 } // namespace Opm

@@ -21,7 +21,7 @@
 
 #include <map>
 #include <memory>
-#include <opm/grid/utility/SparseTable.hpp>
+#include <opm/common/utility/SparseTable.hpp>
 #include <opm/simulators/linalg/PreconditionerWithUpdate.hpp>
 #include <opm/simulators/linalg/gpuistl/GpuBuffer.hpp>
 #include <opm/simulators/linalg/gpuistl/GpuSparseMatrixWrapper.hpp>
@@ -116,7 +116,7 @@ public:
         return false;
     }
 
-    virtual bool hasPerfectUpdate() const override
+    bool hasPerfectUpdate() const override
     {
         return true;
     }

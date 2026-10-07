@@ -65,6 +65,7 @@ public:
         serializer(producer);
         serializer(bhp);
         serializer(thp);
+        serializer(network_thp_limit);
         serializer(pressure_first_connection);
         serializer(temperature);
         serializer(energy_rate);
@@ -77,7 +78,7 @@ public:
         serializer(surface_rates);
         serializer(reservoir_rates);
         serializer(prev_surface_rates);
-        serializer(trivial_group_target);
+        serializer(frac_rate);
         serializer(segments);
         serializer(events);
         serializer(injection_cmode);
@@ -90,6 +91,8 @@ public:
         serializer(group_target_fallback);
         serializer(use_group_target_fallback);
         serializer(was_shut_before_action_applied);
+        serializer(weldraw_max_rate);
+        serializer(weldraw_cmode);
     }
 
     bool operator==(const SingleWellState&) const;
@@ -102,6 +105,9 @@ public:
     PhaseUsageInfo<IndexTraits> pu;
     Scalar bhp{0};
     Scalar thp{0};
+    // Network-imposed THP limit retained until the schedule re-specifies the
+    // well's THP limit or VFP table.
+    std::optional<Scalar> network_thp_limit;
     Scalar pressure_first_connection{0};
 
     // thermal related
@@ -129,8 +135,8 @@ public:
         Scalar guiderate_ratio{1.0}; // well to group guide rate ratio for diagnostics
 
         bool operator==(const GroupTarget& other) const {
-            return (group_name == other.group_name 
-                 && target_value == other.target_value 
+            return (group_name == other.group_name
+                 && target_value == other.target_value
                  && production_cmode == other.production_cmode
                  && injection_cmode == other.injection_cmode
                  && guiderate_ratio == other.guiderate_ratio);
@@ -153,8 +159,8 @@ public:
     std::vector<Scalar> surface_rates;
     std::vector<Scalar> reservoir_rates;
     std::vector<Scalar> prev_surface_rates;
+    Scalar frac_rate{0.0};
     PerfData<Scalar> perf_data;
-    bool trivial_group_target;
     std::optional<GroupTarget> group_target;
     std::optional<GroupTarget> group_target_fallback;
     bool use_group_target_fallback;
@@ -168,6 +174,14 @@ public:
     // if it was SHUT, even the action set the well to OPEN, the data in the well state
     // is not well-defined. We do not use it to overwrite the current well state.
     bool was_shut_before_action_applied {false};
+    // Maximum production rate of the WELDRAW target phase derived from the
+    // well's drawdown limit; updated during the first NUPCOL iterations of
+    // each timestep and unset when no drawdown limit is active.
+    std::optional<Scalar> weldraw_max_rate{};
+    // The rate control which carries that limit, set only while the limit is
+    // at least as restrictive as the well's own target for the same phase.
+    // The well is under drawdown control when this is its active control.
+    std::optional<WellProducerCMode> weldraw_cmode{};
 
     /// Special purpose method to support dynamically rescaling a well's
     /// CTFs through WELPI.

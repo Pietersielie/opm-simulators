@@ -39,6 +39,14 @@ partiallySupported()
             },
          },
          {
+            "CECON",
+            {
+               {9,{true, allow_values<std::string> {"CON", "+CON", "WELL"}, "CECON(PROCEDURE): only CON, +CON and WELL workover procedures are supported"}}, // WORKOVER_PROCEDURE
+               {10,{true, allow_values<std::string> {"NO"}, "CECON(CHECK_STOPPED): only the NO option is supported"}}, // CHECK_STOPPED
+               {13,{true, allow_values<std::string> {}, "CECON(FOLLOW_ON_WELL): follow-on well is not supported and should be defaulted"}}, // FOLLOW_ON_WELL
+            },
+         },
+         {
             "EDITNNC",
             {
                {12,{true, allow_values<std::string> {"NONE"}, "EDITNNC(FACE1): not supported use default."}}, // FACE_FLOW12
@@ -189,7 +197,7 @@ partiallySupported()
          {
             "ROCKCOMP",
             {
-               {1,{true, allow_values<std::string> {"REVERS", "IRREVERS"}, "ROCKCOMP(ROCKOPT): only the REVERS and IRREVERS options are supported – will STOP"}}, // HYSTERESIS
+               {1,{true, allow_values<std::string> {"REVERS", "IRREVERS", "HYSTER"}, "ROCKCOMP(ROCKOPT): only the REVERS, IRREVERS and HYSTER options are supported – will STOP"}}, // HYSTERESIS
                {3,{true, allow_values<std::string> {"YES", "NO"}, "ROCKCOMP(WATINOPT): only YES and NO are supported"}}, // WATER_COMPACTION
                {4,{false, allow_values<std::string> {}, "ROCKCOMP(PORTXROP): transmissibility dependent on porosity model is not supported"}}, // PORTXROP
             },
@@ -264,11 +272,18 @@ partiallySupported()
          {
             "WECON",
             {
-               {7,{true, allow_values<std::string> {"NONE", "CON", "WELL"}, "WECON(ACTION): Only NONE, CON and WELL options are supported"}}, // ACTION
+               {7,{true, allow_values<std::string> {"NONE", "CON", "+CON", "WELL"}, "WECON(ACTION): Only NONE, CON, +CON and WELL options are supported"}}, // ACTION
                {8,{true, allow_values<std::string> {"NO"}, "WECON(ENDRUN): only the NO option is supported"}}, // END_RUN
                // Item 9 (follow-on well) is supported (but not validated here because it is a string with no specific allowed values).
                {10,{true, allow_values<std::string> {"POTN", "RATE"}, "WECON(ELTOPT): Valid options are POTN and RATE"}}, // ELTOPT
                {12,{true, allow_values<std::string> {}, "WECON(ACTION2): Feature not supported and should be defaulted"}}, // ACTION2
+            },
+         },
+         {
+            "WELDRAW",
+            {
+               {4,{true, allow_values<std::string> {"NO"}, "WELDRAW(USE_LIMIT): use of the drawdown limit in the well potential calculation is not supported"}}, // USE_LIMIT
+               {5,{true, allow_values<std::string> {"AVG"}, "WELDRAW(GRID_BLOCKS): only the AVG (PI-weighted average drawdown) option is supported"}}, // GRID_BLOCKS
             },
          },
          {
@@ -297,6 +312,12 @@ partiallySupported()
             "WHISTCTL",
             {
                {2,{true, allow_values<std::string> {"NO"}, "WHISTCTL(END): only the NO option is supported"}}, // BPH_TERMINATE
+            },
+         },
+         {
+            "WINJGAS",
+            {
+               {4,{true, allow_values<std::string> {}, "WINJGAS(MAKEUPGAS): make-up gas stream is not supported and should be defaulted"}}, // MAKEUPGAS
             },
          },
          {
@@ -373,8 +394,13 @@ partiallySupported()
             "EQUIL",
             {
                {9,{true, [](int x) { return x >= -20 && x <= 20; }, "EQUIL(OIP_INIT): only values between -20 and 20 are allowed (default is -5)"}}, // OIP_INIT
-               {10,{false, allow_values<int> {}, "EQUIL(COMP_INIT_TYPE): compositional option not used, should be defaulted"}}, // COMP_INIT_TYPE
-               {11,{false, allow_values<int> {}, "EQUIL(COMP_NOT_SET_SAT_PRESSURE): compositional option not used, should be defaulted"}}, // COMP_NOT_SET_SAT_PRESSURE
+               {10,{false, allow_values<int> {1, 3}, "EQUIL(COMP_INIT_TYPE): only types 1 "
+                                                           "(total composition) and 3 "
+                                                           "(liquid composition with a gas "
+                                                           "cap) are supported"}}, // COMP_INIT_TYPE
+               {11,{false, allow_values<int> {0, 1},
+                    "EQUIL(COMP_NOT_SET_SAT_PRESSURE): must be defaulted/omitted or set to "
+                    "0 (reset when needed) or 1 (keep datum pressure)"}}, // COMP_NOT_SET_SAT_PRESSURE
             },
          },
          {
@@ -544,6 +570,13 @@ partiallySupported()
             },
          },
          {
+            "CECON",
+            {
+               {11,{false, allow_values<double> {}, "CECON(MIN_OIL): minimum oil rate limit is not supported and should be defaulted (1*) – value ignored"}}, // MIN_OIL
+               {12,{false, allow_values<double> {}, "CECON(MIN_GAS): minimum gas rate limit is not supported and should be defaulted (1*) – value ignored"}}, // MIN_GAS
+            },
+         },
+         {
             "DIFFC",
             {
                {7,{false, allow_values<double> {0}, "DIFFC(ISATNUM1): only default value of 0 supported – will continue"}}, // GAS_OIL_CROSS_DIFF_COEFF
@@ -658,9 +691,7 @@ partiallySupported()
             {
                {11,{true, allow_values<double> {}, "WECON(WCUT2): Feature not supported and should be defaulted"}}, // WELOPEN
                {13,{true, allow_values<double> {}, "WECON(GLR): Feature not supported and should be defaulted"}}, // GLR
-               {14,{true, allow_values<double> {}, "WECON(LRAT): Feature not supported and should be defaulted"}}, // LRAT
                {15,{true, allow_values<double> {}, "WECON(TEMP): Feature not supported and should be defaulted"}}, // TEMP
-               {16,{true, allow_values<double> {}, "WECON(RESV): Feature not supported and should be defaulted"}}, // RESV
             },
          },
          {
@@ -700,6 +731,12 @@ partiallySupported()
                {18,{false, allow_values<double> {}, "WCONPROD(CALRATE): calorific rate not used and should be defaulted (1*)"}}, // E300_ITEM18
                {19,{true, allow_values<double> {}, "WCONPROD(COMBPROC): linearly combined rate not used and should be defaulted (1*)"}}, // E300_ITEM19
                {20,{false, allow_values<double> {}, "WCONPROD(NGL): natural gas liquid rate  is not used and should be defaulted (1*)"}}, // E300_ITEM20
+            },
+         },
+         {
+            "WINJGAS",
+            {
+               {5,{true, allow_values<double> {0}, "WINJGAS(STAGE): separator stage is not supported and should be defaulted"}}, // STAGE
             },
          },
          {

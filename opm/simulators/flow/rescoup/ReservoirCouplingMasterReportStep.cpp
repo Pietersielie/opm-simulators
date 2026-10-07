@@ -102,6 +102,28 @@ getMasterGroupProductionReservoirRate(const std::string &group_name, ReservoirCo
 template <class Scalar>
 const ReservoirCoupling::Potentials<Scalar>&
 ReservoirCouplingMasterReportStep<Scalar>::
+getSlaveGroupInjectionPotentials(const std::string &master_group_name) const
+{
+    auto it = this->getMasterGroupToSlaveNameMap().find(master_group_name);
+    if (it != this->getMasterGroupToSlaveNameMap().end()) {
+        auto& slave_name = it->second;
+        auto group_idx = this->getMasterGroupCanonicalIdx(slave_name, master_group_name);
+        return this->slave_group_injection_data_.at(slave_name)[group_idx].potentials;
+    }
+    else {
+        RCOUP_LOG_THROW(
+            std::runtime_error,
+            fmt::format(
+                "Master group name {} not found in master-to-slave-group-name mapping",
+                master_group_name
+            )
+        );
+    }
+}
+
+template <class Scalar>
+const ReservoirCoupling::Potentials<Scalar>&
+ReservoirCouplingMasterReportStep<Scalar>::
 getSlaveGroupPotentials(const std::string &master_group_name) const
 {
     auto it = this->getMasterGroupToSlaveNameMap().find(master_group_name);
@@ -140,7 +162,7 @@ receiveInjectionDataFromSlaves()
         }
         std::vector<SlaveGroupInjectionData> injection_data(num_slave_groups);
         if (this->comm().rank() == 0) {
-            if (this->slaveIsActivated(i)) {
+            if (this->slaveIsCoupled(i)) {
                 // NOTE: See comment about error handling at the top of this file.
                 auto MPI_INJECTION_DATA_TYPE = Dune::MPITraits<SlaveGroupInjectionData>::getType();
                 MPI_Recv(
@@ -158,8 +180,11 @@ receiveInjectionDataFromSlaves()
                 ));
             }
             else {
+                // Either the slave has not activated yet, or it has reached the end of its own
+                // schedule and left the coupling. In both cases the master continues with no
+                // injection from this slave.
                 this->logger().debug(fmt::format(
-                    "Slave {} has not activated yet, skipping injection data",
+                    "Slave {} is not coupled, skipping injection data",
                     this->slaveName(i)
                 ));
                 injection_data.assign(num_slave_groups, SlaveGroupInjectionData{}); // Set to zero injection data
@@ -193,7 +218,7 @@ receiveProductionDataFromSlaves()
         }
         std::vector<SlaveGroupProductionData> production_data(num_slave_groups);
         if (this->comm().rank() == 0) {
-            if (this->slaveIsActivated(i)) {
+            if (this->slaveIsCoupled(i)) {
                 // NOTE: See comment about error handling at the top of this file.
                 auto MPI_PRODUCTION_DATA_TYPE = Dune::MPITraits<SlaveGroupProductionData>::getType();
                 MPI_Recv(
@@ -211,8 +236,11 @@ receiveProductionDataFromSlaves()
                 ));
             }
             else {
+                // Either the slave has not activated yet, or it has reached the end of its own
+                // schedule and left the coupling. In both cases the master continues with no
+                // production from this slave.
                 this->logger().debug(fmt::format(
-                    "Slave {} has not activated yet, skipping production data",
+                    "Slave {} is not coupled, skipping production data",
                     this->slaveName(i)
                 ));
                 production_data.assign(num_slave_groups, SlaveGroupProductionData{}); // Set to zero production data

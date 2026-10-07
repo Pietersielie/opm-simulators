@@ -30,6 +30,8 @@
 
 #include <dune/common/parametertree.hh>
 
+#include <opm/common/ErrorMacros.hpp>
+
 #include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/input/eclipse/EclipseState/Tables/OverburdTable.hpp>
 #include <opm/input/eclipse/EclipseState/Tables/RockwnodTable.hpp>
@@ -81,9 +83,25 @@ FlowGenericProblem(const EclipseState& eclState,
     // 2. EQLDIMS item 2.  Default value from
     //    opm-common/opm/input/eclipse/share/keywords/000_Eclipse100/E/EQLDIMS
 
-    numPressurePointsEquil_ = Parameters::IsSet<Parameters::NumPressurePointsEquil>()
-        ? Parameters::Get<Parameters::NumPressurePointsEquil>()
-        : eclState.getTableManager().getEqldims().getNumDepthNodesP();
+    if (Parameters::IsSet<Parameters::NumPressurePointsEquil>()) {
+        numPressurePointsEquil_ = Parameters::Get<Parameters::NumPressurePointsEquil>();
+        if (numPressurePointsEquil_ < 1) {
+            throw std::invalid_argument {
+                fmt::format("--num-pressure-points-equil must be at least 1, "
+                            "but {} was given.", numPressurePointsEquil_)
+            };
+        }
+    }
+    else {
+        numPressurePointsEquil_ = eclState.getTableManager().getEqldims().getNumDepthNodesP();
+        if (numPressurePointsEquil_ < 1) {
+            throw std::invalid_argument {
+                fmt::format("EQLDIMS item 2, the number of depth nodes in the "
+                            "equilibration pressure tables, must be at least 1, "
+                            "but {} was given.", numPressurePointsEquil_)
+            };
+        }
+    }
 
     explicitRockCompaction_ = Parameters::Get<Parameters::ExplicitRockCompaction>();
 }
@@ -120,7 +138,7 @@ helpPreamble(int,
         desc = desc + "\n";
 
     return
-        "Usage: "+std::string(argv[0]) + " [OPTIONS] [ECL_DECK_FILENAME]\n"
+        "Usage: "+std::string(argv[0]) + " [OPTIONS] [DECK_FILENAME]\n"
         + desc;
 }
 
@@ -240,6 +258,12 @@ readRockCompactionParameters_()
         // i.e. don't allow re-inflation.
         minRefPressure_.resize(numElem, 1e99);
         break;
+    case RockConfig::Hysteresis::HYSTER:
+        // Track the lowest pressure each cell has ever reached, exactly as for
+        // IRREVERS. It doubles as the "turning pressure" that selects/anchors
+        // the ROCKTABH elastic reload curve once the cell re-pressurizes above it.
+        minRefPressure_.resize(numElem, 1e99);
+        break;
     default:
         throw std::runtime_error("Not support ROCKOMP hysteresis option ");
     }
@@ -247,7 +271,45 @@ readRockCompactionParameters_()
     std::size_t numRocktabTables = rock_config.num_rock_tables();
     bool waterCompaction = rock_config.water_compaction();
 
-    if (!waterCompaction) {
+    if (waterCompaction && rock_config.hysteresis_mode() == RockConfig::Hysteresis::HYSTER)
+        throw std::runtime_error("ROCKCOMP: combining WATER_COMPACTION with HYSTERESIS=HYSTER is not supported");
+
+    if (!waterCompaction && rock_config.hysteresis_mode() == RockConfig::Hysteresis::HYSTER) {
+        const auto& rocktabhTables = eclState_.getTableManager().getRocktabhTables();
+        if (rocktabhTables.size() != numRocktabTables)
+            throw std::runtime_error("ROCKCOMP HYSTERESIS is set to HYSTER. " + std::to_string(numRocktabTables)
+                                     +" ROCKTABH tables is expected, but " + std::to_string(rocktabhTables.size()) +" is provided");
+
+        // The deflation (virgin/plastic loading) curve, taken from the first row of
+        // each of ROCKTABH's elastic curves, plays the same role that ROCKTAB plays
+        // for REVERS/IRREVERS, so it is stored in the very same tables.
+        rockCompPoroMult_.resize(numRocktabTables);
+        rockCompTransMult_.resize(numRocktabTables);
+        rockCompPoroMultElastic_.resize(numRocktabTables, TabulatedTwoDFunction(TabulatedTwoDFunction::InterpolationPolicy::LeftExtreme));
+        rockCompTransMultElastic_.resize(numRocktabTables, TabulatedTwoDFunction(TabulatedTwoDFunction::InterpolationPolicy::LeftExtreme));
+        for (std::size_t regionIdx = 0; regionIdx < numRocktabTables; ++regionIdx) {
+            const auto& rocktabhTable = rocktabhTables[regionIdx];
+
+            const auto& deflation = rocktabhTable.deflationCurve();
+            rockCompPoroMult_[regionIdx].setXYContainers(deflation.getColumn(0), deflation.getColumn(1));
+            rockCompTransMult_[regionIdx].setXYContainers(deflation.getColumn(0), deflation.getColumn(2));
+
+            const std::size_t numCurves = rocktabhTable.numElasticCurves();
+            for (std::size_t curveIdx = 0; curveIdx < numCurves; ++curveIdx) {
+                const auto& curve = rocktabhTable.elasticCurve(curveIdx);
+                const auto& pressure = curve.getColumn(0);
+                const auto& poro = curve.getColumn(1);
+                const auto& trans = curve.getColumn(2);
+
+                rockCompPoroMultElastic_[regionIdx].appendXPos(pressure[0]);
+                rockCompTransMultElastic_[regionIdx].appendXPos(pressure[0]);
+                for (std::size_t rowIdx = 0; rowIdx < curve.numRows(); ++rowIdx) {
+                    rockCompPoroMultElastic_[regionIdx].appendSamplePoint(curveIdx, pressure[rowIdx], poro[rowIdx]);
+                    rockCompTransMultElastic_[regionIdx].appendSamplePoint(curveIdx, pressure[rowIdx], trans[rowIdx]);
+                }
+            }
+        }
+    } else if (!waterCompaction) {
         const auto& rocktabTables = eclState_.getTableManager().getRocktabTables();
         if (rocktabTables.size() != numRocktabTables)
             throw std::runtime_error("ROCKCOMP is activated." + std::to_string(numRocktabTables)
@@ -346,9 +408,21 @@ FlowGenericProblem<GridView,FluidSystem>::
 rockBiotComp(unsigned elementIdx) const
 {
     // Additional compressibility of the rock due to Biot poroelasticity
-    auto biot = biotCoeff(elementIdx);
-    auto lameParam = lame(elementIdx);
+    const auto biot = biotCoeff(elementIdx);
+    const auto lameParam = lame(elementIdx);
     return biot * biot / lameParam;
+}
+
+template <class GridView, class FluidSystem>
+typename FlowGenericProblem<GridView, FluidSystem>::Scalar
+FlowGenericProblem<GridView, FluidSystem>::
+rockBiotTemp(unsigned elementIdx) const
+{
+    // Additional compressibility due to Biot thermoelasticity
+    const auto biotT = biotTemp(elementIdx);
+    const auto biotC = biotCoeff(elementIdx);
+    const auto lameParam = lame(elementIdx);
+    return biotC * biotT / lameParam;
 }
 
 template<class GridView, class FluidSystem>
@@ -403,6 +477,81 @@ biotCoeff(unsigned elementIdx) const
     return biotC;
 }
 
+template <class GridView, class FluidSystem>
+typename FlowGenericProblem<GridView, FluidSystem>::Scalar
+FlowGenericProblem<GridView, FluidSystem>::
+biotTemp(unsigned elementIdx) const
+{
+    const auto& fp = eclState_.fieldProps();
+
+    // Return early if deck does not have necessary parameters
+    if (!fp.has_double("THERMEXR") && !fp.has_double("THELCOEF")) {
+        return 0.0;
+    }
+
+    // Calculate from THERMEXR or THELCOEF
+    // OBS: Only accept (YMODULE, PRATIO) or (LAME, SMODULUS) conversions for now
+    Scalar biotT = 0.0;
+    if (fp.has_double("THERMEXR") && !fp.has_double("THELCOEF")) {
+        const auto thermexr = this->lookUpData_.fieldPropDouble(fp, "THERMEXR", elementIdx);
+
+        if (fp.has_double("LAME") && fp.has_double("SMODULUS")) {
+            const auto lamParam = lame(elementIdx);
+            const auto sMod = this->lookUpData_.fieldPropDouble(fp, "SMODULUS", elementIdx);
+            biotT = thermexr * (3.0 * lamParam + 2.0 * sMod);
+        } else if (fp.has_double("YMODULE") && fp.has_double("PRATIO")) {
+            const auto yMod = this->lookUpData_.fieldPropDouble(fp, "YMODULE", elementIdx);
+            const auto pRatio = this->lookUpData_.fieldPropDouble(fp, "PRATIO", elementIdx);
+            biotT = thermexr * yMod / (1.0 - 2.0 * pRatio);
+        } else if (fp.has_double("LAME") && fp.has_double("PRATIO")) {
+            const auto lamParam = lame(elementIdx);
+            const auto pRatio = this->lookUpData_.fieldPropDouble(fp, "PRATIO", elementIdx);
+            biotT =
+                thermexr * lamParam * (1.0 / pRatio - 2.0 * pRatio - 1.0) / (1.0 - 2.0 * pRatio);
+        } else if (fp.has_double("SMODULUS") && fp.has_double("PRATIO")) {
+            const auto sMod = this->lookUpData_.fieldPropDouble(fp, "SMODULUS", elementIdx);
+            const auto pRatio = this->lookUpData_.fieldPropDouble(fp, "PRATIO", elementIdx);
+            biotT = thermexr * 2.0 * sMod * (1 + pRatio) / (1.0 - 2.0 * pRatio);
+        } else if (fp.has_double("YMODULE") && fp.has_double("SMODULUS")) {
+            const auto yMod = this->lookUpData_.fieldPropDouble(fp, "YMODULE", elementIdx);
+            const auto sMod = this->lookUpData_.fieldPropDouble(fp, "SMODULUS", elementIdx);
+            biotT = thermexr * yMod * sMod / (3.0 * sMod - yMod);
+        } else {
+            OPM_THROW(std::runtime_error,
+                      "THERMEXR requires one of (LAME, SMODULUS), (YMODULE, PRATIO), "
+                      "(LAME, PRATIO), (SMODULUS, PRATIO) or (YMODULE, SMODULUS) "
+                      "to compute the Biot temperature coefficient. "
+                      "(YMODULE, LAME) is not supported.");
+        }
+
+    } else if (!fp.has_double("THERMEXR") && fp.has_double("THELCOEF")) {
+        const auto thelcoef = this->lookUpData_.fieldPropDouble(fp, "THELCOEF", elementIdx);
+
+        if (fp.has_double("LAME") && fp.has_double("SMODULUS")) {
+            const auto lamParam = lame(elementIdx);
+            const auto sMod = this->lookUpData_.fieldPropDouble(fp, "SMODULUS", elementIdx);
+            biotT = thelcoef * (lamParam + 2 * sMod) / (2 * sMod);
+        } else if (fp.has_double("PRATIO")) {
+            const auto pRatio = this->lookUpData_.fieldPropDouble(fp, "PRATIO", elementIdx);
+            biotT = thelcoef * (1 - pRatio) / (1 - 2 * pRatio);
+        } else if (fp.has_double("YMODULE") && fp.has_double("SMODULUS")) {
+            const auto yMod = this->lookUpData_.fieldPropDouble(fp, "YMODULE", elementIdx);
+            const auto sMod = this->lookUpData_.fieldPropDouble(fp, "SMODULUS", elementIdx);
+            biotT = thelcoef * (4.0 * sMod - yMod) / (6.0 * sMod - 2.0 * yMod);
+        } else {
+            OPM_THROW(std::runtime_error,
+                      "THELCOEF requires one of (LAME, SMODULUS), (YMODULE, SMODULUS) "
+                      "to compute the Biot temperature coefficient. "
+                      "(YMODULE, LAME) is not supported.");
+        }
+    } else {
+        OPM_THROW(std::runtime_error,
+                  "THERMEXR and THELCOEF cannot both be specified for the "
+                  "Biot temperature coefficient");
+    }
+
+    return biotT;
+}
 
 template<class GridView, class FluidSystem>
 template<class T>
@@ -544,6 +693,22 @@ readBlackoilExtentionsInitialConditions_(std::size_t numDof,
                                          bool enableBioeffects,
                                          bool enableMICP)
 {
+    // LGR (local grid refinement / CARFIN) is supported for black-oil only. The
+    // solvent/polymer/biofilm/MICP initial conditions below are read straight
+    // from the input-grid field properties and indexed by leaf cell; they are
+    // NOT mapped onto refined cells (see the black-oil EQLNUM/FIPNUM handling via
+    // LookUpData), so refined cells would get wrong/out-of-range values. Fail
+    // early with a clear message rather than producing silently wrong results.
+    if ((enableSolvent || enablePolymer || enablePolymerMolarWeight ||
+         enableBioeffects || enableMICP) &&
+        (eclState_.getLgrs().size() > 0))
+    {
+        throw std::runtime_error(
+            "Local grid refinement (LGR/CARFIN) is only supported for black-oil "
+            "runs. It is not supported together with the solvent, polymer, "
+            "biofilm or MICP extensions.");
+    }
+
     auto getArray = [](const std::vector<double>& input)
     {
         if constexpr (std::is_same_v<Scalar,double>) {

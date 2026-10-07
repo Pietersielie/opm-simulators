@@ -36,6 +36,7 @@
 
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -79,6 +80,9 @@ ParamType Get_(const std::string& paramName, ParamType defaultValue,
 void Hide_(const std::string& paramName);
 
 //! \brief Private implementation.
+bool HideIfRegistered_(const std::string& paramName);
+
+//! \brief Private implementation.
 bool IsSet_(const std::string& paramName, bool errorIfNotRegistered);
 
 //! \brief Private implementation.
@@ -102,7 +106,8 @@ void SetDefault_(const std::string& paramName,
  * \param helpPreamble The string that is printed after the error message and before the
  *                     list of parameters.
  * \param os The \c std::ostream which should be used.
- * \param errorMsg The error message to be printed, if any
+ * \param errorMsg The error message to be printed, if any. If given, only the first
+ *                 line of the preamble and a pointer to --help follow it.
  * \param showAll True to show all parameters
  */
 void printUsage(const std::string& helpPreamble,
@@ -213,6 +218,11 @@ void SetDefault(decltype(Param::value) new_value)
 {
     const std::string paramName = detail::getParamName<Param>();
     std::ostringstream oss;
+    // full precision: the default stream setting of 6 significant digits
+    // silently corrupts values on the text round trip
+    if constexpr (std::is_floating_point_v<decltype(Param::value)>) {
+        oss.precision(std::numeric_limits<decltype(Param::value)>::max_digits10);
+    }
     oss << new_value;
     detail::SetDefault_(paramName, oss.str());
 }
@@ -311,6 +321,17 @@ template <class Param>
 void Hide()
 {
     detail::Hide_(detail::getParamName<Param>());
+}
+
+/*!
+ * \brief Indicate that a given parameter should not be mentioned in the help message if present.
+ *
+ * This is useful for parameters that are only registered for some models or output modules.
+ */
+template <class Param>
+bool HideIfRegistered()
+{
+    return detail::HideIfRegistered_(detail::getParamName<Param>());
 }
 
 /*!

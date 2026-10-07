@@ -26,15 +26,19 @@
 
 #include <opm/common/ErrorMacros.hpp>
 #include <opm/common/TimingMacros.hpp>
+
 #include <opm/output/data/GuideRateValue.hpp>
 #include <opm/output/data/Groups.hpp>
 #include <opm/output/data/Wells.hpp>
+
+#include <opm/output/eclipse/RegionVariableCollection.hpp>
 #include <opm/output/eclipse/RestartValue.hpp>
 
 #include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/input/eclipse/EclipseState/SummaryConfig/SummaryConfig.hpp>
 
 #include <opm/input/eclipse/Schedule/Action/SimulatorUpdate.hpp>
+#include <opm/input/eclipse/Schedule/MSW/makeMSWellFromStandardWell.hpp>
 #include <opm/input/eclipse/Schedule/Group/GConSale.hpp>
 #include <opm/input/eclipse/Schedule/Group/GroupEconProductionLimits.hpp>
 #include <opm/input/eclipse/Schedule/Group/GConSump.hpp>
@@ -54,6 +58,7 @@
 
 #include <opm/material/fluidsystems/BlackOilDefaultFluidSystemIndices.hpp>
 
+#include <opm/simulators/flow/FlowProblemParameters.hpp>
 #include <opm/simulators/utils/DeferredLogger.hpp>
 #include <opm/simulators/wells/BlackoilWellModelConstraints.hpp>
 #include <opm/simulators/wells/BlackoilWellModelGasLift.hpp>
@@ -74,6 +79,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cassert>
 #include <functional>
 #include <iterator>
@@ -113,6 +119,7 @@ BlackoilWellModelGeneric(Schedule& schedule,
     , active_wgstate_(pu)
     , last_valid_wgstate_(pu)
     , nupcol_wgstate_(pu)
+    , prev_timestep_state_(pu)
     , group_state_helper_(this->wellState(),
                           this->groupState(),
                           this->schedule(),
@@ -122,6 +129,7 @@ BlackoilWellModelGeneric(Schedule& schedule,
                           comm,
                           terminal_output_)
     , genNetwork_(network)
+    , enable_state_rollback_(Parameters::Get<Parameters::EnableStateRollback>())
 {
 
     const auto numProcs = comm_.size();
@@ -131,13 +139,9 @@ BlackoilWellModelGeneric(Schedule& schedule,
         }
 
         // Recall: false indicates NOT active!
-        const auto value = std::make_pair(well, true);
-        auto candidate = std::lower_bound(this->parallel_well_info_.begin(),
-                                          this->parallel_well_info_.end(),
-                                          value);
+        const auto* pwInfo = this->findParallelWellInfo(well);
 
-        return (candidate == this->parallel_well_info_.end())
-            || (*candidate != value);
+        return (pwInfo == nullptr) || !pwInfo->hasLocalCells();
     };
 }
 
@@ -221,6 +225,7 @@ initFromRestartFile(const RestartValue& restartValues,
     const auto& config = this->schedule()[report_step].guide_rate();
 
     // wells_ecl_ should only contain wells on this processor.
+    this->registerNewParallelWells(report_step);
     wells_ecl_ = getLocalWells(report_step);
     this->local_parallel_well_info_ = createLocalParallelWellInfo(wells_ecl_);
 
@@ -231,7 +236,8 @@ initFromRestartFile(const RestartValue& restartValues,
     // Resize for restart step
     this->wellState().resize(this->wells_ecl_, this->local_parallel_well_info_,
                              this->schedule(), handle_ms_well, numCells,
-                             this->well_perf_data_, this->summaryState_, enable_distributed_wells);
+                             this->well_perf_data_, this->summaryState_, enable_distributed_wells,
+                             this->eclState().getSimulationConfig().isThermal());
 
     BlackoilWellModelRestart(*this).
         loadRestartData(restartValues.wells,
@@ -239,6 +245,41 @@ initFromRestartFile(const RestartValue& restartValues,
                         handle_ms_well,
                         this->wellState(),
                         this->groupState());
+
+    // Reconstruct the retained network THP limit, which the restart file does
+    // not carry. A well is attached to the network when its group is a network
+    // node, and detached once it is not, for instance after WELSPECS moved it
+    // to a non-network group. Attached wells recover their limit from the
+    // restored node pressures; a detached well must recover it from itself: a
+    // THP-controlled well enforces its limit as ws.thp, so the restart THP is
+    // that limit, unless it matches the schedule limit. In that case the well
+    // runs on its own limit and seeding would freeze it against later (UDA)
+    // updates. A limit that was inactive when the restart was written, e.g. on
+    // a rate-controlled well, cannot be recovered. A well without a VFP table
+    // cannot be put under THP control, so nothing is reconstructed for it.
+    // The network.active() test asks whether the deck defines a network at
+    // all; without it a restart would put ordinary THP wells in network-free
+    // decks on the dynamic-THP-limit path.
+    if (const auto& network = this->schedule()[report_step].network(); network.active()) {
+        for (const auto& well : wells_ecl_) {
+            if (!well.isProducer() || !well.predictionMode() ||
+                well.vfp_table_number() <= 0 ||
+                network.has_node(well.groupName()))
+            {
+                continue;
+            }
+            auto& ws = this->wellState().well(well.name());
+            if (ws.production_cmode != Well::ProducerCMode::THP || !(ws.thp > 0.0)) {
+                continue;
+            }
+            const Scalar schedule_limit = well.productionControls(summaryState_).thp_limit;
+            // Relative tolerance for the unit round-trip through the restart file.
+            const Scalar tol = 1e-7 * std::max(std::abs(ws.thp), std::abs(schedule_limit));
+            if (std::abs(ws.thp - schedule_limit) > tol) {
+                ws.network_thp_limit = ws.thp;
+            }
+        }
+    }
 
     if (config.has_model()) {
         BlackoilWellModelRestart(*this).
@@ -266,22 +307,38 @@ void BlackoilWellModelGeneric<Scalar, IndexTraits>::
 prepareDeserialize(int report_step, const std::size_t numCells, bool enable_distributed_wells)
 {
     // wells_ecl_ should only contain wells on this processor.
+    this->registerNewParallelWells(report_step);
     wells_ecl_ = getLocalWells(report_step);
     this->local_parallel_well_info_ = createLocalParallelWellInfo(wells_ecl_);
 
     this->initializeWellProdIndCalculators();
     initializeWellPerfData();
 
-    if (! this->wells_ecl_.empty()) {
-        const bool handle_ms_well = param_.use_multisegment_well_ && anyMSWellOpenLocal();
-        this->wellState().resize(this->wells_ecl_, this->local_parallel_well_info_,
-                                 this->schedule(), handle_ms_well, numCells,
-                                 this->well_perf_data_, this->summaryState_, enable_distributed_wells);
-
-    }
+    // Resize unconditionally, including when this rank has no local wells at
+    // report_step. Skipping it there leaves the PREVIOUS call's well state in
+    // place, so the well state no longer describes report_step and a
+    // subsequent deserialization fails on the size check in
+    // WellState::serializeOp.
+    //
+    // A forward restart never notices, because it deserializes one step into a
+    // fresh model. Walking a run backwards does: a rank goes from "has wells"
+    // to "has none" as it moves to earlier report steps, and a stale non-empty
+    // well state survives into a step whose stored state is empty. Norne, where
+    // wells are drilled progressively, hits this; decks whose wells all exist
+    // from step 0 (SPE1, SPE9) never do.
+    //
+    // WellState::resize handles an empty well list correctly - base_init clears
+    // the well container and init returns early after the bookkeeping.
+    const bool handle_ms_well = param_.use_multisegment_well_ &&
+                                !this->wells_ecl_.empty() && anyMSWellOpenLocal();
+    this->wellState().resize(this->wells_ecl_, this->local_parallel_well_info_,
+                             this->schedule(), handle_ms_well, numCells,
+                             this->well_perf_data_, this->summaryState_, enable_distributed_wells,
+                             this->eclState().getSimulationConfig().isThermal());
     this->wellState().clearWellRates();
     this->commitWGState();
     this->updateNupcolWGState();
+    this->deserialized_state_pending_ = true;
 }
 
 template<typename Scalar, typename IndexTraits>
@@ -300,6 +357,26 @@ getLocalWells(const int timeStepIdx) const
                            (const std::string& wname)
                            { return st.wells(wname); });
 
+    // Optionally turn plain single-segment wells into multisegment wells so the
+    // wellbore hydrostatic head is solved implicitly. No-op for wells that are
+    // already multisegment.
+    const auto& convert = this->param_.convert_to_multisegment_well_;
+    if (convert == "per-connection") {
+        // One linear tubing with a segment per connection: a pressure unknown
+        // per perforation, so the head between perforations is solved for.
+        constexpr double tubing_diameter = 0.1524; // 6"
+        const auto& units = this->schedule().getUnits();
+        for (auto& well : w) {
+            well = makeMultiSegmentWellPerConnection(well, units, tubing_diameter);
+        }
+    }
+    else if (convert != "none") {
+        OPM_THROW(std::runtime_error,
+                  fmt::format("Unknown value '{}' for ConvertToMultisegmentWell. "
+                              "Valid values are 'none' and 'per-connection'.",
+                              convert));
+    }
+
     return w;
 }
 
@@ -312,15 +389,90 @@ createLocalParallelWellInfo(const std::vector<Well>& wells)
     local_parallel_well_info.reserve(wells.size());
     for (const auto& well : wells)
     {
-        auto wellPair = std::make_pair(well.name(), true);
-        auto pwell = std::lower_bound(parallel_well_info_.begin(),
-                                      parallel_well_info_.end(),
-                                      wellPair);
-        assert(pwell != parallel_well_info_.end() &&
-               *pwell == wellPair);
+        auto* pwell = this->findParallelWellInfo(well.name());
+        if (pwell == nullptr) {
+            OPM_THROW(std::logic_error,
+                      fmt::format("No parallel well information registered "
+                                  "for well {}", well.name()));
+        }
         local_parallel_well_info.push_back(std::ref(*pwell));
     }
     return local_parallel_well_info;
+}
+
+template<typename Scalar, typename IndexTraits>
+const ParallelWellInfo<Scalar>*
+BlackoilWellModelGeneric<Scalar, IndexTraits>::
+findParallelWellInfo(const std::string& wname) const
+{
+    auto pwell = std::lower_bound(this->parallel_well_info_.begin(),
+                                  this->parallel_well_info_.end(), wname,
+                                  [](const auto& pwInfo, const std::string& name)
+                                  { return pwInfo->name() < name; });
+
+    return ((pwell == this->parallel_well_info_.end()) ||
+            ((*pwell)->name() != wname))
+        ? nullptr
+        : pwell->get();
+}
+
+template<typename Scalar, typename IndexTraits>
+ParallelWellInfo<Scalar>*
+BlackoilWellModelGeneric<Scalar, IndexTraits>::
+findParallelWellInfo(const std::string& wname)
+{
+    // No const_cast needed to share the const overload's lookup: the elements
+    // are unique_ptrs, and constness of the pointer does not carry to the
+    // pointee, so get() already yields a mutable ParallelWellInfo.
+    auto pwell = std::lower_bound(this->parallel_well_info_.begin(),
+                                  this->parallel_well_info_.end(), wname,
+                                  [](const auto& pwInfo, const std::string& name)
+                                  { return pwInfo->name() < name; });
+
+    return ((pwell == this->parallel_well_info_.end()) ||
+            ((*pwell)->name() != wname))
+        ? nullptr
+        : pwell->get();
+}
+
+template<typename Scalar, typename IndexTraits>
+void BlackoilWellModelGeneric<Scalar, IndexTraits>::
+registerNewParallelWells(const int reportStepIdx)
+{
+    auto added = false;
+
+    for (const auto& wname : this->schedule().wellNames(reportStepIdx)) {
+        if (this->findParallelWellInfo(wname) != nullptr) {
+            continue;
+        }
+
+        const auto& well = this->schedule()[reportStepIdx].wells(wname);
+
+        // A well drilled by an action is not part of the grid partitioning,
+        // so we have to work out here whether it perforates cells on this
+        // rank.
+        const auto hasLocalCells = std::ranges::
+            any_of(well.getConnections(), [this, &well](const Connection& conn)
+            {
+                const auto active_index = well.is_lgr_well()
+                    ? this->compressedIndexForInteriorLGR
+                        (well.get_lgr_well_tag().value(), conn)
+                    : this->compressedIndexForInterior(conn.global_index());
+
+                return active_index >= 0;
+            });
+
+        this->parallel_well_info_.push_back
+            (std::make_unique<ParallelWellInfo<Scalar>>
+             (std::make_pair(wname, hasLocalCells), this->comm_));
+
+        added = true;
+    }
+
+    if (added) {
+        std::ranges::sort(this->parallel_well_info_, {},
+                          [](const auto& pwInfo) { return pwInfo->name(); });
+    }
 }
 
 template<typename Scalar, typename IndexTraits>
@@ -799,6 +951,22 @@ updateEclWells(const int timeStepIdx,
 {
     this->updateEclWellsConstraints(timeStepIdx, sim_update, st);
 
+    // Re-specifying THP or VFP controls in ACTIONX cancels a retained
+    // network-imposed limit, even if the value is unchanged. At a report step
+    // the same change arrives as WELL_THP_UPDATE and is handled in
+    // WellState::init().
+    for (const auto& wname : sim_update.thp_respecified_wells) {
+        if (const auto well_index = this->wellState().index(wname)) {
+            this->wellState().well(*well_index).network_thp_limit.reset();
+        }
+        auto well_it = std::ranges::find_if(this->well_container_generic_,
+                                            [&wname](const auto* well)
+                                            { return well->name() == wname; });
+        if (well_it != this->well_container_generic_.end()) {
+            (*well_it)->setDynamicThpLimit(std::nullopt);
+        }
+    }
+
     if (! sim_update.well_structure_changed &&
         ! this->wellStructureChangedDynamically_)
     {
@@ -1116,6 +1284,93 @@ assignDynamicWellStatus(data::Wells& wsrpt) const
 
 template<typename Scalar, typename IndexTraits>
 void BlackoilWellModelGeneric<Scalar, IndexTraits>::
+assignWellPerformanceEventTracker(data::Wells& wsrpt) const
+{
+    this->loopOwnedWells([this, &wsrpt]
+                         ([[maybe_unused]] const auto wellID,
+                          const Well&                 well)
+    {
+        wsrpt[well.name()].performanceEvents =
+            this->well_performance_event_tracker_.events(well.name());
+    });
+}
+
+template<typename Scalar, typename IndexTraits>
+WellStatusSnapshot BlackoilWellModelGeneric<Scalar, IndexTraits>::
+wellStatusSnapshot() const
+{
+    // Take the snapshot unconditionally.  Gating it on the summary
+    // configuration would miss WPWE vectors referenced only by a UDQ or an
+    // ACTIONX condition, and the walk costs far less than a linear solve.
+    auto snapshot = WellStatusSnapshot{};
+
+    // Only the owning rank reports a well's WPWE values, so only owned wells
+    // are snapshot.  No MPI communication is needed: the owner has the well's
+    // full scheduled connection list, and every rank sharing the well records
+    // the same closure decisions in WellTestState.
+    const auto& wtestState = this->wellTestState();
+
+    this->loopOwnedWells([this, &snapshot, &wtestState]([[maybe_unused]] const auto wellIndex,
+                                                        const Well& well) {
+        if (!this->wellState().has(well.name())) {
+            return;
+        }
+
+        auto& entry = snapshot.wells[well.name()];
+        entry.status = this->wellState().well(well.name()).status;
+
+        // Track connection state independently of well status: shutting an
+        // entire well, for example with a 'WELL' workover, does not close its
+        // individual connections.
+        const auto& connections = well.getConnections();
+        if (! connections.empty()) {
+            entry.topCompletion = connections[0].complnum();
+        }
+
+        for (const auto& connection : connections) {
+            const auto complnum = connection.complnum();
+            const auto closedByWorkover =
+                wtestState.completion_is_closed(well.name(), complnum);
+
+            if ((connection.state() == Connection::State::OPEN) &&
+                !closedByWorkover)
+            {
+                // The cell identifies the connection whatever COMPLUMP calls
+                // it; the completion number is what WPWE3 asks about.
+                entry.openConnections.emplace_back(connection.get_lgr_level(),
+                                                   connection.global_index());
+                entry.openCompletions.push_back(complnum);
+            }
+            else if (wtestState.completion_closed_below_offender(well.name(), complnum)) {
+                entry.closedBelowOffender.emplace_back(connection.get_lgr_level(),
+                                                       connection.global_index());
+            }
+        }
+
+        std::ranges::sort(entry.openConnections);
+        std::ranges::sort(entry.closedBelowOffender);
+        std::ranges::sort(entry.openCompletions);
+
+        // A closure made by an economic or physical limit check does not reach
+        // WellState until the next time step is set up.  Consult WellTestState
+        // so the snapshot records the closure in the time step that caused it.
+        // The indicators follow the WELSPECS automatic shut-in instruction.
+        // In contrast, closedWellStatus() also returns SHUT when cross-flow is
+        // disabled; that simulator shortcut is not a deck-requested shut-in
+        // and must not turn a WPWE4 event into WPWE7.
+        if ((entry.status == WellStatus::OPEN) &&
+            wtestState.well_is_closed(well.name()))
+        {
+            entry.status = (well.getAutomaticShutIn() || entry.openCompletions.empty())
+                ? WellStatus::SHUT : WellStatus::STOP;
+        }
+    });
+
+    return snapshot;
+}
+
+template<typename Scalar, typename IndexTraits>
+void BlackoilWellModelGeneric<Scalar, IndexTraits>::
 assignShutConnections(data::Wells& wsrpt,
                       const int reportStepIndex) const
 {
@@ -1218,6 +1473,34 @@ groupAndNetworkData(const int reportStepIdx) const
     this->genNetwork_.assignNodeAndBranchValues(grp_nwrk_values.nodeData, grp_nwrk_values.branchData, grp_nwrk_values.convergedBranchData, reportStepIdx - 1); // Schedule state info at previous step
 
     return grp_nwrk_values;
+}
+
+template<typename Scalar, typename IndexTraits>
+void BlackoilWellModelGeneric<Scalar, IndexTraits>::
+reportIntervalConnectionOilProduction(const double              dt,
+                                      const std::size_t         conn_opt_ix,
+                                      RegionVariableCollection& regVars) const
+{
+    auto wasDynamicallyClosed = [this](const std::string& wname)
+    {
+        return this->wasDynamicallyShutThisTimeStep(wname);
+    };
+
+    auto wellEffFac = [this](const std::string& wname)
+    {
+        const auto wellPtrPos = std::ranges::find_if
+            (this->well_container_generic_,
+             [&wname](const auto* wellPtr) { return wellPtr->name() == wname; });
+
+        return (wellPtrPos == this->well_container_generic_.end())
+            ? 0.0
+            : (*wellPtrPos)->wellEfficiencyFactor();
+    };
+
+    this->wellState().reportIntervalConnectionOilProduction
+        (dt, wasDynamicallyClosed, wellEffFac,
+         [conn_opt_ix, &regVars](const std::size_t cell_ix, const double copt)
+        { regVars.addCellValue(conn_opt_ix, cell_ix, copt); });
 }
 
 template<typename Scalar, typename IndexTraits>
@@ -1464,6 +1747,14 @@ forceShutWellByName(const std::string& wellname,
                              });
     if (it != well_container_generic_.end()) {
         wellTestState().close_well(wellname, WellTestConfig::Reason::PHYSICAL, simulation_time);
+
+        // Non-owning ranks have no snapshot entry, and do not report WPWE.
+        const auto snapshot = this->wellStatusSnapshot();
+        if (const auto pos = snapshot.wells.find(wellname); pos != snapshot.wells.end()) {
+            this->well_performance_event_tracker_.recordWellStatusChangeForRetry(
+                wellname, pos->second.status);
+        }
+
         well_was_shut = 1;
     }
 
@@ -1981,21 +2272,24 @@ operator==(const BlackoilWellModelGeneric& rhs) const
         && this->switched_prod_groups_ == rhs.switched_prod_groups_
         && this->switched_inj_groups_ == rhs.switched_inj_groups_
         && this->closed_offending_wells_ == rhs.closed_offending_wells_
-        && this->gen_gaslift_ == rhs.gen_gaslift_;
+        && this->gen_gaslift_ == rhs.gen_gaslift_
+        && this->well_performance_event_tracker_ == rhs.well_performance_event_tracker_;
 }
 
 
 template<typename Scalar, typename IndexTraits>
-bool BlackoilWellModelGeneric<Scalar, IndexTraits>::
-allConnectionsClosed(const Well& well_ecl) const
+WellStatus BlackoilWellModelGeneric<Scalar, IndexTraits>::
+closedWellStatus(const Well& well_ecl) const
 {
-    return std::ranges::all_of(well_ecl.getConnections(),
-                               [this, &well_name = well_ecl.name()](const auto& connection)
-                               {
-                                   return connection.state() != Connection::State::OPEN
-                                       || this->wellTestState().completion_is_closed(well_name,
-                                                                                     connection.complnum());
-                               });
+    const bool allConnectionsClosed = std::ranges::all_of(
+        well_ecl.getConnections(),
+        [this, &well_name = well_ecl.name()](const auto& connection)
+        {
+            return connection.state() != Connection::State::OPEN
+                || this->wellTestState().completion_is_closed(well_name, connection.complnum());
+        });
+    return (well_ecl.getAutomaticShutIn() || !well_ecl.getAllowCrossFlow() || allConnectionsClosed)
+        ? WellStatus::SHUT : WellStatus::STOP;
 }
 
 template class BlackoilWellModelGeneric<double, BlackOilDefaultFluidSystemIndices>;

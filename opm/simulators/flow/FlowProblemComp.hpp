@@ -1,7 +1,7 @@
 // -*- mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
 // vi: set et ts=4 sw=4 sts=4:
 /*
-  Copyright 2024 SINTEF Digital
+  Copyright 2024, 2026 SINTEF Digital
 
   This file is part of the Open Porous Media project (OPM).
 
@@ -32,8 +32,10 @@
 
 
 #include <opm/simulators/flow/FlowProblem.hpp>
-#include <opm/simulators/flow/FlowThresholdPressure.hpp>
 #include <opm/simulators/flow/OutputCompositionalModule.hpp>
+#include <opm/simulators/flow/equil/InitStateEquilComp.hpp>
+
+#include <opm/grid/LookUpData.hh>
 
 #include <opm/material/fluidstates/CompositionalFluidState.hpp>
 
@@ -43,8 +45,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <set>
-#include <string>
 #include <vector>
 
 namespace Opm {
@@ -98,6 +98,7 @@ public:
     static void registerParameters()
     {
         FlowProblemType::registerParameters();
+        Parameters::SetDefault<Parameters::InputSkipMode>("300");
 
         EclWriterType::registerParameters();
 
@@ -117,7 +118,6 @@ public:
      */
     explicit FlowProblemComp(Simulator& simulator)
         : FlowProblemType(simulator)
-        , thresholdPressures_(simulator)
     {
         eclWriter_ = std::make_unique<EclWriterType>(simulator);
         enableEclOutput_ = Parameters::Get<Parameters::EnableEclOutput>();
@@ -128,80 +128,25 @@ public:
      */
     void finishInit()
     {
-        // TODO: there should be room to remove duplication for this function,
-        // but there is relatively complicated logic in the function calls in this function
-        // some refactoring is needed for this function
         FlowProblemType::finishInit();
 
         auto& simulator = this->simulator();
-
-        auto finishTransmissibilities = [updated = false, this]() mutable {
-            if (updated) {
-                return;
-            }
-            this->transmissibilities_.finishInit(
-                [&vg = this->simulator().vanguard()](const unsigned int it) { return vg.gridIdxToEquilGridIdx(it); });
-            updated = true;
-        };
-        // TODO: we might need to do the same with FlowProblemBlackoil for parallel
-
-        finishTransmissibilities();
-
-        if (enableEclOutput_) {
-            eclWriter_->setTransmissibilities(&simulator.problem().eclTransmissibilities());
-            std::function<unsigned int(unsigned int)> equilGridToGrid = [&simulator](unsigned int i) {
-                return simulator.vanguard().gridEquilIdxToGridIdx(i);
-            };
-            eclWriter_->extractOutputTransAndNNC(equilGridToGrid);
+        const bool transmissibilitiesFinished =
+            this->prepareTransmissibilityOutput_(*eclWriter_, enableEclOutput_);
+        if (!transmissibilitiesFinished) {
+            this->finishTransmissibilities_();
         }
 
         const auto& eclState = simulator.vanguard().eclState();
         const auto& schedule = simulator.vanguard().schedule();
-
-        // Set the start time of the simulation
-        simulator.setStartTime(schedule.getStartTime());
-        simulator.setEndTime(schedule.simTime(schedule.size() - 1));
-
-        // We want the episode index to be the same as the report step index to make
-        // things simpler, so we have to set the episode index to -1 because it is
-        // incremented by endEpisode(). The size of the initial time step and
-        // length of the initial episode is set to zero for the same reason.
-        simulator.setEpisodeIndex(-1);
-        simulator.setEpisodeLength(0.0);
-
-        // the "NOGRAV" keyword from Frontsim or setting the EnableGravity to false
-        // disables gravity, else the standard value of the gravity constant at sea level
-        // on earth is used
-        this->gravity_ = 0.0;
-        if (Parameters::Get<Parameters::EnableGravity>())
-            this->gravity_[dim - 1] = 9.80665;
-        if (!eclState.getInitConfig().hasGravity())
-            this->gravity_[dim - 1] = 0.0;
-
-        if (this->enableTuning_) {
-            // if support for the TUNING keyword is enabled, we get the initial time
-            // steping parameters from it instead of from command line parameters
-            const auto& tuning = schedule[0].tuning();
-            this->initialTimeStepSize_ = tuning.TSINIT.has_value() ? tuning.TSINIT.value() : -1.0;
-            this->maxTimeStepAfterWellEvent_ = tuning.TMAXWC;
-        }
+        this->initializeSimulatorTime_();
 
         this->initFluidSystem_();
-
-        if (FluidSystem::phaseIsActive(FluidSystem::oilPhaseIdx)
-            && FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx)) {
-            this->maxOilSaturation_.resize(this->model().numGridDof(), 0.0);
+        if (eclState.getSimulationConfig().rock_config().active()) {
+            throw std::runtime_error("Rock compaction (ROCKCOMP) is not supported "
+                                     "by compositional modeling yet");
         }
-
-        this->readRockParameters_(simulator.vanguard().cellCenterDepths(), [&simulator](const unsigned idx) {
-            std::array<int, dim> coords;
-            simulator.vanguard().cartesianCoordinate(idx, coords);
-            std::ranges::transform(coords, coords.begin(),
-                                   [](const auto c) { return c + 1; });
-            return coords;
-        });
-        FlowProblemType::readMaterialParameters_();
-        FlowProblemType::readThermalParameters_();
+        this->initializeModelProperties_();
 
         // write the static output files (EGRID, INIT)
         if (enableEclOutput_) {
@@ -247,6 +192,17 @@ public:
             simulator.setEpisodeIndex(0);
             simulator.setTimeStepIndex(0);
         }
+    }
+
+    /*!
+     * \copydoc FvBaseProblem::initialSolutionApplied()
+     */
+    void initialSolutionApplied() override
+    {
+        FlowProblemType::initialSolutionApplied();
+
+        // Defaulted threshold pressures are taken from the initial solution.
+        this->thresholdPressures_.finishInit();
     }
 
     /*!
@@ -411,18 +367,23 @@ public:
     const std::vector<InitialFluidState>& initialFluidStates() const
     { return initialFluidStates_; }
 
-    const FlowThresholdPressure<TypeTag>& thresholdPressure() const
-    {
-        assert( !thresholdPressures_.enableThresholdPressure() &&
-                " Threshold Pressures are not supported by compostional simulation ");
-        return thresholdPressures_;
-    }
-
     const EclWriterType& eclWriter() const
     { return *eclWriter_; }
 
     EclWriterType& eclWriter()
     { return *eclWriter_; }
+
+    void setSubStepReport(const SimulatorReportSingle& report)
+    { return eclWriter_->setSubStepReport(report); }
+
+    void setSimulationReport(const SimulatorReport& report)
+    { return eclWriter_->setSimulationReport(report); }
+
+    void finalizeOutput()
+    {
+        OPM_TIMEBLOCK(finalizeOutput);
+        eclWriter_.reset();
+    }
 
     // TODO: do we need this one?
     template<class Serializer>
@@ -440,7 +401,61 @@ protected:
 
     void readEquilInitialCondition_() override
     {
-        throw std::logic_error("Equilibration is not supported by compositional modeling yet");
+        const auto& simulator = this->simulator();
+        const auto& vanguard = simulator.vanguard();
+        const auto& eclState = vanguard.eclState();
+
+        // Zero-based equilibration region of every cell (EQLNUM, or region 0).
+        // EQLNUM is given on the unrefined input grid while the equilibration
+        // works on the leaf grid, so a refined cell takes its parent's region;
+        // without local refinement the mapping is the identity.
+        std::vector<int> eqlnum(this->model().numGridDof(), 0);
+        if (eclState.fieldProps().has_int("EQLNUM")) {
+            const LookUpData<typename GridView::Grid, GridView>
+                lookUpData(vanguard.gridView());
+            eqlnum = lookUpData.template assignFieldPropsIntOnLeaf<int>(
+                eclState.fieldProps(), "EQLNUM", /*needsTranslation=*/true);
+        }
+
+        // The water saturation endpoints are selected by SATNUM and scaled per
+        // cell, so they are read here rather than from the equilibration region.
+        std::vector<Scalar> connateWater, maxWater;
+        if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
+            const auto numDof = this->model().numGridDof();
+            connateWater.resize(numDof);
+            maxWater.resize(numDof);
+            for (std::size_t dofIdx = 0; dofIdx < numDof; ++dofIdx) {
+                const auto& eps = this->materialLawManager()
+                    ->oilWaterScaledEpsInfoDrainage(static_cast<int>(dofIdx));
+                connateWater[dofIdx] = eps.Swl;
+                maxWater[dofIdx] = eps.Swu;
+            }
+        }
+
+        EQUIL::Comp::InitialStateComputer<FluidSystem> initialState(
+            eclState,
+            getEosType(),
+            vanguard.cellCenterDepths(),
+            eqlnum,
+            vanguard.gridView().comm(),
+            this->gravity()[dimWorld - 1],
+            this->numPressurePointsEquil(),
+            connateWater,
+            maxWater);
+
+        initialFluidStates_ = std::move(initialState.fluidStates());
+        // The current flash has one pressure for all phases. Adapt the
+        // independent equilibrium columns here, using the water column below
+        // the contact. Once phase-pressure differences are supported by the
+        // flash, the equilibrated phase pressures can be used directly.
+        for (std::size_t cell = 0; cell < initialFluidStates_.size(); ++cell) {
+            for (unsigned phaseIdx = 0; phaseIdx < FluidSystem::numPhases; ++phaseIdx) {
+                initialFluidStates_[cell].setPressure(phaseIdx,
+                                                     initialState.referencePressures()[cell]);
+            }
+        }
+        // The primary variables are formed from the total composition; see initial().
+        zmf_initialization_ = true;
     }
 
     void readEclRestartSolution_()
@@ -598,32 +613,30 @@ protected:
 
 private:
 
-    void handleSolventBC(const BCProp::BCFace& /* bc */, RateVector& /* rate */) const override
+    void handleSolventBC(const BCState::BCFace& /* bc */, RateVector& /* rate */) const override
     {
         throw std::logic_error("solvent is disabled for compositional modeling and you're trying to add solvent to BC");
     }
 
-    void handlePolymerBC(const BCProp::BCFace& /* bc */, RateVector& /* rate */) const override
+    void handlePolymerBC(const BCState::BCFace& /* bc */, RateVector& /* rate */) const override
     {
         throw std::logic_error("polymer is disabled for compositional modeling and you're trying to add polymer to BC");
     }
 
-    void handleMicrBC(const BCProp::BCFace& /* bc */, RateVector& /* rate */) const override
+    void handleMicrBC(const BCState::BCFace& /* bc */, RateVector& /* rate */) const override
     {
         throw std::logic_error("MICP is disabled for compositional modeling and you're trying to add microbes to BC");
     }
 
-    void handleOxygBC(const BCProp::BCFace& /* bc */, RateVector& /* rate */) const override
+    void handleOxygBC(const BCState::BCFace& /* bc */, RateVector& /* rate */) const override
     {
         throw std::logic_error("MICP is disabled for compositional modeling and you're trying to add oxygen to BC");
     }
 
-    void handleUreaBC(const BCProp::BCFace& /* bc */, RateVector& /* rate */) const override
+    void handleUreaBC(const BCState::BCFace& /* bc */, RateVector& /* rate */) const override
     {
         throw std::logic_error("MICP is disabled for compositional modeling and you're trying to add urea to BC");
     }
-
-    FlowThresholdPressure<TypeTag> thresholdPressures_;
 
     std::vector<InitialFluidState> initialFluidStates_;
 

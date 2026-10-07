@@ -30,13 +30,31 @@
 
 #include <opm/common/TimingMacros.hpp>
 
+#include <opm/input/eclipse/EclipseState/Grid/RegionSetMatcher.hpp>
+#include <opm/input/eclipse/Schedule/ResCoup/ReservoirCouplingInfo.hpp>
+#include <opm/input/eclipse/Schedule/Schedule.hpp>
+#include <opm/input/eclipse/Schedule/SummaryState.hpp>
+#include <opm/input/eclipse/Schedule/UDQ/UDQConfig.hpp>
+#include <opm/input/eclipse/Schedule/UDQ/UDQDefine.hpp>
+#include <opm/input/eclipse/Schedule/UDQ/UDQEnums.hpp>
+#include <opm/input/eclipse/Schedule/Well/WellMatcher.hpp>
+#include <opm/input/eclipse/Units/UnitSystem.hpp>
+
+#include <opm/simulators/utils/DeferredLoggingErrorHelpers.hpp>
 #include <opm/simulators/wells/BlackoilWellModel.hpp>
 #include <opm/simulators/wells/rescoup/RescoupConstraintsCalculator.hpp>
 #include <opm/simulators/wells/rescoup/RescoupReceiveGroupConstraints.hpp>
 #include <opm/simulators/wells/rescoup/RescoupReceiveSlaveGroupData.hpp>
 #include <opm/simulators/wells/rescoup/RescoupSendSlaveGroupData.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cassert>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <string>
+#include <tuple>
 
 namespace Opm {
 
@@ -53,6 +71,47 @@ BlackoilWellModelRescoup(BlackoilWellModel<TypeTag>& well_model)
 
 // Public methods alphabetically
 // ------------------------------
+
+template<typename TypeTag>
+void
+BlackoilWellModelRescoup<TypeTag>::
+evalGroupAndFieldUDQs()
+{
+    const int reportStepIdx = this->groupStateHelper().reportStepIdx();
+    auto& deferred_logger = this->groupStateHelper().deferredLogger();
+    // UDQs are normally evaluated at the end of a time step.  A slave UDQ
+    // that depends on a target imposed by the master would then lag one
+    // step behind, so re-evaluate the group and field level UDQs now that
+    // this step's targets have arrived.  Well and segment level UDQs are
+    // left alone: their inputs are not available yet.  So is any
+    // "UPDATE NEXT" DEFINE: it is a one-shot that the ordinary end-of-step
+    // evaluation is meant to consume, and this extra evaluation must not
+    // use it up early.
+    const auto select = [](const UDQDefine& def) {
+        const auto var_type = def.var_type();
+        return ((var_type == UDQVarType::GROUP_VAR) || (var_type == UDQVarType::FIELD_VAR))
+            && (def.status().first != UDQUpdate::NEXT);
+    };
+    const auto& schedule = this->schedule();
+    OPM_BEGIN_PARALLEL_TRY_CATCH();
+    {
+        schedule[reportStepIdx].udq().eval(
+            reportStepIdx,
+            schedule.wellMatcher(reportStepIdx),
+            schedule[reportStepIdx].group_order(),
+            schedule.segmentMatcherFactory(reportStepIdx),
+            [es = std::cref(this->simulator_.vanguard().eclState())]() {
+                return std::make_unique<RegionSetMatcher>(es.get().fipRegionStatistics());
+            },
+            this->simulator_.vanguard().summaryState(),
+            this->simulator_.vanguard().udqState(),
+            select);
+    }
+    OPM_END_PARALLEL_TRY_CATCH_LOG(deferred_logger,
+                                   "Failed to evaluate UDQs for reservoir coupling slave: ",
+                                   this->well_model_.terminalOutput(),
+                                   this->simulator_.vanguard().grid().comm())
+}
 
 template<typename TypeTag>
 bool
@@ -78,7 +137,7 @@ masterNetworkHasMasterGroupLeaves() const
     const auto& rcm = this->reservoirCouplingMaster();
     const auto num_slaves = rcm.numSlaves();
     for (std::size_t s = 0; s < num_slaves; ++s) {
-        if (!rcm.slaveIsActivated(s)) continue;
+        if (!rcm.slaveIsCoupled(s)) continue;
         if (this->masterNetworkHasMasterGroupLeavesForSlave_(s)) {
             return true;
         }
@@ -109,6 +168,7 @@ maybeExchangeNetworkOuterIterationWithSlaves(bool more_network_update)
         if (!is_final) {
             // receive slaves' updated network_surface_rates for the next outer iteration.
             this->receiveSlaveGroupData();
+            this->refreshAndSendInjectionTargets_();
         }
     }
 }
@@ -144,6 +204,7 @@ maybeExchangeNetworkSubIterationWithSlaves()
     }
     this->sendMasterGroupNodePressuresToSlaves(/*is_final=*/false);
     this->receiveSlaveGroupData();
+    this->refreshAndSendInjectionTargets_();
 }
 
 template<typename TypeTag>
@@ -182,38 +243,47 @@ receiveMasterGroupNodePressuresFromMaster()
     if (num_pressures > 0) {
         rescoup_slave.receiveMasterGroupNodePressuresFromMaster(num_pressures);
     }
-    // Apply pressures as dynamic THP limits on every producer whose
-    // group has a master-supplied pressure.  Wells in master groups that
-    // are not network leaves are not touched (no entry in the map).
-    // Mirrors the standard local-network apply pattern in
+    // Apply pressures as dynamic THP limits on every producer whose group
+    // has a master-supplied pressure *and* whose group the slave's own deck
+    // placed in its own surface network as a fixed-pressure node.  Wells in
+    // master groups that are not network leaves are not touched either (no
+    // entry in the map).  Mirrors the standard local-network apply pattern in
     // BlackoilWellModelNetworkGeneric::updatePressures(): when the well is
     // currently THP-controlled, also write the new THP into the WellState
     // directly, because setDynamicThpLimit() alone leaves the active
     // control's THP value stale and the subsequent well-solve would
     // converge against the old THP.
     //
-    // TODO (follow-up PR): this THP-direct path is only correct when the
-    // slave has no extended network between its slave group and the wells
-    // (the case exercised here).  When the slave uses an extended network
-    // with the slave group declared as a fixed-pressure node, the master-
-    // supplied pressure should instead be installed as that node's terminal
-    // pressure and the slave's network solver should propagate it down to
-    // the wells.  The plumbing exists -- the solver already reads
+    // The node-pressure exchange is a boundary condition between two
+    // networks: the master's network ends at the master groups, and the
+    // pressure it computes there is the fixed pressure of the corresponding
+    // slave group's node in the *slave's* network.  A slave that declares no
+    // network has no such node, and its wells keep the THP limits from their
+    // own WCONPROD records -- so the messages are still received (the
+    // protocol is unchanged) but nothing is imposed.
+    //
+    // TODO (follow-up PR): when the slave group is a fixed-pressure node with
+    // branches below it, the pressure belongs at the top of the slave's own
+    // network solve rather than directly on the wells; the slave's branches
+    // and their pressure losses then decide the wells' THP limits.  The
+    // plumbing exists -- the solver already reads
     // Network::Node::terminal_pressure() when walking up branches -- but
     // surfacing the master-sent value into the solver needs a runtime
     // override path (e.g. a fixed-pressure override map on
     // BlackoilWellModelNetwork) so we do not mutate the parsed Schedule
-    // network at runtime.  Until then, decks where the slave group is a
-    // fixed-pressure node in the slave's extended network are not handled
-    // correctly.
+    // network at runtime.  Until then the direct write below is exact only
+    // for a slave group that is itself a well group, where there is no
+    // branch between the node and the wells.
     const auto& pressures = rescoup_slave.masterGroupNodePressures();
     if (pressures.empty()) return;
     const auto& summary_state = this->well_model_.summaryState();
     auto& well_state = this->wellState();
     for (auto& well : this->wellContainer()) {
         if (!well->isProducer() || !well->wellEcl().predictionMode()) continue;
-        const auto it = pressures.find(well->wellEcl().groupName());
+        const auto& group_name = well->wellEcl().groupName();
+        const auto it = pressures.find(group_name);
         if (it == pressures.end()) continue;
+        if (!this->slaveGroupIsFixedPressureNodeInOwnNetwork_(group_name)) continue;
         well->setDynamicThpLimit(it->second);
         auto& ws = well_state[well->indexOfWell()];
         if (ws.production_cmode == Well::ProducerCMode::THP) {
@@ -233,6 +303,24 @@ receiveSlaveGroupData()
         this->groupStateHelper(),
     };
     slave_group_data_receiver.receiveSlaveGroupData();
+}
+
+template<typename TypeTag>
+void
+BlackoilWellModelRescoup<TypeTag>::
+refreshSlaveGroupTargets()
+{
+    // The deck's own GCONINJE and GCONPROD limits may be UDAs, resolved from
+    // the summary state, and the UDQ evaluation below may change them.  So
+    // prime, evaluate the selected UDQs, and work the targets in force out
+    // once more with the UDQs current, as the well control path will see
+    // them.  The second pass repeats the loops over the slave groups, not
+    // the UDQ evaluation.
+    this->storeSlaveGroupInjectionTargets();
+    this->storeSlaveGroupProductionTargets();
+    this->evalGroupAndFieldUDQs();
+    this->storeSlaveGroupInjectionTargets();
+    this->storeSlaveGroupProductionTargets();
 }
 
 template<typename TypeTag>
@@ -282,7 +370,7 @@ sendCoupledNetworkActiveStatus()
     const auto num_slaves = rescoup_master.numSlaves();
     bool any_connected = false;
     for (std::size_t slave_idx = 0; slave_idx < num_slaves; ++slave_idx) {
-        if (rescoup_master.slaveIsActivated(slave_idx)) {
+        if (rescoup_master.slaveIsCoupled(slave_idx)) {
             const bool connected =
                 this->masterNetworkHasMasterGroupLeavesForSlave_(slave_idx);
             any_connected = any_connected || connected;
@@ -323,7 +411,7 @@ sendMasterGroupNodePressuresToSlaves(bool is_final)
     const auto& node_pressures = this->network_.nodePressures();
     const auto num_slaves = rescoup_master.numSlaves();
     for (std::size_t slave_idx = 0; slave_idx < num_slaves; ++slave_idx) {
-        if (!rescoup_master.slaveIsActivated(slave_idx)) continue;
+        if (!rescoup_master.slaveIsCoupled(slave_idx)) continue;
         std::vector<typename ReservoirCoupling::MasterGroupNodePressure<Scalar>> pressures;
         const auto& master_groups = rescoup_master.getMasterGroupNamesForSlave(slave_idx);
         for (std::size_t i = 0; i < master_groups.size(); ++i) {
@@ -381,8 +469,214 @@ setupScopedLogger(DeferredLogger& local_logger)
     return std::nullopt;
 }
 
+template<typename TypeTag>
+void
+BlackoilWellModelRescoup<TypeTag>::
+storeSlaveGroupInjectionTargets()
+{
+    const int reportStepIdx = this->groupStateHelper().reportStepIdx();
+    // The injection target that applies to a slave group is not something
+    // the slave's schedule can know on its own: it depends on the target
+    // the master imposes at every synchronization step and on the group's
+    // GRUPSLAV filter flag, which says whether the master's limit, the
+    // deck's own GCONINJE limit, or the smaller of the two is in force.
+    // Work out that effective target and keep it on the slave, where the
+    // summary writer picks it up and reports it as GGIRT/GWIRT.  Only
+    // surface rate targets map onto these keywords.
+    //
+    // A UDQ that refers to the target reads it from the summary state, so
+    // the summary state is primed with the same value, in output units,
+    // ahead of the UDQ evaluation that follows.  When nothing is in force
+    // the slot is primed with the schedule's own target instead -- what the
+    // end-of-step summary evaluation will report -- so that a target in
+    // force on an earlier sync step cannot linger there.
+    using M = UnitSystem::measure;
+    auto& summary_state = this->simulator_.vanguard().summaryState();
+    const auto& units = this->simulator_.vanguard().eclState().getUnits();
+    auto& slave = this->reservoirCouplingSlave();
+    const auto& rescoup = this->schedule()[reportStepIdx].rescoup();
+    // The surface-rate group injection target vectors, which is all of them:
+    // there is no oil equivalent, so a master oil injection target reaches the
+    // control path but has nothing to be reported as; and GVIRT is a reservoir
+    // volume target, which cannot be derived from what the master sends, since
+    // it converts every injection mode to a surface rate before sending (see
+    // RescoupConstraintsCalculator::calculateSlaveGroupInjectionTargets_()).
+    // A slave UDQ naming GVIRT for a slave group therefore still reads the
+    // schedule, as it did before reservoir coupling could report a target at
+    // all.
+    const auto targets = std::array {
+        std::tuple { Phase::GAS,   std::string{"GGIRT"}, M::gas_surface_rate    },
+        std::tuple { Phase::WATER, std::string{"GWIRT"}, M::liquid_surface_rate },
+    };
+    auto& in_force = slave.effectiveInjectionTargets();
+    in_force.clear();
+    for (std::size_t i = 0; i < slave.numSlaveGroups(); ++i) {
+        const auto& gname = slave.slaveGroupIdxToGroupName(i);
+        for (const auto& [phase, keyword, unit] : targets) {
+            const auto effective = this->effectiveSlaveGroupInjectionTarget_(
+                gname, phase, reportStepIdx, rescoup, summary_state);
+            if (effective.has_value()) {
+                in_force[gname][phase] = *effective;
+                summary_state.update_group_var(gname, keyword, units.from_si(unit, *effective));
+            }
+            else {
+                summary_state.update_group_var(
+                    gname, keyword,
+                    units.from_si(unit, this->scheduleInjectionTarget_(gname, phase, reportStepIdx, summary_state)));
+            }
+        }
+    }
+}
+
+template<typename TypeTag>
+void
+BlackoilWellModelRescoup<TypeTag>::
+storeSlaveGroupProductionTargets()
+{
+    const int reportStepIdx = this->groupStateHelper().reportStepIdx();
+    // As storeSlaveGroupInjectionTargets(), for the production rate limits.
+    // The master sends a slave group a limit for every rate type: the target
+    // of its active control mode, and its share of the other limits found up
+    // the master's group tree.  The GRUPSLAV flag says how each combines with
+    // the deck's own GCONPROD limit.  Work out the limit in force for each
+    // rate type, keep it on the slave for the summary writer, and prime the
+    // summary state for the UDQ evaluation that follows -- with the
+    // schedule's own limit when nothing is in force.
+    //
+    // The values are primed in the measures the summary evaluators use.
+    // RESV is left out: GVPRT does not report a group target, it adds up the
+    // reservoir volume rate targets of the group's wells.
+    using M = UnitSystem::measure;
+    using CMode = Group::ProductionCMode;
+    auto& summary_state = this->simulator_.vanguard().summaryState();
+    const auto& units = this->simulator_.vanguard().eclState().getUnits();
+    auto& slave = this->reservoirCouplingSlave();
+    const auto& rescoup = this->schedule()[reportStepIdx].rescoup();
+    const auto targets = std::array {
+        std::tuple { CMode::ORAT, std::string{"GOPRT"}, M::rate             },
+        std::tuple { CMode::WRAT, std::string{"GWPRT"}, M::rate             },
+        std::tuple { CMode::GRAT, std::string{"GGPRT"}, M::gas_surface_rate },
+        std::tuple { CMode::LRAT, std::string{"GLPRT"}, M::rate             },
+    };
+    auto& in_force = slave.effectiveProductionTargets();
+    in_force.clear();
+    for (std::size_t i = 0; i < slave.numSlaveGroups(); ++i) {
+        const auto& gname = slave.slaveGroupIdxToGroupName(i);
+        for (const auto& [cmode, keyword, unit] : targets) {
+            const auto effective = this->effectiveSlaveGroupProductionTarget_(
+                gname, cmode, reportStepIdx, rescoup, summary_state);
+            if (effective.has_value()) {
+                in_force[gname][cmode] = *effective;
+                summary_state.update_group_var(gname, keyword, units.from_si(unit, *effective));
+            }
+            else {
+                summary_state.update_group_var(
+                    gname, keyword,
+                    units.from_si(unit, this->scheduleProductionTarget_(gname, cmode, reportStepIdx, summary_state)));
+            }
+        }
+    }
+}
+
 // Private methods alphabetically
 // ------------------------------
+
+template<typename TypeTag>
+std::optional<typename BlackoilWellModelRescoup<TypeTag>::Scalar>
+BlackoilWellModelRescoup<TypeTag>::
+effectiveSlaveGroupInjectionTarget_(const std::string& gname,
+                                    const Phase phase,
+                                    const int reportStepIdx,
+                                    const ReservoirCoupling::CouplingInfo& rescoup,
+                                    const SummaryState& summary_state) const
+{
+    using FilterFlag = ReservoirCoupling::GrupSlav::FilterFlag;
+    const auto& slave = this->reservoirCouplingSlave();
+    if (! slave.hasMasterInjectionTarget(gname, phase)) {
+        return std::nullopt;
+    }
+    const auto [master_target, cmode] = slave.masterInjectionTarget(gname, phase);
+    if (cmode != Group::InjectionCMode::RATE) {
+        return std::nullopt;
+    }
+
+    // Same fallback as GroupStateHelper::getInjectionFilterFlag_(): a slave
+    // group without a GRUPSLAV record follows the master.
+    auto filter = FilterFlag::MAST;
+    if (rescoup.hasGrupSlav(gname)) {
+        const auto& grup_slav = rescoup.grupSlav(gname);
+        filter = (phase == Phase::GAS) ? grup_slav.gasInjFlag()
+               : (phase == Phase::WATER) ? grup_slav.waterInjFlag()
+               : grup_slav.oilInjFlag();
+    }
+    if (filter == FilterFlag::SLAV) {
+        // The deck's own limit applies; the summary evaluator reads it from
+        // the schedule as for any other group.
+        return std::nullopt;
+    }
+    if (filter == FilterFlag::BOTH) {
+        const auto& group = this->schedule().getGroup(gname, reportStepIdx);
+        if (group.hasInjectionControl(phase)) {
+            return std::min(master_target,
+                            this->scheduleInjectionTarget_(gname, phase, reportStepIdx, summary_state));
+        }
+    }
+    return master_target;
+}
+
+template<typename TypeTag>
+std::optional<typename BlackoilWellModelRescoup<TypeTag>::Scalar>
+BlackoilWellModelRescoup<TypeTag>::
+effectiveSlaveGroupProductionTarget_(const std::string& gname,
+                                     const Group::ProductionCMode cmode,
+                                     const int reportStepIdx,
+                                     const ReservoirCoupling::CouplingInfo& rescoup,
+                                     const SummaryState& summary_state) const
+{
+    // The rule GroupStateHelper::getEffectiveProductionLimit_() applies in
+    // the control path, with one difference.  That method is only reached
+    // for a rate type the group has a GCONPROD limit of its own for, while
+    // a limit is reported here for every rate type, so the deck's own limit
+    // only takes part under BOTH when the group has one.
+    using CMode = Group::ProductionCMode;
+    using FilterFlag = ReservoirCoupling::GrupSlav::FilterFlag;
+    const auto& slave = this->reservoirCouplingSlave();
+    if (! slave.hasMasterProductionLimits(gname)) {
+        return std::nullopt;
+    }
+    const auto& limits = slave.masterProductionLimits(gname);
+    const Scalar master_limit = (cmode == CMode::ORAT) ? limits.oil_limit
+                              : (cmode == CMode::WRAT) ? limits.water_limit
+                              : (cmode == CMode::GRAT) ? limits.gas_limit
+                              : limits.liquid_limit;
+    if (master_limit < 0) {
+        // No limit of this type up the master's group tree: the deck's own
+        // limit applies, and the summary evaluator reads it from the schedule.
+        return std::nullopt;
+    }
+
+    // Same mapping and fallback as GroupStateHelper::getProductionFilterFlag_():
+    // the second production flag of GRUPSLAV covers both water and liquid, and
+    // a slave group without a GRUPSLAV record follows the master.
+    auto filter = FilterFlag::MAST;
+    if (rescoup.hasGrupSlav(gname)) {
+        const auto& grup_slav = rescoup.grupSlav(gname);
+        filter = (cmode == CMode::ORAT) ? grup_slav.oilProdFlag()
+               : (cmode == CMode::GRAT) ? grup_slav.gasProdFlag()
+               : grup_slav.liquidProdFlag();
+    }
+    if (filter == FilterFlag::SLAV) {
+        return std::nullopt;
+    }
+    if (filter == FilterFlag::BOTH) {
+        const auto& group = this->schedule().getGroup(gname, reportStepIdx);
+        if (group.has_control(cmode)) {
+            return std::min(master_limit,
+                            this->scheduleProductionTarget_(gname, cmode, reportStepIdx, summary_state));
+        }
+    }
+    return master_limit;
+}
 
 template<typename TypeTag>
 bool
@@ -402,6 +696,84 @@ masterNetworkHasMasterGroupLeavesForSlave_(std::size_t slave_idx) const
         }
     }
     return false;
+}
+
+template<typename TypeTag>
+void
+BlackoilWellModelRescoup<TypeTag>::
+refreshAndSendInjectionTargets_()
+{
+    // Called right after a receiveSlaveGroupData() inside the network iteration.
+    // Fold the rates just received into the master's group state -- that is what
+    // recomputes the reinjection and voidage rates that a GCONINJE REIN, SALE
+    // or VREP target is built from -- and ship the resulting targets to the
+    // slaves, replacing the ones they are currently holding.  Without this the
+    // targets stay at the values computed in beginTimeStep(), from slave
+    // production of the previous sync step.
+    const int report_step_idx = this->well_model_.simulator().episodeIndex();
+    this->well_model_.updateAndCommunicateGroupData(
+        report_step_idx, /*update_wellgrouptarget=*/false);
+    this->sendMasterGroupInjectionTargetsToSlaves_();
+}
+
+template<typename TypeTag>
+typename BlackoilWellModelRescoup<TypeTag>::Scalar
+BlackoilWellModelRescoup<TypeTag>::
+scheduleInjectionTarget_(const std::string& gname,
+                         const Phase phase,
+                         const int reportStepIdx,
+                         const SummaryState& summary_state) const
+{
+    const auto& group = this->schedule().getGroup(gname, reportStepIdx);
+    if (! group.hasInjectionControl(phase)) {
+        return Scalar{0};
+    }
+    return static_cast<Scalar>(group.injectionControls(phase, summary_state).surface_max_rate);
+}
+
+template<typename TypeTag>
+typename BlackoilWellModelRescoup<TypeTag>::Scalar
+BlackoilWellModelRescoup<TypeTag>::
+scheduleProductionTarget_(const std::string& gname,
+                          const Group::ProductionCMode cmode,
+                          const int reportStepIdx,
+                          const SummaryState& summary_state) const
+{
+    using CMode = Group::ProductionCMode;
+    const auto controls = this->schedule().getGroup(gname, reportStepIdx)
+        .productionControls(summary_state);
+    switch (cmode) {
+    case CMode::ORAT: return static_cast<Scalar>(controls.oil_target);
+    case CMode::WRAT: return static_cast<Scalar>(controls.water_target);
+    case CMode::GRAT: return static_cast<Scalar>(controls.gas_target);
+    case CMode::LRAT: return static_cast<Scalar>(controls.liquid_target);
+    default: return Scalar{0};
+    }
+}
+
+template<typename TypeTag>
+void
+BlackoilWellModelRescoup<TypeTag>::
+sendMasterGroupInjectionTargetsToSlaves_()
+{
+    OPM_TIMEFUNCTION();
+    RescoupConstraintsCalculator<Scalar, IndexTraits> constraints_calculator{
+        this->well_model_.guideRateHandler(),
+        this->groupStateHelper()
+    };
+    constraints_calculator.recalculateInjectionTargetsAndSendToSlaves();
+}
+
+template<typename TypeTag>
+bool
+BlackoilWellModelRescoup<TypeTag>::
+slaveGroupIsFixedPressureNodeInOwnNetwork_(const std::string& group_name) const
+{
+    const int episodeIdx = this->simulator_.episodeIndex();
+    const auto& network = this->schedule()[episodeIdx].network();
+    if (!network.active()) return false;
+    if (!network.has_node(group_name)) return false;
+    return network.node(group_name).terminal_pressure().has_value();
 }
 
 

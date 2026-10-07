@@ -36,6 +36,7 @@
 #include <array>
 #include <cassert>
 #include <cstddef>
+#include <sstream>
 #include <stack>
 #include <set>
 #include <unordered_set>
@@ -985,6 +986,19 @@ bool GroupStateHelper<Scalar, IndexTraits>::isMasterGroupEligibleForGuideRate(
 }
 
 template <typename Scalar, typename IndexTraits>
+bool GroupStateHelper<Scalar, IndexTraits>::isMasterGroupEligibleForInjectionGuideRate(
+                                                                const std::string& group_name,
+                                                                const Phase injection_phase) const
+{
+    if (!this->rescoup_.isMasterGroup(group_name)) {
+        return false;
+    }
+    const auto& group = this->schedule_.getGroup(group_name, this->report_step_);
+    return group.hasInjectionControl(injection_phase)
+        && group.injectionGroupControlAvailable(injection_phase);
+}
+
+template <typename Scalar, typename IndexTraits>
 int
 GroupStateHelper<Scalar, IndexTraits>::phaseToActivePhaseIdx(const Phase phase) const
 {
@@ -1154,39 +1168,8 @@ GroupStateHelper<Scalar, IndexTraits>::sumWellPhaseRates(bool res_rates,
     }
 
     for (const std::string& well_name : group.wells()) {
-        const auto well_index = this->wellState().index(well_name);
-        if (!well_index.has_value())
-            continue;
-
-        if (!this->wellState().wellIsOwned(well_index.value(), well_name)) // Only sum once
-        {
-            continue;
-        }
-
-        const auto& well_ecl = this->schedule_.getWell(well_name, this->report_step_);
-        // only count producers or injectors
-        if ((well_ecl.isProducer() && is_injector) || (well_ecl.isInjector() && !is_injector))
-            continue;
-
-        const auto& ws = this->wellState().well(well_index.value());
-        if (ws.status == Opm::Well::Status::SHUT)
-            continue;
-
-        const Scalar factor = well_ecl.getEfficiencyFactor(network)
-            * this->wellState().well(well_index.value()).efficiency_scaling_factor;
-        if (res_rates) {
-            const auto& well_rates = ws.reservoir_rates;
-            if (is_injector)
-                rate += factor * well_rates[phase_pos];
-            else
-                rate -= factor * well_rates[phase_pos];
-        } else {
-            const auto& well_rates = ws.surface_rates;
-            if (is_injector)
-                rate += factor * well_rates[phase_pos];
-            else
-                rate -= factor * well_rates[phase_pos];
-        }
+        rate += this->wellRateContributionToGroup(
+            well_name, phase_pos, res_rates, is_injector, network);
     }
     return rate;
 }
@@ -1310,9 +1293,13 @@ GroupStateHelper<Scalar, IndexTraits>::updateNetworkLeafNodeRates()
         }
     };
     do_update(this->schedule_[this->report_step_].network(), /*is_injector=*/false);
-    // TODO: do the below to support injection networks when available.
-    // do_update(this->schedule_[this->report_step_].gas_injection_network(), /*is_injector=*/true);
-    // do_update(this->schedule_[this->report_step_].water_injection_network(), /*is_injector=*/true);
+    for (const Phase phase : {Phase::GAS, Phase::WATER}) {
+        if (const auto injNetwork = this->schedule_[this->report_step_].injectionNetwork.get_ptr(phase);
+            injNetwork != nullptr)
+        {
+            do_update(*injNetwork, /* is_injector = */ true);
+        }
+    }
 }
 
 template <typename Scalar, typename IndexTraits>
@@ -1612,6 +1599,41 @@ GroupStateHelper<Scalar, IndexTraits>::updateWellRatesFromGroupTargetScale(
             }
         }
     }
+}
+
+template <typename Scalar, typename IndexTraits>
+Scalar
+GroupStateHelper<Scalar, IndexTraits>::wellRateContributionToGroup(const std::string& well_name,
+                                                                  const int phase_pos,
+                                                                  const bool res_rates,
+                                                                  const bool is_injector,
+                                                                  const bool network) const
+{
+    const auto well_index = this->wellState().index(well_name);
+    if (!well_index.has_value())
+        return 0.0;
+
+    if (!this->wellState().wellIsOwned(well_index.value(), well_name)) // Only sum once
+    {
+        return 0.0;
+    }
+
+    const auto& well_ecl = this->schedule_.getWell(well_name, this->report_step_);
+    // only count producers or injectors
+    if ((well_ecl.isProducer() && is_injector) || (well_ecl.isInjector() && !is_injector))
+        return 0.0;
+
+    const auto& ws = this->wellState().well(well_index.value());
+    if (ws.status == Opm::Well::Status::SHUT)
+        return 0.0;
+
+    const Scalar factor = well_ecl.getEfficiencyFactor(network)
+        * ws.efficiency_scaling_factor;
+    const auto& well_rates = res_rates ? ws.reservoir_rates : ws.surface_rates;
+    // Production rates are negative in the well state; a group rate sum is a positive
+    // magnitude for both directions.
+    return is_injector ? factor * well_rates[phase_pos]
+                       : -factor * well_rates[phase_pos];
 }
 
 template <typename Scalar, typename IndexTraits>
@@ -1978,15 +2000,34 @@ getInjectionGroupTargetForMode_(
     const Group::InjectionCMode cmode) const
 {
     const int pos = this->phaseToActivePhaseIdx(injection_phase);
-    Group::InjectionControls ctrl = group.injectionControls(injection_phase, this->summary_state_);
     bool use_gpmaint = group.has_gpmaint_control(injection_phase, cmode)
                                 && this->groupState().has_gpmaint_target(group.name());
+
+    // A group whose injection is controlled by GPMAINT alone has no GCONINJE
+    // record for the phase, and hence no injection controls to read.  Fetch
+    // them only in the branches that actually use them.
+    auto injectionControls = [this, &group, &injection_phase]()
+    {
+        if (! group.hasInjectionControl(injection_phase)) {
+            auto phase = std::ostringstream{};
+            phase << injection_phase;
+
+            OPM_DEFLOG_THROW(std::runtime_error,
+                             fmt::format("Group {} has no injection control "
+                                         "for phase {}", group.name(),
+                                         phase.str()),
+                             this->deferredLogger());
+        }
+
+        return group.injectionControls(injection_phase, this->summary_state_);
+    };
+
     switch (cmode) {
     case Group::InjectionCMode::RATE:
         if (use_gpmaint) {
             return this->groupState().gpmaint_target(group.name());
         }
-        return ctrl.surface_max_rate;
+        return injectionControls().surface_max_rate;
     case Group::InjectionCMode::RESV: {
         // GPMAINT targets (WINJ/GINJ/OINJ) are already per-phase RESV rates,
         // so no other-phase subtraction is needed.
@@ -1998,13 +2039,16 @@ getInjectionGroupTargetForMode_(
         const std::vector<Scalar>& group_injection_reservoir_rates =
             this->groupState().injection_reservoir_rates(group.name());
         return this->subtractOtherPhaseResvInjection_(
-            injection_phase, ctrl.resv_max_rate, group_injection_reservoir_rates) / resv_coeff[pos];
+            injection_phase, injectionControls().resv_max_rate,
+            group_injection_reservoir_rates) / resv_coeff[pos];
     }
     case Group::InjectionCMode::REIN: {
+        const auto ctrl = injectionControls();
         Scalar production_rate = this->groupState().injection_rein_rates(ctrl.reinj_group)[pos];
         return ctrl.target_reinj_fraction * production_rate;
     }
     case Group::InjectionCMode::VREP: {
+        const auto ctrl = injectionControls();
         const std::vector<Scalar>& group_injection_reservoir_rates =
             this->groupState().injection_reservoir_rates(group.name());
         Scalar voidage_rate = this->groupState().injection_vrep_rate(ctrl.voidage_group)
@@ -2112,7 +2156,10 @@ getProductionGroupTargetForMode_(const Group& group,
     }
     default:
         OPM_DEFLOG_THROW(std::logic_error,
-                         "Invalid Group::ProductionCMode in getProductionGroupTargetForMode_",
+                         fmt::format("Invalid Group::ProductionCMode in "
+                                     "getProductionGroupTargetForMode_ for {} cmode: {}",
+                                     group.name(),
+                                     Group::ProductionCMode2String(cmode)),
                          this->deferredLogger());
         return 0.0;
     }
@@ -2407,7 +2454,8 @@ getInjectionFilterFlag_(const std::string& group_name,
 template <typename Scalar, typename IndexTraits>
 int
 GroupStateHelper<Scalar, IndexTraits>::getMasterGroupEffectiveGCW_(const std::string& group_name,
-                                                                   bool is_production_group) const
+                                                                   bool is_production_group,
+                                                                   const Phase injection_phase) const
 {
     const auto& group = this->schedule_.getGroup(group_name, this->report_step_);
     int num_wells = 0;
@@ -2438,7 +2486,18 @@ GroupStateHelper<Scalar, IndexTraits>::getMasterGroupEffectiveGCW_(const std::st
             num_wells = 0;
         }
     } else {
-        num_wells = 1;  // injection: not yet handled
+        if (this->isMasterGroupEligibleForInjectionGuideRate(group_name, injection_phase)) {
+            // As for production: the group participates in the parent's injection
+            // guide-rate distribution for this phase whatever its injection control
+            // mode, and its weight is read from the rescoup master -- 1 when
+            // participating-and-uncapped, 0 when capped at the slave's injection
+            // potential or belonging to an inactive slave.  See
+            // RescoupConstraintsCalculator::capAndRedistributeInjectionTargets_().
+            num_wells = this->reservoirCouplingMaster().effectiveInjectionGCW(
+                group_name, injection_phase);
+        } else {
+            num_wells = 1;
+        }
     }
     return num_wells;
 }
@@ -2568,33 +2627,34 @@ GroupStateHelper<Scalar, IndexTraits>::satelliteInjectionRate_(const ScheduleSta
 // - Returns the satellite production rate for the given rate component from GSATPROD data.
 template <typename Scalar, typename IndexTraits>
 Scalar
-GroupStateHelper<Scalar, IndexTraits>::satelliteProductionRate_(
-    const ScheduleState& sched,
-    const Group& group,
-    const GSatProd::GSatProdGroupProp::Rate rate_comp,
-    bool res_rates) const
+GroupStateHelper<Scalar, IndexTraits>::
+satelliteProductionRate_(const ScheduleState& sched,
+                         const Group&         group,
+                         const GSatProd::Rate rate_comp,
+                         const bool           res_rates) const
 {
-    Scalar rate = 0.0;
-    if (group.hasSatelliteProduction()) {
-        const auto& gsat_prod = sched.gsatprod();
-        if (!res_rates) {
-            rate = gsat_prod.get(group.name(), this->summary_state_).rate[rate_comp];
-        }
-        // We don't support reservoir rates for satellite production groups
+    if (res_rates || !group.hasSatelliteProduction()) {
+        // Note: We explicitly exclude reservoir condition production rates
+        // ("res_rates") since we don't support those for satellite groups.
+        return Scalar{};
     }
-    return rate;
+
+    const auto gsrate = sched.satelliteProduction(group.name())
+        .getRate(rate_comp, this->summary_state_);
+
+    return static_cast<Scalar>(gsrate);
 }
 
 // Called from getSatelliteRate_().
 // - Maps an active phase index to the corresponding GSatProd rate component enum.
 template <typename Scalar, typename IndexTraits>
-std::optional<GSatProd::GSatProdGroupProp::Rate>
+std::optional<GSatProd::Rate>
 GroupStateHelper<Scalar, IndexTraits>::selectRateComponent_(const int phase_pos) const
 {
     // TODO: this function can be wrong, phase_pos is not used anymore, this function requries checking and
     // refactoring.
     const auto& pu = this->phase_usage_info_;
-    using Rate = GSatProd::GSatProdGroupProp::Rate;
+    using Rate = GSatProd::Rate;
 
     for (const auto& [phase, rate_comp] : std::array {std::pair {IndexTraits::waterPhaseIdx, Rate::Water},
                                                       std::pair {IndexTraits::oilPhaseIdx, Rate::Oil},
@@ -2726,7 +2786,7 @@ GroupStateHelper<Scalar, IndexTraits>::updateGroupControlledWellsRecursive_(
     int num_wells = 0;
     if (this->isReservoirCouplingMasterGroup(group)) {
 #ifdef RESERVOIR_COUPLING_ENABLED
-        num_wells = this->getMasterGroupEffectiveGCW_(group_name, is_production_group);
+        num_wells = this->getMasterGroupEffectiveGCW_(group_name, is_production_group, injection_phase);
 #endif
     }
     else {
@@ -2748,6 +2808,10 @@ GroupStateHelper<Scalar, IndexTraits>::updateGroupControlledWellsRecursive_(
             } else {
                 const auto ctrl = this->groupState().injection_control(child_group, injection_phase);
                 included = (ctrl == Group::InjectionCMode::FLD || ctrl == Group::InjectionCMode::NONE);
+                // The injection counterpart of the production rule above: a participating
+                // master group (GCONINJE item 8 = YES) counts toward its parent's GCW for
+                // this phase even on individual control.
+                included |= this->isMasterGroupEligibleForInjectionGuideRate(child_group, injection_phase);
             }
 
             if (included) {
@@ -2828,9 +2892,17 @@ GroupStateHelper<Scalar, IndexTraits>::updateGroupTargetReductionRecursive_(
                     continue;
                 const Group::InjectionCMode& current_group_control
                     = this->groupState().injection_control(sub_group.name(), phase);
-                const bool individual_control = (current_group_control != Group::InjectionCMode::FLD
-                                                 && current_group_control != Group::InjectionCMode::NONE);
-            // NOTE: A reservoir coupling master group: will have GCW (group controlled wells) set to 1 by convention.
+                // A participating master group (GCONINJE item 8 = YES) has its target
+                // guide-rate distributed by the parent even while on individual control,
+                // so it is not individual here; a capped or inactive-slave group still
+                // has its rate reduced through the num_group_controlled_wells == 0 branch.
+                const bool individual_control =
+                    (current_group_control != Group::InjectionCMode::FLD
+                     && current_group_control != Group::InjectionCMode::NONE)
+                    && !this->isMasterGroupEligibleForInjectionGuideRate(sub_group.name(), phase);
+            // NOTE: A reservoir coupling master group eligible for injection guide-rate distribution
+            //   in this phase reports its effective injection GCW here, any other one reports 1,
+            //   see getMasterGroupEffectiveGCW_().
             const int num_group_controlled_wells
                     = this->groupControlledWells(sub_group.name(),
                                                  /*always_included_child=*/"",

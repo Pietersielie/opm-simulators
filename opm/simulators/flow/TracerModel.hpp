@@ -31,6 +31,9 @@
 #include <opm/common/OpmLog/OpmLog.hpp>
 #include <opm/common/TimingMacros.hpp>
 
+#include <opm/input/eclipse/EclipseState/Aquifer/AquiferConfig.hpp>
+#include <opm/input/eclipse/Schedule/BCState.hpp>
+#include <opm/input/eclipse/Schedule/Schedule.hpp>
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellConnections.hpp>
 
@@ -41,6 +44,7 @@
 
 #include <opm/simulators/flow/GenericTracerModel.hpp>
 #include <opm/simulators/utils/DeferredLoggingErrorHelpers.hpp>
+#include <opm/simulators/utils/gatherDeferredLogger.hpp>
 #include <opm/simulators/utils/VectorVectorDataHandle.hpp>
 
 #include <array>
@@ -48,7 +52,10 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include <fmt/format.h>
 
 namespace Opm::Properties {
 
@@ -146,7 +153,23 @@ public:
 
     void prepareTracerBatches()
     {
+        DeferredLogger local_deferredLogger;
+
         for (std::size_t tracerIdx = 0; tracerIdx < this->tracerPhaseIdx_.size(); ++tracerIdx) {
+            // Tracers of the same phase are solved together with a common system matrix,
+            // which requires a common diffusion coefficient.
+            {
+                auto& batch = tbatch[this->tracerPhaseIdx_[tracerIdx]];
+                const Scalar D = this->eclState_.tracer()[tracerIdx].diffusion_coefficient;
+                if (batch.numTracer() == 0) {
+                    batch.diffusionCoefficient_ = D;
+                }
+                else if (batch.diffusionCoefficient_ != D) {
+                    throw std::runtime_error("TRCDIFF: tracers in the same phase must have the same "
+                                             "diffusion coefficient (tracer " + this->name(tracerIdx) + ")");
+                }
+            }
+
             if (this->tracerPhaseIdx_[tracerIdx] == FluidSystem::waterPhaseIdx) {
                 if (! FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)){
                     throw std::runtime_error("Water tracer specified for non-water fluid system: " +
@@ -194,6 +217,14 @@ public:
                     tr.mat = std::make_unique<TracerMatrix>(*base);
                 }
             }
+        }
+
+        this->buildAquiferTracerConnections_(local_deferredLogger);
+
+        const auto& comm = simulator_.vanguard().grid().comm();
+        auto global_logger = gatherDeferredLogger(local_deferredLogger, comm);
+        if (comm.rank() == 0) {
+            global_logger.logMessages();
         }
     }
 
@@ -346,99 +377,60 @@ protected:
     }
 
     /**
-     * @brief This function calculates the diffusive coefficient D, as used in the Fickian type equations for diffusion. ∇c is calculated in the function that calls this.
-     *        This will probably have to change per tracer in future.
-     * @param 
-     * @param 
-     * @param 
-     * @param
-     * @return
+     * @brief Geometric (porosity weighted) diffusivity of a face, i.e. the factor that
+     *        multiplies the molecular diffusion coefficient D_mol of the tracer (TRCDIFF)
+     *        in the Fickian flux J = -D_mol * diffusivity * A * (c_J - c_I).
      */
-    template<TracerTypeIdx Index>
     TracerEvaluation
-    computeDiffusiveFlux_(const int tracerPhaseIdx,
-                 const ElementContext& elemCtx,
-                 const unsigned scvfIdx,
-                 const unsigned timeIdx) const
+    computeDiffusivity_(const ElementContext& elemCtx,
+                        const unsigned scvfIdx,
+                        const unsigned timeIdx) const
     {
-        const auto& stencil = elemCtx.stencil(timeIdx);
-        const auto& scvf = stencil.interiorFace(scvfIdx);
-        Scalar v;
-        unsigned upIdx;
+        const auto& scvf = elemCtx.stencil(timeIdx).interiorFace(scvfIdx);
 
-        const auto& extQuants = elemCtx.extensiveQuantities(scvfIdx, timeIdx);
-        const unsigned inIdx = extQuants.interiorIndex();
-        upIdx = extQuants.upstreamIndex(tracerPhaseIdx);
-        const auto& intQuants = elemCtx.intensiveQuantities(upIdx, timeIdx);
-        const FluidSystem& fsys = intQuants.getFluidSystem();
-        const unsigned solventCompIdx = fsys.solventComponentIndex(tracerPhaseIdx);
-
+        Scalar v = 0.0;
         if constexpr (enableDiffusion) {
-            auto localDiffusivity = extQuants.diffusivity();
-            auto localEffectiveDiffusionCoefficient = extQuants.effectiveDiffusionCoefficient()[tracerPhaseIdx][solventCompIdx];
-            v = decay<Scalar>(localDiffusivity *
-                                0.000001); //Testing: set effective diffusion coefficient to 1.
-                                //localEffectiveDiffusionCoefficient);
-        }
-        else {
-            v = 0.0;
+            v = decay<Scalar>(elemCtx.extensiveQuantities(scvfIdx, timeIdx).diffusivity());
         }
 
-        const Scalar A = scvf.area();
-        return A * v * variable<TracerEvaluation>(1.0, 0);
+        return scvf.area() * v * variable<TracerEvaluation>(1.0, 0);
     }
 
     /**
-     * @brief This function calculates the dispersive coefficient κ, as used in the Fickian type equations for dispersion. ∇c is calculated in the function that calls this.
-     *        This will probably have to change per tracer in future.
-     * @param 
-     * @param 
-     * @param 
-     * @param
-     * @return
+     * @brief Dispersive coefficient of a face for the Fickian flux
+     *        J = -(bAvg * |u| * disp) * (c_J - c_I), where disp is the geometric
+     *        dispersivity (DISPERC, as in the blackoil dispersion module), |u| the
+     *        average max-norm filter velocity of the two cells and bAvg the average
+     *        inverse formation volume factor. Zero unless DISPERC is in the deck.
      */
-    template<TracerTypeIdx Index>
     TracerEvaluation
-    computeDispersiveFlux_(const int tracerPhaseIdx,
-                 const ElementContext& elemCtx,
-                 const unsigned scvfIdx,
-                 const unsigned timeIdx) const
+    computeDispersivity_(const int tracerPhaseIdx,
+                         const ElementContext& elemCtx,
+                         const unsigned scvfIdx,
+                         const unsigned timeIdx) const
     {
-        const auto& stencil = elemCtx.stencil(timeIdx);
-        const auto& scvf = stencil.interiorFace(scvfIdx);
-        Scalar v;
-        unsigned upIdx;
-        
-        const auto& extQuants = elemCtx.extensiveQuantities(scvfIdx, timeIdx);
-        const unsigned inIdx = extQuants.interiorIndex();
-        const unsigned outIdx = extQuants.exteriorIndex();
-        upIdx = extQuants.upstreamIndex(tracerPhaseIdx);
-        
+        Scalar flux = 0.0;
         if constexpr (enableDispersion) {
-            const auto& normVelocityAvg = 0.5 * 
-                        (elemCtx.intensiveQuantities(inIdx, timeIdx).normVelocityCell(tracerPhaseIdx) +
-                        elemCtx.intensiveQuantities(outIdx, timeIdx).normVelocityCell(tracerPhaseIdx));
-            if (normVelocityAvg > 0.0 || normVelocityAvg < 0.0){
-                std::cout << "NormVelocityAvg = " << normVelocityAvg << "." << std::endl;
+            if (this->dispersionActive_) {
+                const auto& extQuants = elemCtx.extensiveQuantities(scvfIdx, timeIdx);
+                const unsigned inIdx = extQuants.interiorIndex();
+                const unsigned outIdx = extQuants.exteriorIndex();
+                const auto& inIq = elemCtx.intensiveQuantities(inIdx, timeIdx);
+                const auto& outIq = elemCtx.intensiveQuantities(outIdx, timeIdx);
+
+                const Scalar normVelocityAvg = 0.5 * (inIq.normVelocityCell(tracerPhaseIdx) +
+                                                      outIq.normVelocityCell(tracerPhaseIdx));
+                const Scalar bAvg = 0.5 * (decay<Scalar>(inIq.fluidState().invB(tracerPhaseIdx)) +
+                                           decay<Scalar>(outIq.fluidState().invB(tracerPhaseIdx)));
+                const Scalar dispersivity =
+                    simulator_.problem().dispersivity(elemCtx.globalSpaceIndex(inIdx, timeIdx),
+                                                      elemCtx.globalSpaceIndex(outIdx, timeIdx));
+                flux = bAvg * normVelocityAvg * dispersivity;
             }
-            Scalar dispersivity = 100.0;//extQuants.dispersivity();
-            // if (dispersivity > 0.0 || dispersivity < 0.0){
-            //     std::cout << "Debug point reached: `dispersivity != 0`" << std::endl;
-            // }
-            v = decay<Scalar>(  
-                normVelocityAvg *
-                dispersivity);
         }
-        else {
-            v = 0.0;
-        }
-        
 
-        const Scalar A = scvf.area();
-        return A * v * variable<TracerEvaluation>(1.0, 0);
+        return flux * variable<TracerEvaluation>(1.0, 0);
     }
-
-
 
     template<TracerTypeIdx Index, class TrRe>
     Scalar storage1_(const TrRe& tr,
@@ -506,14 +498,11 @@ protected:
         const auto& [fFlux, isUpF] = computeFlux_<Free>(tr.phaseIdx_, elemCtx, scvfIdx, 0);
         const auto& [sFlux, isUpS] = computeFlux_<Solution>(tr.phaseIdx_, elemCtx, scvfIdx, 0);
         
-        // computeDiffusiveFlux_() provides diffusivity D
-        const auto& diffusivity_ = computeDiffusiveFlux_<Free>(tr.phaseIdx_, elemCtx, scvfIdx, 0);
-        // computeDispersiveFlux_() provides dispersivity κ(V)
-        const auto& dispersivity_ = computeDispersiveFlux_<Free>(tr.phaseIdx_, elemCtx, scvfIdx, 0);
+        // Geometric diffusivity, scaled by the molecular diffusion coefficient of the tracer batch (TRCDIFF)
+        const TracerEvaluation diffusivity_ = computeDiffusivity_(elemCtx, scvfIdx, 0) * tr.diffusionCoefficient_;
+        // Dispersive coefficient (DISPERC), zero if dispersion is not active
+        const TracerEvaluation dispersivity_ = computeDispersivity_(tr.phaseIdx_, elemCtx, scvfIdx, 0);
 
-        // Declare variables to be available when setting derivative matrix
-        TracerEvaluation diffusiveFlux_ = 0, dispersiveFlux_ = 0;
-        
         dVol_[Solution][tr.phaseIdx_][I] += sFlux.value() * dt;
         dVol_[Free][tr.phaseIdx_][I] += fFlux.value() * dt;
         const int fGlobalUpIdx = isUpF ? I : J;
@@ -523,31 +512,20 @@ protected:
             tr.residual_[tIdx][I][Free] += fFlux.value()*tr.concentration_[tIdx][fGlobalUpIdx][Free]; // residual + flux
             tr.residual_[tIdx][I][Solution] += sFlux.value()*tr.concentration_[tIdx][sGlobalUpIdx][Solution]; // residual + flux
             
+            // Fickian fluxes J = -(D + D_disp) * grad(c), diffusion and dispersion both
+            // being implicit in the free tracer concentration
+            const Scalar concentrationGradient = tr.concentration_[tIdx][J][Free] - tr.concentration_[tIdx][I][Free];
             if constexpr (enableDiffusion) {
-                Scalar concentrationGradient = (tr.concentration_[tIdx][J][Free] - tr.concentration_[tIdx][I][Free]);
-                // TODO: Divide by distance? Or is 1/Δx included already in earlier code?
-                
-                // This calculates J = -D∇c
-                diffusiveFlux_ = - diffusivity_.value() * concentrationGradient;
-                // std::cout << "Diffusivity is " << diffusivity_.value() << std::endl; -- 2e-9
-                tr.residual_[tIdx][I][Free] += diffusiveFlux_.value(); // residual + flux
-                // Still need to calculate ∂c/∂t = D∇^2 c? Or is that included in the above? Included in extquants.diffusivity().
-                
-                if constexpr (enableDispersion) {
-                    // This calculates J* = -κ(V).∇c
-                    dispersiveFlux_ = -dispersivity_.value() * concentrationGradient;
-                    // if (dispersiveFlux_.value() > 0.0 || dispersiveFlux_.value() < 0.0){
-                        //     std::cout << "Debug point reached: `dispersiveFlux_ != 0`" << std::endl;
-                        // }
-                    std::cout << "Dispersivity is " << dispersivity_.value() << "\n" << std::endl;
-                    tr.residual_[tIdx][I][Free] += dispersiveFlux_.value();// residual + flux
-                }
+                tr.residual_[tIdx][I][Free] -= diffusivity_.value() * concentrationGradient;
+            }
+            if constexpr (enableDispersion) {
+                tr.residual_[tIdx][I][Free] -= dispersivity_.value() * concentrationGradient;
             }
         }
 
         // Derivative matrix
         if (isUpF){
-            (*tr.mat)[J][I][Free][Free] = -fFlux.derivative(0);
+            (*tr.mat)[J][I][Free][Free] += -fFlux.derivative(0);
             (*tr.mat)[I][I][Free][Free] += fFlux.derivative(0);
             if constexpr (enableDiffusion) {
                 // Should this be the actual flux or the diffusivity derivative?
@@ -560,17 +538,19 @@ protected:
             }
         }
         if (isUpS) {
-            (*tr.mat)[J][I][Solution][Solution] = -sFlux.derivative(0);
+            (*tr.mat)[J][I][Solution][Solution] += -sFlux.derivative(0);
             (*tr.mat)[I][I][Solution][Solution] += sFlux.derivative(0);
-            if constexpr (enableDiffusion) {
-                // Should this be the actual flux or the diffusivity derivative?
-                (*tr.mat)[J][I][Solution][Solution] -= diffusivity_.derivative(0);
-                (*tr.mat)[I][I][Solution][Solution] += diffusivity_.derivative(0);
-                if constexpr (enableDispersion) {
-                    (*tr.mat)[J][I][Solution][Solution] -= dispersivity_.derivative(0);
-                    (*tr.mat)[I][I][Solution][Solution] += dispersivity_.derivative(0);
-                }
-            }
+        }
+
+        // Diffusion and dispersion: d(residual_I)/d(c_I) = +D and d(residual_I)/d(c_J) = -D,
+        // for every face irrespective of the flow direction.
+        if constexpr (enableDiffusion) {
+            (*tr.mat)[I][I][Free][Free] += diffusivity_.derivative(0);
+            (*tr.mat)[I][J][Free][Free] -= diffusivity_.derivative(0);
+        }
+        if constexpr (enableDispersion) {
+            (*tr.mat)[I][I][Free][Free] += dispersivity_.derivative(0);
+            (*tr.mat)[I][J][Free][Free] -= dispersivity_.derivative(0);
         }
     }
 
@@ -612,15 +592,17 @@ protected:
 
         const Scalar dt = simulator_.timeStepSize();
         const auto& ws = simulator_.problem().wellModel().wellState().well(well.name());
+        const auto well_eff = well.wellEfficiencyFactor(); // Needed to convert ws.phase_mixing_rates to effective rates
         for (std::size_t i = 0; i < ws.perf_data.size(); ++i) {
             const auto I = ws.perf_data.cell_index[i];
-            const Scalar rate = well.volumetricSurfaceRateForConnection(I, tr.phaseIdx_);
+            const Scalar rate = well.volumetricSurfaceRateForConnection(I, tr.phaseIdx_); // Includes (accumulated) well efficiency factor
             Scalar rate_s;
+
             if (tr.phaseIdx_ == FluidSystem::oilPhaseIdx && FluidSystem::enableVaporizedOil()) {
-                rate_s = ws.perf_data.phase_mixing_rates[i][ws.vaporized_oil];
+                rate_s = ws.perf_data.phase_mixing_rates[i][ws.vaporized_oil] * well_eff;
             }
             else if (tr.phaseIdx_ == FluidSystem::gasPhaseIdx && FluidSystem::enableDissolvedGas()) {
-                rate_s = ws.perf_data.phase_mixing_rates[i][ws.dissolved_gas];
+                rate_s = ws.perf_data.phase_mixing_rates[i][ws.dissolved_gas] * well_eff;
             }
             else {
                 rate_s = 0.0;
@@ -668,6 +650,97 @@ protected:
 
                 // Derivative matrix for solution tracer producer
                 (*tr.mat)[I][I][Solution][Solution] -= rate_s * variable<TracerEvaluation>(1.0, 0).derivative(0);
+            }
+        }
+    }
+
+    /*!
+     * \brief Boundary conditions for the tracer equations.
+     *
+     * The phase rate is taken from the BCPROP rate boundary conditions (via
+     * the problem's boundaryCondition()), and the concentration of the fluid
+     * entering through the face is taken from BCTRACER. As for BCPROP, a
+     * positive rate is a flow out of the domain and a negative rate is a flow
+     * into the domain. Outflow carries the tracer concentration of the cell.
+     */
+    template<class TrRe>
+    void assembleTracerEquationBoundary(TrRe& tr,
+                                        const ElementContext& elemCtx,
+                                        const unsigned I,
+                                        const Scalar dt)
+    {
+        if (tr.numTracer() == 0) {
+            return;
+        }
+
+        const auto& problem = simulator_.problem();
+        if (!problem.nonTrivialBoundaryConditions()) {
+            return;
+        }
+
+        const auto& stencil = elemCtx.stencil(/*timeIdx=*/0);
+        const auto& bcstate = simulator_.vanguard().schedule()[problem.episodeIndex()].bcstate;
+        for (unsigned bfIdx = 0; bfIdx < stencil.numBoundaryFaces(); ++bfIdx) {
+            const auto& bf = stencil.boundaryFace(bfIdx);
+            const int dirId = bf.dirId();
+            if (dirId < 0) { // not for NNCs
+                continue;
+            }
+
+            const int bcIndex = problem.boundaryConditionIndex(I, dirId);
+            if (bcIndex == 0) {
+                continue;
+            }
+
+            const auto [type, massRate] = problem.boundaryCondition(I, dirId);
+            if (type != BCType::RATE) {
+                continue;
+            }
+
+            // BCPROP gives a mass rate per unit area of the BC component. Convert to
+            // the surface volume rate (out of the cell) of the tracer phase.
+            BCComponent phaseComp;
+            int compIdx;
+            if (tr.phaseIdx_ == FluidSystem::waterPhaseIdx) {
+                phaseComp = BCComponent::WATER;
+                compIdx = FluidSystem::waterCompIdx;
+            }
+            else if (tr.phaseIdx_ == FluidSystem::oilPhaseIdx) {
+                phaseComp = BCComponent::OIL;
+                compIdx = FluidSystem::oilCompIdx;
+            }
+            else {
+                phaseComp = BCComponent::GAS;
+                compIdx = FluidSystem::gasCompIdx;
+            }
+
+            const Scalar massRateComp = decay<Scalar>(massRate[FluidSystem::canonicalToActiveCompIdx(compIdx)]);
+            if (massRateComp == Scalar{0}) {
+                continue;
+            }
+
+            const unsigned pvtRegionIdx = problem.pvtRegionIndex(I);
+            const Scalar rateOut = massRateComp * bf.area() /
+                                   FluidSystem::referenceDensity(tr.phaseIdx_, pvtRegionIdx);
+
+            for (int tIdx = 0; tIdx < tr.numTracer(); ++tIdx) {
+                if (rateOut < 0) {
+                    // Inflow: concentration from BCTRACER, no tracer if not specified
+                    const auto bcConc = bcstate.tracerConcentration(bcIndex,
+                                                                    this->name(tr.idx_[tIdx]),
+                                                                    phaseComp);
+                    tr.residual_[tIdx][I][Free] += rateOut * bcConc.value_or(0.0);
+                }
+                else {
+                    // Outflow: tracer leaves with the concentration of the cell
+                    tr.residual_[tIdx][I][Free] += rateOut * tr.concentration_[tIdx][I][Free];
+                }
+            }
+            dVol_[Free][tr.phaseIdx_][I] += rateOut * dt;
+
+            if (rateOut > 0) {
+                // Derivative matrix for outflow
+                (*tr.mat)[I][I][Free][Free] += rateOut * variable<TracerEvaluation>(1.0, 0).derivative(0);
             }
         }
     }
@@ -771,6 +844,10 @@ protected:
                 }
             }
 
+            for (auto& tr : tbatch) {
+                this->assembleTracerEquationAquifer_(tr);
+            }
+
             // Parallel loop over element chunks
             #ifdef _OPENMP
             #pragma omp parallel for
@@ -827,6 +904,11 @@ protected:
                             }
                             this->assembleTracerEquationFlux(tr, elemCtx, scvfIdx, I, J, dt);
                         }
+                    }
+
+                    // Boundary conditions (BCCON + BCPROP + BCTRACER)
+                    for (auto& tr : tbatch) {
+                        this->assembleTracerEquationBoundary(tr, elemCtx, I, dt);
                     }
 
                      // Source terms (mass transfer between free and solution tracer)
@@ -943,6 +1025,136 @@ protected:
         }
     }
 
+    void convertEffectiveRatesToRawRates() {
+        const auto& wellPtrs = simulator_.problem().wellModel().localNonshutWells();
+        for (const auto& wellPtr : wellPtrs) {
+            const auto& eclWell = wellPtr->wellEcl();
+            const auto well_seq_index = eclWell.seqIndex();
+            const auto inv_well_eff_factor = 1.0 / std::max(Scalar{1.0e-10}, wellPtr->wellEfficiencyFactor());
+
+            std::ranges::for_each(this->wellTracerRate_[well_seq_index], [&](WellTracerRate<Scalar>& wtr) {
+                wtr.rate *= inv_well_eff_factor;
+            });
+            std::ranges::for_each(this->wellFreeTracerRate_[well_seq_index], [&](WellTracerRate<Scalar>& wtr) {
+                wtr.rate *= inv_well_eff_factor;
+            });
+            std::ranges::for_each(this->wellSolTracerRate_[well_seq_index], [&](WellTracerRate<Scalar>& wtr) {
+                wtr.rate *= inv_well_eff_factor;
+            });
+            if (eclWell.isMultiSegment()) {
+                std::ranges::for_each(this->mSwTracerRate_[well_seq_index], [&](MSWellTracerRate<Scalar>& wtr) {
+                    std::ranges::for_each(wtr.rate, [&](auto& item) {
+                        item.second *= inv_well_eff_factor;
+                    });
+                });
+            }
+        }
+    }
+
+    void buildAquiferTracerConnections_(DeferredLogger& deferredLogger)
+    {
+        aquifer_tracer_cells_.clear();
+
+        const auto& aquifer_cfg = this->eclState_.aquifer();
+        if (!aquifer_cfg.active()) {
+            return;
+        }
+
+        const auto& specs = aquifer_cfg.aquiferTracers();
+        if (specs.empty()) {
+            return;
+        }
+
+        std::unordered_map<std::string, int> tracer_name_to_idx;
+        for (int tracerIdx = 0; tracerIdx < this->numTracers(); ++tracerIdx) {
+            tracer_name_to_idx.emplace(this->name(tracerIdx), tracerIdx);
+        }
+
+        const auto& vanguard = simulator_.vanguard();
+        for (const auto& spec : specs) {
+            if (!aquifer_cfg.hasAnalyticalAquifer(spec.aquifer_id)) {
+                continue;
+            }
+
+            const auto tracer_pos = tracer_name_to_idx.find(spec.tracer_name);
+            if (tracer_pos == tracer_name_to_idx.end()) {
+                if (simulator_.vanguard().grid().comm().rank() == 0) {
+                    deferredLogger.warning(fmt::format("AQANTRC tracer '{}' is not declared in TRACER",
+                                                       spec.tracer_name));
+                }
+                continue;
+            }
+
+            if (!aquifer_cfg.connections().hasAquiferConnections(spec.aquifer_id)) {
+                continue;
+            }
+
+            const int tracerIdx = tracer_pos->second;
+            const int phaseIdx = this->tracerPhaseIdx_[tracerIdx];
+
+            for (const auto& conn : aquifer_cfg.connections().getConnections(spec.aquifer_id)) {
+                const int cellIdx = vanguard.compressedIndex(conn.global_index);
+                if (cellIdx < 0) {
+                    continue;
+                }
+
+                aquifer_tracer_cells_[cellIdx].push_back(
+                    AquiferTracerCellSpec { tracerIdx, phaseIdx, static_cast<Scalar>(spec.concentration) });
+            }
+        }
+    }
+
+    template<class TrRe>
+    void assembleTracerEquationAquifer_(TrRe& tr)
+    {
+        if (tr.numTracer() == 0 || aquifer_tracer_cells_.empty()) {
+            return;
+        }
+
+        const auto& aquiferModel = simulator_.problem().aquiferModel();
+        const Scalar dt = simulator_.timeStepSize();
+
+        for (const auto& [cellIdx, specs] : aquifer_tracer_cells_) {
+            // Scalar influx from converged Qai_; do not recalculate or use getValue()
+            // in the flow Newton path (see AquiferAnalytical::addToSource).
+            const Scalar rate = aquiferModel.cachedConnectionInfluxRate(cellIdx);
+            if (rate == Scalar{0}) {
+                continue;
+            }
+
+            const unsigned I = cellIdx;
+            const Scalar rate_f = rate;
+
+            for (const auto& spec : specs) {
+                if (spec.phaseIdx != tr.phaseIdx_) {
+                    continue;
+                }
+
+                int localTIdx = -1;
+                for (int tIdx = 0; tIdx < tr.numTracer(); ++tIdx) {
+                    if (tr.idx_[tIdx] == spec.tracerIdx) {
+                        localTIdx = tIdx;
+                        break;
+                    }
+                }
+                if (localTIdx < 0) {
+                    continue;
+                }
+
+                if (rate_f > 0) {
+                    const Scalar delta = rate_f * spec.concentration;
+                    tr.residual_[localTIdx][I][Free] -= delta;
+                    dVol_[Free][tr.phaseIdx_][I] -= rate_f * dt;
+                }
+                else if (rate_f < 0) {
+                    tr.residual_[localTIdx][I][Free] -= rate_f * tr.concentration_[localTIdx][I][Free];
+                    dVol_[Free][tr.phaseIdx_][I] -= rate_f * dt;
+                    (*tr.mat)[I][I][Free][Free] -= rate_f * variable<TracerEvaluation>(1.0, 0).derivative(0);
+                }
+            }
+        }
+    }
+
     void advanceTracerFields()
     {
         assembleTracerEquations_();
@@ -1005,17 +1217,17 @@ protected:
                 auto& freeTracerRate = this->wellFreeTracerRate_[eclWell.seqIndex()];
                 auto& solTracerRate = this->wellSolTracerRate_[eclWell.seqIndex()];
                 auto* mswTracerRate = eclWell.isMultiSegment() ? &this->mSwTracerRate_[eclWell.seqIndex()] : nullptr;
-
+                const auto well_eff = wellPtr->wellEfficiencyFactor(); // Needed to convert ws.phase_mixing_rates to effective rates
                 for (std::size_t i = 0; i < ws.perf_data.size(); ++i) {
                     const auto I = ws.perf_data.cell_index[i];
-                    const Scalar rate = wellPtr->volumetricSurfaceRateForConnection(I, tr.phaseIdx_);
+                    const Scalar rate = wellPtr->volumetricSurfaceRateForConnection(I, tr.phaseIdx_); // Includes (accumulated) well efficiency factor
 
                     Scalar rate_s;
                     if (tr.phaseIdx_ == FluidSystem::oilPhaseIdx && FluidSystem::enableVaporizedOil()) {
-                        rate_s = ws.perf_data.phase_mixing_rates[i][ws.vaporized_oil];
+                        rate_s = ws.perf_data.phase_mixing_rates[i][ws.vaporized_oil]*well_eff;
                     }
                     else if (tr.phaseIdx_ == FluidSystem::gasPhaseIdx && FluidSystem::enableDissolvedGas()) {
-                        rate_s = ws.perf_data.phase_mixing_rates[i][ws.dissolved_gas];
+                        rate_s = ws.perf_data.phase_mixing_rates[i][ws.dissolved_gas]*well_eff;
                     }
                     else {
                         rate_s = 0.0;
@@ -1054,9 +1266,14 @@ protected:
                 }
             }
         }
+        convertEffectiveRatesToRawRates();
     }
 
     Simulator& simulator_;
+
+    // True if DISPERC is given in the deck
+    bool dispersionActive_ =
+        simulator_.vanguard().eclState().getSimulationConfig().rock_config().dispersion();
 
     // This struct collects tracers of the same type (i.e, transported in same phase).
     // The idea being that, under the assumption of linearity, tracers of same type can
@@ -1076,6 +1293,8 @@ protected:
         std::vector<TV> storageOfTimeIndex1_;
         std::vector<TV> residual_;
         std::unique_ptr<TracerMatrix> mat;
+        // Molecular diffusion coefficient [m2/s] (TRCDIFF), common to all tracers in the batch
+        Scalar diffusionCoefficient_ = 0.0;
 
         bool operator==(const TracerBatch& rhs) const
         {
@@ -1125,6 +1344,14 @@ protected:
     std::array<std::array<std::vector<Scalar>,numPhases>,2> vol1_;
     std::array<std::array<std::vector<Scalar>,numPhases>,2> dVol_;
     ElementChunks<GridView, Dune::Partitions::All> element_chunks_;
+
+    struct AquiferTracerCellSpec {
+        int tracerIdx{};
+        int phaseIdx{};
+        Scalar concentration{};
+    };
+
+    std::unordered_map<unsigned, std::vector<AquiferTracerCellSpec>> aquifer_tracer_cells_;
 };
 
 } // namespace Opm

@@ -352,7 +352,17 @@ assembleOutflowTerm(const int seg,
     if constexpr (has_gfrac_variable) {
         eqns.D()[seg][seg_upwind][comp_idx][GFrac] -= segment_rate.derivative(GFrac + Indices::numEq);
     }
-    // pressure derivative should be zero
+    // pressure derivative should be zero for non-thermal cases
+
+    if constexpr (enable_energy) {
+        // Only the energy equation depends on pressure and temperature; the mass
+        // surface rates carry no SPres/Temperature derivatives.
+        if (comp_idx == Temperature) {
+            // energy flux depends on the pressure and temperature
+            eqns.D()[seg][seg_upwind][comp_idx][SPres] -= segment_rate.derivative(SPres + Indices::numEq);
+            eqns.D()[seg][seg_upwind][comp_idx][Temperature] -= segment_rate.derivative(Temperature + Indices::numEq);
+        }
+    }
 }
 
 template<class FluidSystem, class Indices>
@@ -377,7 +387,17 @@ assembleInflowTerm(const int seg,
     if constexpr (has_gfrac_variable) {
         eqns.D()[seg][inlet_upwind][comp_idx][GFrac] += inlet_rate.derivative(GFrac + Indices::numEq);
     }
-    // pressure derivative should be zero
+    // pressure derivative should be zero for non-thermal cases
+
+    if constexpr (enable_energy) {
+        // Only the energy equation depends on pressure and temperature; the mass
+        // surface rates carry no SPres/Temperature derivatives.
+        if (comp_idx == Temperature) {
+            // energy flux depends on the pressure and temperature
+            eqns.D()[seg][inlet_upwind][comp_idx][SPres] += inlet_rate.derivative(SPres + Indices::numEq);
+            eqns.D()[seg][inlet_upwind][comp_idx][Temperature] += inlet_rate.derivative(Temperature + Indices::numEq);
+        }
+    }
 }
 
 template<class FluidSystem, class Indices>
@@ -385,6 +405,7 @@ void MultisegmentWellAssemble<FluidSystem,Indices>::
 assemblePerforationEq(const int seg,
                       const int local_perf_index,
                       const int comp_idx,
+                      const int reservoir_eq_idx,
                       const EvalWell& cq_s_effective,
                       Equations& eqns1) const
 {
@@ -401,7 +422,7 @@ assemblePerforationEq(const int seg,
     // assemble the jacobians
     for (int pv_idx = 0; pv_idx < numWellEq; ++pv_idx) {
         // also need to consider the efficiency factor when manipulating the jacobians.
-        eqns.C()[seg][local_perf_index][pv_idx][comp_idx] -= cq_s_effective.derivative(pv_idx + Indices::numEq); // input in transformed matrix
+        eqns.C()[seg][local_perf_index][pv_idx][reservoir_eq_idx] -= cq_s_effective.derivative(pv_idx + Indices::numEq); // input in transformed matrix
 
         // the index name for the D should be eq_idx / pv_idx
         eqns.D()[seg][seg][comp_idx][pv_idx] += cq_s_effective.derivative(pv_idx + Indices::numEq);

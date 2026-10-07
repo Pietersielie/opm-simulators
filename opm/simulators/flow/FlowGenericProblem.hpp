@@ -127,6 +127,20 @@ public:
     Scalar overburdenPressure(unsigned elementIdx) const;
 
     /*!
+     * \brief Whether all rock compaction multipliers use their default values.
+     *
+     * The GPU problem currently supports only the default unity multipliers.
+     */
+    bool usesDefaultRockCompaction() const
+    {
+        return rockCompPoroMultWc_.empty() &&
+               rockCompTransMultWc_.empty() &&
+               rockCompPoroMult_.empty() &&
+               rockCompTransMult_.empty() &&
+               rockCompTransMultVal_.empty();
+    }
+
+    /*!
      * \brief Returns the porosity of an element
      *
      * The reference porosity of an element is the porosity of the medium before modified
@@ -156,6 +170,11 @@ public:
     Scalar rockBiotComp(unsigned elementIdx) const;
 
     /*!
+     * \brief Returns the rock compressibility of an element due to thermoelasticity
+     */
+    Scalar rockBiotTemp(unsigned elementIdx) const;
+
+    /*!
     * \brief Direct access to Lame's second parameter in an element
     */
     Scalar lame(unsigned elementIdx) const;
@@ -164,6 +183,11 @@ public:
     * \brief Direct access to Biot coefficient in an element
     */
     Scalar biotCoeff(unsigned elementIdx) const;
+
+    /*!
+    * \brief Direct access to Biot temperature coefficient in an element
+    */
+    Scalar biotTemp(unsigned elementIdx) const;
 
     /*!
      * \brief Sets the porosity of an element
@@ -348,6 +372,12 @@ protected:
     std::vector<TabulatedTwoDFunction> rockCompTransMultWc_;
     std::vector<TabulatedFunction> rockCompPoroMult_;
     std::vector<TabulatedFunction> rockCompTransMult_;
+    // ROCKCOMP HYSTERESIS=HYSTER only: the reversible "elastic" curves built from
+    // ROCKTABH, indexed by (turning pressure, current pressure). Used instead of
+    // rockCompPoroMult_/rockCompTransMult_ whenever the current pressure is above
+    // the lowest pressure the cell has ever reached (this->minRefPressure_).
+    std::vector<TabulatedTwoDFunction> rockCompPoroMultElastic_;
+    std::vector<TabulatedTwoDFunction> rockCompTransMultElastic_;
     std::vector<Scalar> rockCompTransMultVal_;
 
     PolymerSolutionContainer<Scalar> polymer_;

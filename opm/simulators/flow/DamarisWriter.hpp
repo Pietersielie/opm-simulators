@@ -442,7 +442,8 @@ private:
         const bool log = this->collectOnIORank_.isIORank();
 
         damarisOutputModule_->allocBuffers(num_interior, reportStepNum,
-                                      isSubStep, log, /*isRestart*/ false);
+                                           isSubStep, log,
+                                           /*forceRestartFieldAllocation=*/false);
 
         ElementContext elemCtx(simulator_);
         OPM_BEGIN_PARALLEL_TRY_CATCH();
@@ -455,7 +456,6 @@ private:
 
             damarisOutputModule_->processElement(elemCtx);
         }
-        damarisOutputModule_->clearExtractors();
         }
         {
         OPM_TIMEBLOCK(prepareBlockData);
@@ -464,6 +464,7 @@ private:
             elemCtx.updatePrimaryIntensiveQuantities(/*timeIdx=*/0);
             damarisOutputModule_->processElementBlockData(elemCtx);
         }
+        damarisOutputModule_->clearExtractors();
         }
         {
         OPM_TIMEBLOCK(prepareFluidInPlace);
@@ -476,8 +477,11 @@ private:
                 damarisOutputModule_->updateFluidInPlace(dofIdx, intQuants, totVolume);
         }
         }
+        OPM_END_PARALLEL_TRY_CATCH("DamarisWriter::prepareLocalCellData() failed: ",
+                                   simulator_.vanguard().grid().comm());
+
+        // Keep collective validation outside rank-local exception handling.
         damarisOutputModule_->validateLocalData();
-        OPM_END_PARALLEL_TRY_CATCH("DamarisWriter::prepareLocalCellData() failed: ", simulator_.vanguard().grid().comm());
     }
 
 };

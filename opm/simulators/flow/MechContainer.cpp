@@ -24,6 +24,7 @@
 #include <opm/simulators/flow/MechContainer.hpp>
 
 #include <opm/common/utility/Visitor.hpp>
+#include <opm/input/eclipse/EclipseState/Grid/FaceDir.hpp>
 
 #include <opm/output/data/Solution.hpp>
 
@@ -72,15 +73,40 @@ allocate(const std::size_t bufferSize,
     resizeAndRegister(strain_, "STRAIN");
     resizeAndRegister(stress_, "STRESS");
 
+    // Traction vector allocation
+    enableTraction_ = false;
+    if (rstKeywords["TRACT"] > 0) {
+        using Dir = FaceDir::DirEnum;
+        enableTraction_ = true;
+        rstKeywords["TRACT"] = 0;
+        for (std::size_t dirIdx = 0; dirIdx < 3; ++dirIdx) {
+            auto& tractDir = this->traction_[dirIdx];
+            tractDir[FaceDir::ToIntersectionIndex(Dir::XPlus)].resize(bufferSize, 0.0);
+            tractDir[FaceDir::ToIntersectionIndex(Dir::YPlus)].resize(bufferSize, 0.0);
+            tractDir[FaceDir::ToIntersectionIndex(Dir::ZPlus)].resize(bufferSize, 0.0);
+        }
+    }
+    if (rstKeywords["TRACT-"] > 0) {
+        using Dir = FaceDir::DirEnum;
+        enableTraction_ = true;
+        rstKeywords["TRACT-"] = 0;
+        for (std::size_t dirIdx = 0; dirIdx < 3; ++dirIdx) {
+            auto& tractDir = this->traction_[dirIdx];
+            tractDir[FaceDir::ToIntersectionIndex(Dir::XMinus)].resize(bufferSize, 0.0);
+            tractDir[FaceDir::ToIntersectionIndex(Dir::YMinus)].resize(bufferSize, 0.0);
+            tractDir[FaceDir::ToIntersectionIndex(Dir::ZMinus)].resize(bufferSize, 0.0);
+        }
+    }
+
     allocated_ = true;
 }
 
 template<class Scalar>
 void MechContainer<Scalar>::
 assignDelStress(const unsigned globalDofIdx,
-                const Dune::FieldVector<Scalar,6>& delStress)
+                const SymmTensor<Scalar>& delStress)
 {
-    this->delstress_.assign(globalDofIdx, VoigtContainer<Scalar>(delStress));
+    this->delstress_.assign(globalDofIdx, delStress);
 }
 
 template<class Scalar>
@@ -96,17 +122,17 @@ assignDisplacement(const unsigned globalDofIdx,
 template<class Scalar>
 void MechContainer<Scalar>::
 assignFracStress(const unsigned globalDofIdx,
-                 const Dune::FieldVector<Scalar,6>& fracStress)
+                 const SymmTensor<Scalar>& fracStress)
 {
-    this->fracstress_.assign(globalDofIdx, VoigtContainer<Scalar>(fracStress));
+    this->fracstress_.assign(globalDofIdx, fracStress);
 }
 
 template<class Scalar>
 void MechContainer<Scalar>::
 assignLinStress(const unsigned globalDofIdx,
-                const Dune::FieldVector<Scalar,6>& linStress)
+                const SymmTensor<Scalar>& linStress)
 {
-    this->linstress_.assign(globalDofIdx, VoigtContainer<Scalar>(linStress));
+    this->linstress_.assign(globalDofIdx, linStress);
 }
 
 template<class Scalar>
@@ -124,17 +150,32 @@ assignPotentialForces(const unsigned globalDofIdx,
 template<class Scalar>
 void MechContainer<Scalar>::
 assignStrain(const unsigned globalDofIdx,
-             const Dune::FieldVector<Scalar,6>& strain)
+             const SymmTensor<Scalar>& strain)
 {
-    this->strain_.assign(globalDofIdx, VoigtContainer<Scalar>(strain));
+    this->strain_.assign(globalDofIdx, strain);
 }
 
 template<class Scalar>
 void MechContainer<Scalar>::
 assignStress(const unsigned globalDofIdx,
-             const Dune::FieldVector<Scalar,6>& stress)
+             const SymmTensor<Scalar>& stress)
 {
-    this->stress_.assign(globalDofIdx, VoigtContainer<Scalar>(stress));
+    this->stress_.assign(globalDofIdx, stress);
+}
+
+template<class Scalar>
+void MechContainer<Scalar>::
+assignTraction(const unsigned globalDofIdx,
+               const std::array<Dune::FieldVector<Scalar,3>, 6>& traction)
+{
+    for (std::size_t faceIdx = 0; faceIdx < 6; ++faceIdx) {
+        for (std::size_t dirIdx = 0; dirIdx < 3; ++dirIdx) {
+            auto& tractEntry = this->traction_[dirIdx][faceIdx];
+            if (!tractEntry.empty()) {
+                tractEntry[globalDofIdx] = traction[faceIdx][dirIdx];
+            }
+        }
+    }
 }
 
 template<class Scalar>
@@ -148,6 +189,7 @@ outputRestart(data::Solution& sol)
                                  UnitSystem::measure,
                                  std::variant<std::vector<Scalar>*,
                                               std::array<std::vector<Scalar>,3>*,
+                                              std::array<std::vector<Scalar>,6>*,
                                               VoigtArray<Scalar>*>>;
 
     auto doInsert = [&sol](const std::string& name,
@@ -169,6 +211,9 @@ outputRestart(data::Solution& sol)
         DataEntry{"STRAIN",   UnitSystem::measure::identity, &strain_},
         DataEntry{"STRESS",   UnitSystem::measure::pressure, &stress_},
         DataEntry{"TEMPPOTF", UnitSystem::measure::pressure, &potentialTempForce_},
+        DataEntry{"TRACTX",   UnitSystem::measure::pressure, &traction_[0]},
+        DataEntry{"TRACTY",   UnitSystem::measure::pressure, &traction_[1]},
+        DataEntry{"TRACTZ",   UnitSystem::measure::pressure, &traction_[2]},
     };
 
     std::ranges::for_each(solutionVectors,
@@ -199,6 +244,30 @@ outputRestart(data::Solution& sol)
                                         doInsert(name + "YZ", measure, v[VoigtIndex::YZ]);
                                         doInsert(name + "XZ", measure, v[VoigtIndex::XZ]);
                                         doInsert(name + "XY", measure, v[VoigtIndex::XY]);
+                                    },
+                                    [&array, &doInsert](std::array<std::vector<Scalar>,6>* V)
+                                    {
+                                        using Dir = FaceDir::DirEnum;
+                                        static const auto dirs = std::array{
+                                            std::pair{FaceDir::ToIntersectionIndex(Dir::XMinus),
+                                                      "I-"},
+                                            std::pair{FaceDir::ToIntersectionIndex(Dir::XPlus),
+                                                      "I+"},
+                                            std::pair{FaceDir::ToIntersectionIndex(Dir::YMinus),
+                                                      "J-"},
+                                            std::pair{FaceDir::ToIntersectionIndex(Dir::YPlus),
+                                                      "J+"},
+                                            std::pair{FaceDir::ToIntersectionIndex(Dir::ZMinus),
+                                                      "K-"},
+                                            std::pair{FaceDir::ToIntersectionIndex(Dir::ZPlus),
+                                                      "K+"},
+                                        };
+                                        auto& v = *V;
+                                        const auto& name = std::get<0>(array);
+                                        const auto& measure = std::get<1>(array);
+                                        for (const auto& [index, postfix] : dirs) {
+                                            doInsert(name + postfix, measure, v[index]);
+                                        }
                                     }
                                  }, std::get<2>(array));
                   }

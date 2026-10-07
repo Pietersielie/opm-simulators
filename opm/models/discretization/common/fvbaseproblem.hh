@@ -162,6 +162,8 @@ public:
         }
     }
 
+    virtual ~FvBaseProblem() = default;
+
     /*!
      * \brief Registers all available parameters for the problem and
      *        the model.
@@ -570,6 +572,18 @@ public:
     { return Parameters::Get<Parameters::MinTimeStepSize<Scalar>>(); }
 
     /*!
+     * \brief Upper bound for the next time step imposed by the problem.
+     *
+     * The default is no limit; problems with their own step restrictions
+     * (e.g. a geomechanical fracture model throttling growth per step)
+     * override this.  Deliberately double rather than Scalar: time step
+     * quantities are kept in double throughout, since float has too little
+     * precision at the magnitudes involved.
+     */
+    virtual double maxNextTimeStepSize() const
+    { return std::numeric_limits<double>::max(); }
+
+    /*!
      * \brief Returns the maximum number of subsequent failures for the time integration
      *        before giving up.
      */
@@ -844,8 +858,10 @@ public:
 
 private:
     // LocalContextGuard needs mutable access to save/restore the context
-    // during NLDD domain-local solves.
+    // during NLDD domain-local solves; SetupIterationContextGuard likewise
+    // for mid-step re-initialization passes.
     template<class P> friend class LocalContextGuard;
+    template<class P> friend class SetupIterationContextGuard;
 
     /*!
      * \brief Mutable access to the iteration context for LocalContextGuard.

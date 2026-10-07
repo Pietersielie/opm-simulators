@@ -31,10 +31,6 @@
 #if HAVE_MPI
 #define RESERVOIR_COUPLING_ENABLED
 #endif
-#ifdef RESERVOIR_COUPLING_ENABLED
-#include <opm/simulators/flow/rescoup/ReservoirCouplingMaster.hpp>
-#include <opm/simulators/flow/rescoup/ReservoirCouplingSlave.hpp>
-#endif
 
 #include <dune/common/parallel/mpihelper.hh>
 
@@ -58,6 +54,13 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#ifdef RESERVOIR_COUPLING_ENABLED
+namespace Opm {
+    template<class Scalar> class ReservoirCouplingMaster;
+    template<class Scalar> class ReservoirCouplingSlave;
+}
+#endif
 
 namespace Opm {
 
@@ -123,6 +126,7 @@ public:
         if (!predetTimeStepFile.empty()) {
             forcedTimeSteps_ = readTimeStepFile<Scalar>(predetTimeStepFile);
         }
+        truncateTimeStepToFloat_ = Parameters::Get<Parameters::TruncateTimeStepToFloat>();
 
         episodeIdx_ = 0;
         episodeStartTime_ = 0;
@@ -222,6 +226,10 @@ public:
         Parameters::Register<Parameters::PredeterminedTimeStepsFile>
             ("A file with a list of predetermined time step sizes "
              "(one time step per line)");
+        Parameters::Register<Parameters::TruncateTimeStepToFloat>
+            ("Truncate the time step size to float precision. Only used to make "
+             "time steps reproducible for the timestep-replay regression test; "
+             "do not enable for production runs.");
 
         Vanguard::registerParameters();
         Model::registerParameters();
@@ -395,7 +403,7 @@ public:
      * \param value The new value for the time step size \f$\mathrm{[s]}\f$
      */
     void setTimeStepSize(Scalar value)
-    { timeStepSize_ = value; }
+    { timeStepSize_ = truncateTimeStepToFloat_ ? static_cast<Scalar>(float(value)) : value; }
 
     /*!
      * \brief Set the current time step index to a given value.
@@ -834,11 +842,11 @@ public:
     {
         return reservoirCouplingSlave_;
     }
-    void setReservoirCouplingMaster(ReservoirCouplingMaster<Scalar> *reservoirCouplingMaster)
+    void setReservoirCouplingMaster(ReservoirCouplingMaster<Scalar>* reservoirCouplingMaster)
     {
         this->reservoirCouplingMaster_ = reservoirCouplingMaster;
     }
-    void setReservoirCouplingSlave(ReservoirCouplingSlave<Scalar> *reservoirCouplingSlave)
+    void setReservoirCouplingSlave(ReservoirCouplingSlave<Scalar>* reservoirCouplingSlave)
     {
         this->reservoirCouplingSlave_ = reservoirCouplingSlave;
     }
@@ -958,10 +966,11 @@ private:
 
     bool finished_;
     bool verbose_;
+    bool truncateTimeStepToFloat_ = false;
 
 #ifdef RESERVOIR_COUPLING_ENABLED
-    ReservoirCouplingMaster<Scalar> *reservoirCouplingMaster_ = nullptr;
-    ReservoirCouplingSlave<Scalar> *reservoirCouplingSlave_ = nullptr;
+    ReservoirCouplingMaster<Scalar>* reservoirCouplingMaster_ = nullptr;
+    ReservoirCouplingSlave<Scalar>* reservoirCouplingSlave_ = nullptr;
 #endif
 
 };

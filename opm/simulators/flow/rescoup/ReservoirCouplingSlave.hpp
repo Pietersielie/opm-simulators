@@ -53,6 +53,24 @@ public:
     );
     bool activated() const { return activated_; }
     void clearDeferredLogger() { logger_.clearDeferredLogger(); }
+    /// @brief The surface injection rate target in force for each slave group
+    ///   and phase this sync step (SI): the master's target combined with the
+    ///   deck's own limit as the GRUPSLAV flag says.  Rebuilt every sync step
+    ///   by the well model; reported to the summary output as GGIRT/GWIRT.
+    const std::map<std::string, std::map<Phase, Scalar>>& effectiveInjectionTargets() const
+    { return effective_injection_targets_; }
+    std::map<std::string, std::map<Phase, Scalar>>& effectiveInjectionTargets()
+    { return effective_injection_targets_; }
+    /// @brief The production rate limit in force for each slave group and rate
+    ///   type (ORAT, WRAT, GRAT, LRAT) this sync step (SI): the master's limit
+    ///   combined with the deck's own as the GRUPSLAV flag says.  Rebuilt every
+    ///   sync step by the well model; reported to the summary output as GOPRT,
+    ///   GWPRT, GGPRT and GLPRT.
+    const std::map<std::string, std::map<Group::ProductionCMode, Scalar>>& effectiveProductionTargets() const
+    { return effective_production_targets_; }
+    std::map<std::string, std::map<Group::ProductionCMode, Scalar>>& effectiveProductionTargets()
+    { return effective_production_targets_; }
+
     const Parallel::Communication& getComm() const { return comm_; }
     MPI_Comm getMasterComm() const { return slave_master_comm_; }
     const std::string& getSlaveName() const { return slave_name_; }
@@ -161,6 +179,10 @@ public:
     /// @details Delegates to ReservoirCouplingSlaveReportStep.
     void markSlaveGroupsInSchedule(Schedule& schedule, int report_step_idx);
 
+    /// @brief Record whether the initial well solve for this sync step has run
+    /// @details Delegates to ReservoirCouplingSlaveReportStep
+    void setWellsSolvedThisSyncStep(bool value);
+
     const std::string& slaveGroupIdxToGroupName(std::size_t group_idx) const {
         return this->slave_group_order_.at(group_idx);
     }
@@ -176,21 +198,36 @@ public:
     /// @return true if terminate signal received and disconnect completed, false to continue.
     bool maybeReceiveTerminateSignalFromMaster();
 
-    /// @brief Receive terminate signal from master and disconnect the intercommunicator.
+    /// @brief Wind up the coupling after the slave has run out of report steps of its own.
     ///
-    /// This method must be called at the end of the simulation to cleanly shut down
-    /// the MPI intercommunicator created when the slave was spawned. It performs two steps:
-    /// 1. Receives a terminate signal from master (only on rank 0, then broadcast)
-    /// 2. Disconnects the intercommunicator (collective operation)
+    /// Called once, when the slave's own schedule is exhausted, to shut down the MPI
+    /// intercommunicator created when the slave was spawned. Two cases have to be told apart,
+    /// and the terminate signal from the master is what tells them apart:
     ///
-    /// Both master and slaves must call their respective disconnect methods for
+    /// 1. **The master finished too.** The signal is non-zero. Nothing more is expected of
+    ///    us; disconnect and return.
+    /// 2. **The master is still running.** The signal is zero ("keep going"), sent because
+    ///    the master has begun another sync step and expects a next report date from us.
+    ///    There is none, so we answer with ReservoirCoupling::slave_end_of_run_sentinel on
+    ///    the next-report-date channel. That tells the master our run has ended, and it
+    ///    replies with a terminate signal before joining the disconnect.
+    ///
+    /// Both master and slave must call their respective disconnect methods for
     /// MPI_Comm_disconnect() to complete - it is a collective operation.
-    void receiveTerminateAndDisconnect();
+    ///
+    /// @see ReservoirCouplingTimeStepper::receiveNextReportDateFromSlaves() and
+    ///   ReservoirCouplingMaster::markSlaveEndedAndDisconnect() for the master's half.
+    void notifyEndOfRunAndDisconnect();
+
+    /// @brief True once the initial well solve for this sync step has run
+    /// @details Delegates to ReservoirCouplingSlaveReportStep
+    bool wellsSolvedThisSyncStep() const;
 
 private:
     void checkGrupSlavGroupNames_();
     std::pair<double, bool> getGrupSlavActivationDateAndCheckHistoryMatchingMode_() const;
     bool historyMatchingMode_() const { return this->history_matching_mode_; }
+
     std::size_t numMasterGroups_() const { return this->slave_to_master_group_map_.size(); }
     //! \brief Receive the master's go-ahead after reporting our OK status.
     //!
@@ -226,6 +263,10 @@ private:
     // Later, the master process will send us group name indices, and not the group names themselves,
     // so we use this mapping to recover the slave group names from the indices.
     std::map<std::size_t, std::string> slave_group_order_;
+    // See effectiveInjectionTargets().
+    std::map<std::string, std::map<Phase, Scalar>> effective_injection_targets_;
+    // See effectiveProductionTargets().
+    std::map<std::string, std::map<Group::ProductionCMode, Scalar>> effective_production_targets_;
     // Stores data that changes for a single report step or for timesteps within a report step.
     std::unique_ptr<ReservoirCouplingSlaveReportStep<Scalar>> report_step_data_{nullptr};
 };

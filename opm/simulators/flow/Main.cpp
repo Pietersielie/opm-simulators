@@ -215,6 +215,10 @@ void Main::initMPI()
     // The instance() method already checks if MPI has been initialized so we may
     // not need to check mpi_init_ here.
     if (this->mpi_init_) {
+        // dune-fem's MPI manager must be initialized explicitly; any later
+        // use of dune-fem facilities throws "MPIManager has not been
+        // initialized" otherwise. It initializes MPI itself if needed.
+        Dune::Fem::MPIManager::initialize(argc_, argv_);
         Dune::MPIHelper::instance(argc_, argv_);
     }
 #elif HAVE_MPI
@@ -230,7 +234,7 @@ void Main::initMPI()
     maybeRedirectReservoirCouplingSlaveOutput_();
     if (test_split_comm_ && FlowGenericVanguard::comm().size() > 1) {
         int world_rank = FlowGenericVanguard::comm().rank();
-        int color = (world_rank == 0);
+        const int color = world_rank == 0 ? 1 : 0;
         MPI_Comm new_comm;
         MPI_Comm_split(FlowGenericVanguard::comm(), color, world_rank, &new_comm);
         isSimulationRank_ = (world_rank > 0);
@@ -279,7 +283,7 @@ void Main::handleTestSplitCommunicatorCmdLine_()
     }
 }
 
-void Main::notifyMasterSlaveInitFailed_()
+void Main::notifyMasterSlaveInitFailed_() const
 {
 #if HAVE_MPI
     if (Parameters::Get<Parameters::Slave>()) {

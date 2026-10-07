@@ -148,20 +148,30 @@ activeInjectionConstraint(const SingleWellState<Scalar, IndexTraits>& ws,
             return Well::InjectorCMode::RESV;
     }
 
-    // Note: we are not working on injecting network yet, so it is possible we need to change the following line
-    // to be as follows to incorporate the injecting network nodal pressure
-    // if (well_.wellHasTHPConstraints(summaryState) && currentControl != Well::InjectorCMode::THP)
-    if (controls.hasControl(Well::InjectorCMode::THP) && currentControl != Well::InjectorCMode::THP)
+    // Use wellHasTHPConstraints so that injection wells with a dynamic THP from
+    // the injection network (dynamic_thp_limit_ set) also enter this check.
+    // Wells with neither an explicit WCONINJE THP nor a network-derived THP are
+    // unaffected because wellHasTHPConstraints returns false for them.
+    if (well_.wellHasTHPConstraints(summaryState) && currentControl != Well::InjectorCMode::THP)
     {
         const auto& thp = well_.getTHPConstraint(summaryState);
         Scalar current_thp = ws.thp;
         if (thp < current_thp) {
+            // When the THP comes from the injection network (dynamic_thp_limit_ is set),
+            // well potentials were computed before network iterations at a different (static)
+            // THP and are stale. The rate_less_than_potential check would always suppress
+            // switching in that case. Bypass the check for dynamic THP — this mirrors the
+            // default production-well behaviour (no WVFPEXP) where switching is unconditional.
             bool rate_less_than_potential = true;
-            for (int p = 0; p < well_.numPhases(); ++p) {
-                // Currently we use the well potentials here computed before the iterations.
-                // We may need to recompute the well potentials to get a more
-                // accurate check here.
-                rate_less_than_potential = rate_less_than_potential && (ws.surface_rates[p]) <= ws.well_potentials[p];
+            if (!well_.getDynamicThpLimit().has_value()) {
+                for (int p = 0; p < well_.numPhases(); ++p) {
+                    // Currently we use the well potentials here computed before the iterations.
+                    // We may need to recompute the well potentials to get a more
+                    // accurate check here.
+                    rate_less_than_potential = rate_less_than_potential && (ws.surface_rates[p]) <= ws.well_potentials[p];
+                }
+            } else {
+                rate_less_than_potential = false;
             }
             if (!rate_less_than_potential) {
                 thp_limit_violated_but_not_switched = false;
@@ -191,7 +201,11 @@ activeProductionConstraint(const SingleWellState<Scalar, IndexTraits>& ws,
                            const std::optional<Well::ProductionControls>& prod_controls) const
 {
     const auto& pu = well_.phaseUsage();
-    const auto controls = prod_controls.has_value() ? prod_controls.value() : well_.wellEcl().productionControls(summaryState);
+    // Controls passed in by the caller already have the WELDRAW limit
+    // applied (or deliberately removed).
+    const auto controls = prod_controls.has_value()
+        ? prod_controls.value()
+        : well_.productionControlsWithWeldraw(summaryState, ws);
     const auto currentControl = ws.production_cmode;
 
     if (controls.hasControl(Well::ProducerCMode::BHP) && currentControl != Well::ProducerCMode::BHP) {
@@ -292,9 +306,12 @@ activeProductionConstraint(const SingleWellState<Scalar, IndexTraits>& ws,
     if (well_.wellHasTHPConstraints(summaryState) && currentControl != Well::ProducerCMode::THP) {
         const auto& thp = well_.getTHPConstraint(summaryState);
         Scalar current_thp = ws.thp;
-        // For trivial group targets (for instance caused by NETV) we dont want to flip to THP control.
-        const bool dont_check = (currentControl == Well::ProducerCMode::GRUP && ws.trivial_group_target);
-        if (thp > current_thp && !dont_check) {
+        // Wells under a zero group rate target are handled before this check
+        // is reached: stoppedOrZeroRateTarget() in updateWellControl() and
+        // wellUnderZeroRateTarget() in the local-iteration switching both
+        // return early for them. The THP limit is checked unconditionally
+        // here.
+        if (thp > current_thp) {
             // If WVFPEXP item 4 is set to YES1 or YES2
             // switching to THP is prevented if the well will
             // produce at a higher rate with THP control

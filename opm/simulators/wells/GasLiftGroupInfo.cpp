@@ -23,10 +23,12 @@
 #include <opm/material/fluidsystems/BlackOilDefaultFluidSystemIndices.hpp>
 
 #include <opm/input/eclipse/Schedule/GasLiftOpt.hpp>
-#include <opm/input/eclipse/Schedule/Schedule.hpp>
-#include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/input/eclipse/Schedule/Group/GSatProd.hpp>
+#include <opm/input/eclipse/Schedule/Schedule.hpp>
+#include <opm/input/eclipse/Schedule/ScheduleState.hpp>
+#include <opm/input/eclipse/Schedule/Well/Well.hpp>
 
+#include <opm/simulators/wells/WellInterfaceGeneric.hpp>
 #include <opm/simulators/wells/WellState.hpp>
 
 #include <fmt/format.h>
@@ -545,7 +547,12 @@ getProducerWellRates_(const Well* well, int well_index)
         ? wrate[pu.canonicalToActivePhaseIdx(IndexTraits::waterPhaseIdx)]
         : 0.0;
 
-    const auto controls = well->productionControls(this->summary_state_);
+    // The drawdown limit is a rate target like the others applied below, so
+    // the rates this well contributes to its group must respect it too.
+    auto controls = well->productionControls(this->summary_state_);
+    WellInterfaceGeneric<Scalar, IndexTraits>::
+        applyWeldrawRateLimit(*well, ws.weldraw_max_rate, controls);
+
     Scalar oil_rate = oil_pot;
     Scalar water_rate = water_pot;
     Scalar gas_rate = gas_pot;
@@ -593,16 +600,24 @@ initializeGroupRatesRecursive_(const Group& group)
     auto& [oil_rate, water_rate, gas_rate, oil_potential, water_potential, gas_potential, alq] = rates;
 
     if (group.hasSatelliteProduction()) {
-        using RateProp = GSatProd::GSatProdGroupProp::Rate;
-        const auto& gsat_prod = this->schedule_[this->report_step_idx_].gsatprod().get(group.name(), this->summary_state_);
-        oil_rate += gsat_prod.rate[RateProp::Oil];
-        water_rate += gsat_prod.rate[RateProp::Water];
-        gas_rate += gsat_prod.rate[RateProp::Gas];
-        oil_potential += gsat_prod.rate[RateProp::Oil];
-        water_potential += gsat_prod.rate[RateProp::Water];
-        gas_potential += gsat_prod.rate[RateProp::Gas];
-        alq += gsat_prod.rate[RateProp::GLift];
-        // We don't support reservoir rates for satellite production groups
+        using RateProp = GSatProd::Rate;
+
+        const auto gsat_prod = this->schedule_[this->report_step_idx_]
+            .satelliteProduction(group.name())
+            .getRates(this->summary_state_);
+
+        // Note: We don't support reservoir production rates for satellite
+        // groups.
+
+        oil_rate        += gsat_prod[RateProp::Oil];
+        water_rate      += gsat_prod[RateProp::Water];
+        gas_rate        += gsat_prod[RateProp::Gas];
+
+        oil_potential   += gsat_prod[RateProp::Oil];
+        water_potential += gsat_prod[RateProp::Water];
+        gas_potential   += gsat_prod[RateProp::Gas];
+
+        alq             += gsat_prod[RateProp::GLift];
     }
 
     if (group.wellgroup()) {

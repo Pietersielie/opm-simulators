@@ -36,28 +36,35 @@
 #include <opm/common/TimingMacros.hpp>
 #include <opm/common/OpmLog/OpmLog.hpp>
 
+#include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 #include <opm/input/eclipse/EclipseState/SummaryConfig/SummaryConfig.hpp>
 
 #include <opm/material/common/Valgrind.hpp>
 
 #include <opm/models/blackoil/blackoilproperties.hh>
 #include <opm/models/common/multiphasebaseproperties.hh>
+#include <opm/models/io/vtkblackoilparams.hpp>
 #include <opm/models/utils/parametersystem.hpp>
 #include <opm/models/utils/propertysystem.hh>
 
 #include <opm/simulators/flow/CompositionalContainer.hpp>
 #include <opm/simulators/flow/FlowBaseVanguard.hpp>
-#include <opm/simulators/flow/GenericOutputBlackoilModule.hpp>
+#include <opm/simulators/flow/GenericOutputModule.hpp>
 #include <opm/simulators/flow/OutputExtractor.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <fstream>
+#include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
 
 namespace Opm {
 
@@ -68,11 +75,11 @@ class EcfvDiscretization;
 /*!
  * \ingroup BlackOilSimulator
  *
- * \brief Output module for the results black oil model writing in
- *        ECL binary format.
+ * \brief Output module for compositional-model results written in ECL binary
+ *        format.
  */
 template <class TypeTag>
-class OutputCompositionalModule : public GenericOutputBlackoilModule<GetPropType<TypeTag, Properties::FluidSystem>>
+class OutputCompositionalModule : public GenericOutputModule<GetPropType<TypeTag, Properties::FluidSystem>>
 {
     using Simulator = GetPropType<TypeTag, Properties::Simulator>;
     using Discretization = GetPropType<TypeTag, Properties::Discretization>;
@@ -80,8 +87,10 @@ class OutputCompositionalModule : public GenericOutputBlackoilModule<GetPropType
     using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
     using IntensiveQuantities = GetPropType<TypeTag, Properties::IntensiveQuantities>;
     using FluidSystem = GetPropType<TypeTag, Properties::FluidSystem>;
-    using BaseType = GenericOutputBlackoilModule<FluidSystem>;
+    using BaseType = GenericOutputModule<FluidSystem>;
+    using RestartOutput = typename CompositionalContainer<FluidSystem>::RestartOutput;
     using Extractor = detail::Extractor<TypeTag>;
+    using BlockExtractor = detail::BlockExtractor<TypeTag>;
 
     enum { numPhases = FluidSystem::numPhases };
     enum { numComponents = FluidSystem::numComponents };
@@ -90,6 +99,12 @@ class OutputCompositionalModule : public GenericOutputBlackoilModule<GetPropType
     enum { waterPhaseIdx = FluidSystem::waterPhaseIdx };
 
 public:
+    static void registerParameters()
+    {
+        BaseType::registerParameters();
+        VtkBlackoilParams::registerParameters();
+    }
+
     template <class CollectDataToIORankType>
     OutputCompositionalModule(const Simulator& simulator,
                               const SummaryConfig& smryCfg,
@@ -116,6 +131,7 @@ public:
                    getPropValue<TypeTag, Properties::EnableBioeffects>(),
                    getPropValue<TypeTag, Properties::EnableGeochemistry>())
         , simulator_(simulator)
+        , eosType_(simulator.vanguard().eclState().compositionalConfig().eosType(0))
     {
         for (auto& region_pair : this->regions_) {
             this->createLocalRegion_(region_pair.second);
@@ -126,6 +142,12 @@ public:
         };
 
         this->setupBlockData(isCartIdxOnThisRank);
+
+        // Compositional runs currently fill block data on the global grid only.
+        // The empty level map intentionally leaves LB* values unallocated.
+        if (! collectToIORank.isParallel()) {
+            this->setupLgrBlockData({}, [](const int, const int) { return true; });
+        }
 
         if (! Parameters::Get<Parameters::OwnerCellsFirst>()) {
             const std::string msg = "The output code does not support --owner-cells-first=false.";
@@ -160,25 +182,139 @@ public:
                  const unsigned reportStepNum,
                  const bool     substep,
                  const bool     log,
-                 const bool     isRestart)
+                 const bool     forceRestartFieldAllocation)
     {
         if (! std::is_same<Discretization, EcfvDiscretization<TypeTag>>::value) {
             return;
         }
 
         auto rstKeywords = this->schedule_.rst_keywords(reportStepNum);
-        this->compC_.allocate(bufferSize, rstKeywords);
+        const bool isRestartOutput = forceRestartFieldAllocation ||
+            (!substep && this->schedule_.write_rst_file(reportStepNum));
+        const auto restartOutput = isRestartOutput
+            ? RestartOutput::Enabled
+            : RestartOutput::Disabled;
+        this->compC_.allocate(bufferSize, rstKeywords, restartOutput);
+        this->numUnresolvedSaturationPressures_ = 0;
 
-        this->doAllocBuffers(bufferSize, reportStepNum, substep, log, isRestart,
+        this->doAllocBuffers(bufferSize, reportStepNum, substep, log,
+                             forceRestartFieldAllocation,
                              /* hysteresisConfig = */ nullptr,
                              /* numOutputNnc =*/ 0,
                              std::move(rstKeywords));
     }
 
-    void assignToSolution(data::Solution& sol)
+    void assignToSolution(data::Solution& sol) override
     {
         this->compC_.outputRestart(sol, this->saturation_[oilPhaseIdx]);
         BaseType::assignToSolution(sol);
+
+        // Use the compositional restart names for phase densities and viscosities.
+        this->assignPhaseProperties(sol, typename BaseType::PhasePropertyNames {
+            .oilDensity     = "DENO",
+            .gasDensity     = "DENG",
+            .waterDensity   = "DENW",
+            .oilViscosity   = "VOIL",
+            .gasViscosity   = "VGAS",
+            .waterViscosity = "VWAT",
+        });
+
+        // Report compositional relative permeabilities under their restart names.
+        using M = UnitSystem::measure;
+        this->assignBuffer(sol, "KRO", M::identity,
+                           relativePermeability_[oilPhaseIdx], oilPhaseIdx);
+        this->assignBuffer(sol, "KRG", M::identity,
+                           relativePermeability_[gasPhaseIdx], gasPhaseIdx);
+        if constexpr (numPhases > 2) {
+            this->assignBuffer(sol, "KRW", M::identity,
+                               relativePermeability_[waterPhaseIdx], waterPhaseIdx);
+        }
+    }
+
+    void outputFipAndResvLog(const Inplace& inplace,
+                             const std::size_t reportStepNum,
+                             double elapsed,
+                             boost::posix_time::ptime currentDate,
+                             const bool substep,
+                             const Parallel::Communication& comm)
+    {
+        if (comm.rank() != 0) {
+            return;
+        }
+
+        std::unique_ptr<FIPConfig> fipSched;
+        if (reportStepNum > 0) {
+            const auto& rpt = this->schedule_[reportStepNum - 1].rpt_config.get();
+            fipSched = std::make_unique<FIPConfig>(rpt);
+        }
+
+        const FIPConfig& fipc = reportStepNum == 0
+            ? this->eclState_.getEclipseConfig().fip()
+            : *fipSched;
+
+        if (!substep && !this->forceDisableFipOutput_ && fipc.output(FIPConfig::OutputField::FIELD)) {
+            this->logOutput_.timeStamp("BALANCE", elapsed, reportStepNum, currentDate);
+
+            const auto& initial_inplace = *this->initialInplace();
+            this->logOutput_.fip(inplace, initial_inplace, "");
+
+            if (fipc.output(FIPConfig::OutputField::FIPNUM)) {
+                this->logOutput_.fip(inplace, initial_inplace, "FIPNUM");
+
+                if (fipc.output(FIPConfig::OutputField::RESV)) {
+                    this->logOutput_.fipResv(inplace, "FIPNUM");
+                }
+            }
+
+            if (fipc.output(FIPConfig::OutputField::FIP)) {
+                for (const auto& reg : this->regions_) {
+                    if (reg.first != "FIPNUM") {
+                        std::ostringstream ss;
+                        ss << "BAL" << reg.first.substr(3);
+                        this->logOutput_.timeStamp(ss.str(), elapsed, reportStepNum, currentDate);
+                        this->logOutput_.fip(inplace, initial_inplace, reg.first);
+
+                        if (fipc.output(FIPConfig::OutputField::RESV)) {
+                            this->logOutput_.fipResv(inplace, reg.first);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void outputFipAndResvLogToCSV(const std::size_t reportStepNum,
+                                  const bool substep,
+                                  const Parallel::Communication& comm)
+    {
+        if (comm.rank() != 0) {
+            return;
+        }
+
+        if ((reportStepNum == 0) && (!substep) &&
+            (this->schedule_.initialReportConfiguration().has_value()) &&
+            (this->schedule_.initialReportConfiguration()->contains("CSVFIP"))) {
+
+            std::ostringstream csv_stream;
+
+            this->logOutput_.csv_header(csv_stream);
+
+            const auto& initial_inplace = *this->initialInplace();
+
+            this->logOutput_.fip_csv(csv_stream, initial_inplace, "FIPNUM");
+
+            for (const auto& reg : this->regions_) {
+                if (reg.first != "FIPNUM") {
+                    this->logOutput_.fip_csv(csv_stream, initial_inplace, reg.first);
+                }
+            }
+
+            const IOConfig& io = this->eclState_.getIOConfig();
+            auto csv_fname = io.getOutputDir() + "/" + io.getBaseName() + ".CSV";
+
+            std::ofstream outputFile(csv_fname);
+            outputFile << csv_stream.str();
+        }
     }
 
     //! \brief Setup list of active element-level data extractors
@@ -193,7 +329,7 @@ public:
         auto extractors = std::array{
             Entry{PhaseEntry{&this->saturation_,
                   [](const unsigned phase, const ExtractContext& ectx)
-                  { return getValue(ectx.fs.saturation(phase)); }}
+                  { return ectx.intQuants.saturationForOutput(phase); }}
             },
             Entry{ScalarEntry{&this->fluidPressure_,
                   [](const ExtractContext& ectx)
@@ -219,30 +355,234 @@ public:
             Entry{[&compC = this->compC_](const ExtractContext& ectx)
                   {
                       compC.assignMoleFractions(ectx.globalDofIdx,
-                                                [&fs = ectx.fs](const unsigned compIdx)
-                                                { return getValue(fs.moleFraction(compIdx)); });
+                                                [&ectx](const unsigned compIdx)
+                                                {
+                                                    return ectx.intQuants.hasHydrocarbon()
+                                                        ? getValue(ectx.fs.moleFraction(compIdx))
+                                                        : Scalar{0};
+                                                });
+                  }, this->compC_.moleFractionsAllocated()
+            },
 
-                      if (FluidSystem::phaseIsActive(gasPhaseIdx)) {
-                          compC.assignGasFractions(ectx.globalDofIdx,
-                                                   [&fs = ectx.fs](const unsigned compIdx)
-                                                   { return getValue(fs.moleFraction(gasPhaseIdx, compIdx)); });
-                      }
-
-                      if (FluidSystem::phaseIsActive(oilPhaseIdx)) {
-                          compC.assignOilFractions(ectx.globalDofIdx,
-                                                   [&fs = ectx.fs](const unsigned compIdx)
-                                                   { return getValue(fs.moleFraction(oilPhaseIdx, compIdx)); });
-                      }
-                  }, this->compC_.allocated()
+            // Use presence before regularization so the numerical hydrocarbon
+            // floor does not create reported phase properties in a water-only cell.
+            Entry{[&compC = this->compC_](const ExtractContext& ectx)
+                  {
+                      const bool hasGas =
+                          ectx.intQuants.phaseIsPresent(gasPhaseIdx);
+                      compC.assignGasFractions(ectx.globalDofIdx,
+                                               [&fs = ectx.fs, hasGas](const unsigned compIdx)
+                                               {
+                                                   return hasGas
+                                                       ? getValue(fs.moleFraction(gasPhaseIdx, compIdx))
+                                                       : Scalar{0};
+                                               });
+                  }, FluidSystem::phaseIsActive(gasPhaseIdx) &&
+                     this->compC_.gasFractionsAllocated()
+            },
+            Entry{[&compC = this->compC_](const ExtractContext& ectx)
+                  {
+                      const bool hasOil =
+                          ectx.intQuants.phaseIsPresent(oilPhaseIdx);
+                      compC.assignOilFractions(ectx.globalDofIdx,
+                                               [&fs = ectx.fs, hasOil](const unsigned compIdx)
+                                               {
+                                                   return hasOil
+                                                       ? getValue(fs.moleFraction(oilPhaseIdx, compIdx))
+                                                       : Scalar{0};
+                                               });
+                  }, FluidSystem::phaseIsActive(oilPhaseIdx) &&
+                     this->compC_.oilFractionsAllocated()
+            },
+            Entry{[&compC = this->compC_](const ExtractContext& ectx)
+                  {
+                      compC.assignPhasePressures(ectx.globalDofIdx,
+                                                 getValue(ectx.fs.pressure(oilPhaseIdx)),
+                                                 getValue(ectx.fs.pressure(gasPhaseIdx)));
+                  }, this->compC_.phasePressuresAllocated()
+            },
+            // The reference convention for a water-only cell is VMF = 1.
+            // Otherwise use the hydrocarbon flash's vapour mole fraction.
+            Entry{[&compC = this->compC_](const ExtractContext& ectx)
+                  {
+                      const Scalar liquidFraction = getValue(ectx.fs.L());
+                      compC.assignVaporFraction(ectx.globalDofIdx,
+                                                ectx.intQuants.hasHydrocarbon()
+                                                    ? std::clamp(Scalar{1} - liquidFraction,
+                                                                 Scalar{0}, Scalar{1})
+                                                    : Scalar{1});
+                  }, this->compC_.vaporFractionAllocated()
+            },
+            // The phase densities and viscosities, reported where the phase is present.
+            Entry{PhaseEntry{&this->relativePermeability_,
+                  [](const unsigned phaseIdx, const ExtractContext& ectx)
+                  {
+                      return ectx.intQuants.phaseIsPresent(phaseIdx)
+                          ? getValue(ectx.intQuants.relativePermeability(phaseIdx))
+                          : Scalar{0};
+                  }}
+            },
+            Entry{PhaseEntry{&this->density_,
+                  [](const unsigned phaseIdx, const ExtractContext& ectx)
+                  {
+                      return ectx.intQuants.phaseIsPresent(phaseIdx)
+                          ? getValue(ectx.fs.density(phaseIdx))
+                          : Scalar{0};
+                  }}
+            },
+            Entry{PhaseEntry{&this->viscosity_,
+                  [](const unsigned phaseIdx, const ExtractContext& ectx)
+                  {
+                      return ectx.intQuants.phaseIsPresent(phaseIdx)
+                          ? getValue(ectx.fs.viscosity(phaseIdx))
+                          : Scalar{0};
+                  }}
             },
         };
 
         this->extractors_ = Extractor::removeInactive(extractors);
+
+        this->setupBlockExtractors_();
     }
 
-    //! \brief Clear list of active element-level data extractors
+    //! \brief Setup the block (B*) summary extractors.
+    //!
+    //! Populate the quantities available directly from the compositional fluid
+    //! state. Vectors that require black-oil Rs/Rv data or a surface-condition
+    //! flash remain unsupported. Bind each phase keyword explicitly because
+    //! BlockExtractor::PhaseEntry stores \c numPhases names but interprets their
+    //! positions as water, oil, and gas. That convention cannot represent both
+    //! active phases when an oil-gas compositional system has two phase slots.
+    void setupBlockExtractors_()
+    {
+        using Entry = typename BlockExtractor::Entry;
+        using Context = typename BlockExtractor::Context;
+        using ScalarEntry = typename BlockExtractor::ScalarEntry;
+
+        using namespace std::string_view_literals;
+
+        const auto densityIfPresent = [](const unsigned phaseIdx) {
+            return [phaseIdx](const Context& ectx) -> Scalar {
+                if (!ectx.intQuants.phaseIsPresent(phaseIdx)) {
+                    return Scalar{0};
+                }
+
+                return getValue(ectx.fs.density(phaseIdx));
+            };
+        };
+
+        const auto viscosityIfPresent = [](const unsigned phaseIdx) {
+            return [phaseIdx](const Context& ectx) -> Scalar {
+                if (!ectx.intQuants.phaseIsPresent(phaseIdx)) {
+                    return Scalar{0};
+                }
+
+                return getValue(ectx.fs.viscosity(phaseIdx));
+            };
+        };
+
+        const auto reservoirPoreVolume = [&model = this->simulator_.model()]
+            (const Context& ectx) -> Scalar
+        {
+            return getValue(ectx.intQuants.porosity()) *
+                   model.dofTotalVolume(ectx.globalDofIdx);
+        };
+
+        const auto phasePoreVolume = [reservoirPoreVolume](const unsigned phaseIdx) {
+            return [phaseIdx, reservoirPoreVolume](const Context& ectx) -> Scalar {
+                return ectx.intQuants.saturationForOutput(phaseIdx) * reservoirPoreVolume(ectx);
+            };
+        };
+
+        const auto handlers = std::array{
+            Entry{ScalarEntry{std::vector{"BPR"sv, "BPRESSUR"sv},
+                              [](const Context& ectx)
+                              {
+                                  return FluidSystem::phaseIsActive(oilPhaseIdx)
+                                      ? getValue(ectx.fs.pressure(oilPhaseIdx))
+                                      : getValue(ectx.fs.pressure(gasPhaseIdx));
+                              }
+                  }
+            },
+            Entry{ScalarEntry{"BGPR"sv,
+                              [](const Context& ectx)
+                              { return getValue(ectx.fs.pressure(gasPhaseIdx)); }
+                  }
+            },
+            Entry{ScalarEntry{"BWPR"sv,
+                              [](const Context& ectx)
+                              {
+                                  return FluidSystem::phaseIsActive(waterPhaseIdx)
+                                      ? getValue(ectx.fs.pressure(waterPhaseIdx))
+                                      : Scalar{0};
+                              }
+                  }
+            },
+            Entry{ScalarEntry{"BRPV"sv, reservoirPoreVolume}},
+            Entry{ScalarEntry{"BWPV"sv, phasePoreVolume(waterPhaseIdx)}},
+            Entry{ScalarEntry{"BOPV"sv, phasePoreVolume(oilPhaseIdx)}},
+            Entry{ScalarEntry{"BGPV"sv, phasePoreVolume(gasPhaseIdx)}},
+            Entry{ScalarEntry{std::vector{"BSOIL"sv, "BOSAT"sv},
+                              [](const Context& ectx)
+                              { return ectx.intQuants.saturationForOutput(oilPhaseIdx); }
+                  }
+            },
+            Entry{ScalarEntry{std::vector{"BSGAS"sv, "BGSAT"sv},
+                              [](const Context& ectx)
+                              { return ectx.intQuants.saturationForOutput(gasPhaseIdx); }
+                  }
+            },
+            Entry{ScalarEntry{std::vector{"BSWAT"sv, "BWSAT"sv},
+                              [](const Context& ectx)
+                              {
+                                  return ectx.intQuants.saturationForOutput(waterPhaseIdx);
+                              }
+                  }
+            },
+            Entry{ScalarEntry{std::vector{"BDENO"sv, "BODEN"sv},
+                              densityIfPresent(oilPhaseIdx)
+                  }
+            },
+            Entry{ScalarEntry{std::vector{"BDENG"sv, "BGDEN"sv},
+                              densityIfPresent(gasPhaseIdx)
+                  }
+            },
+            Entry{ScalarEntry{std::vector{"BDENW"sv, "BWDEN"sv},
+                              densityIfPresent(waterPhaseIdx)
+                  }
+            },
+            Entry{ScalarEntry{std::vector{"BVOIL"sv, "BOVIS"sv},
+                              viscosityIfPresent(oilPhaseIdx)
+                  }
+            },
+            Entry{ScalarEntry{std::vector{"BVGAS"sv, "BGVIS"sv},
+                              viscosityIfPresent(gasPhaseIdx)
+                  }
+            },
+            Entry{ScalarEntry{std::vector{"BVWAT"sv, "BWVIS"sv},
+                              viscosityIfPresent(waterPhaseIdx)
+                  }
+            },
+            Entry{ScalarEntry{std::vector{"BTEMP"sv, "BTCNFHEA"sv},
+                              [](const Context& ectx)
+                              {
+                                  return FluidSystem::phaseIsActive(oilPhaseIdx)
+                                      ? getValue(ectx.fs.temperature(oilPhaseIdx))
+                                      : getValue(ectx.fs.temperature(gasPhaseIdx));
+                              }
+                  }
+            },
+        };
+
+        this->blockExtractors_ = BlockExtractor::setupExecMap(this->blockData_, handlers);
+    }
+
+    //! \brief Clear the active element and block extractors.
     void clearExtractors()
-    { this->extractors_.clear(); }
+    {
+        this->extractors_.clear();
+        this->blockExtractors_.clear();
+    }
 
     /*!
      * \brief Modify the internal buffers according to the intensive
@@ -280,11 +620,37 @@ public:
             return;
     }
 
-    void processElementBlockData(const ElementContext& /* elemCtx */)
+    void processElementBlockData(const ElementContext& elemCtx)
     {
         OPM_TIMEBLOCK_LOCAL(processElementBlockData, Subsystem::Output);
         if (!std::is_same<Discretization, EcfvDiscretization<TypeTag>>::value)
             return;
+
+        if (this->blockExtractors_.empty() || elemCtx.element().level() != 0) {
+            return;
+        }
+
+        for (unsigned dofIdx = 0; dofIdx < elemCtx.numPrimaryDof(/*timeIdx=*/0); ++dofIdx) {
+            const auto globalDofIdx = elemCtx.globalSpaceIndex(dofIdx, /*timeIdx=*/0);
+            const auto cartesianIdx = elemCtx.simulator().vanguard().cartesianIndex(globalDofIdx);
+
+            const auto be_it = this->blockExtractors_.find(cartesianIdx);
+            if (be_it == this->blockExtractors_.end()) {
+                continue;
+            }
+
+            const auto& intQuants = elemCtx.intensiveQuantities(dofIdx, /*timeIdx=*/0);
+
+            const typename BlockExtractor::Context ectx{
+                globalDofIdx,
+                dofIdx,
+                intQuants.fluidState(),
+                intQuants,
+                elemCtx,
+            };
+
+            BlockExtractor::process(be_it->second, ectx);
+        }
     }
 
     /*!
@@ -349,14 +715,72 @@ public:
         return this->interRegionFlows_;
     }
 
-    void updateFluidInPlace(const unsigned             /* globalDofIdx */,
-                            const IntensiveQuantities& /* intQuants */,
-                            const double               /* totVolume */)
+    void updateFluidInPlace(const unsigned             globalDofIdx,
+                            const IntensiveQuantities& intQuants,
+                            const double               totVolume)
     {
-        // this->updateFluidInPlace_(globalDofIdx, intQuants, totVolume);
+        // Pressure and pore-volume summaries do not require a surface-condition
+        // flash. Phase in-place volumes do, so those remain unavailable here.
+        const auto referencePorosity =
+            this->simulator_.problem().referencePorosity(globalDofIdx, /*timeIdx=*/0);
+        this->updateTotalVolumesAndPressures_(globalDofIdx,
+                                              intQuants,
+                                              totVolume,
+                                              referencePorosity);
+
+        // Run the nonlinear PSAT solve in the caller's OpenMP loop. The
+        // assignment is a no-op unless a PSAT restart buffer is allocated.
+        this->assignSaturationPressure_(globalDofIdx, intQuants);
+    }
+
+    /// When PSAT is requested, reduce the count of unresolved cells across all
+    /// ranks before marking the output data valid.
+    void validateLocalData() override
+    {
+        if (this->compC_.saturationPressureRequested()) {
+            const auto& comm = this->simulator_.gridView().comm();
+            const auto totalUnresolved = comm.sum(this->numUnresolvedSaturationPressures_);
+            if (totalUnresolved > 0 && comm.rank() == 0) {
+                const std::string_view cell = totalUnresolved == 1 ? "cell" : "cells";
+                // Some unresolved searches correspond to states with no saturation
+                // boundary at this composition and temperature, so report the aggregate
+                // informationally rather than treating every result as a solver failure.
+                OpmLog::info(fmt::format("No saturation pressure was resolved in {} {}; "
+                                         "PSAT is written as zero there. This includes "
+                                         "mixtures that have none.",
+                                         totalUnresolved,
+                                         cell));
+            }
+        }
+        this->numUnresolvedSaturationPressures_ = 0;
+        BaseType::validateLocalData();
+    }
+
+protected:
+    //! \brief Allocate compositional relative-permeability buffers.
+    void allocFormulationBuffers(std::map<std::string, int>& rstKeywords,
+                                 const unsigned bufferSize) override
+    {
+        // Name each phase explicitly: the compositional phase ordering is not
+        // the one the black-oil keyword names assume.
+        const auto named = std::array{
+            std::pair{static_cast<unsigned>(oilPhaseIdx),   std::string_view{"KRO"}},
+            std::pair{static_cast<unsigned>(gasPhaseIdx),   std::string_view{"KRG"}},
+            std::pair{static_cast<unsigned>(waterPhaseIdx), std::string_view{"KRW"}},
+        };
+        for (const auto& [phase, kw] : named) {
+            if (phase >= numPhases || !FluidSystem::phaseIsActive(phase)) {
+                continue;
+            }
+            BaseType::allocBufferIfRequested(rstKeywords, bufferSize,
+                                             relativePermeability_[phase], kw, true);
+        }
     }
 
 private:
+    using ScalarBuffer = typename BaseType::ScalarBuffer;
+    std::array<ScalarBuffer, numPhases> relativePermeability_;
+
     bool isDefunctParallelWell(const std::string& wname) const override
     {
         if (simulator_.gridView().comm().size() == 1)
@@ -395,9 +819,52 @@ private:
         }
     }
 
+    /// Store the cell's saturation pressure, using zero for an unsuccessful solve.
+    /// Water-only cells use the reference convention PSAT = cell pressure.
+    /// Concurrent calls must use distinct cell indices; the unresolved count is atomic.
+    void assignSaturationPressure_(const unsigned globalDofIdx,
+                                   const IntensiveQuantities& intQuants)
+    {
+        if (!this->compC_.saturationPressureAllocated()) {
+            return;
+        }
+
+        const auto& fluidState = intQuants.fluidState();
+        if (!intQuants.hasHydrocarbon()) {
+            this->compC_.assignSaturationPressure(globalDofIdx,
+                                                  getValue(fluidState.pressure(oilPhaseIdx)));
+            return;
+        }
+
+        std::array<Scalar, numComponents> moleFractions{};
+        for (int c = 0; c < numComponents; ++c) {
+            moleFractions[c] = getValue(fluidState.moleFraction(c));
+        }
+        const auto psat = CompositionalContainer<FluidSystem>::cellSaturationPressure(
+            getValue(fluidState.L()),
+            getValue(fluidState.pressure(oilPhaseIdx)),
+            moleFractions,
+            getValue(fluidState.temperature(oilPhaseIdx)),
+            this->eosType_);
+        if (!psat) {
+            // A false result means only that no saturation pressure was resolved;
+            // it does not distinguish a physically absent boundary from numerical
+            // nonconvergence.
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+            ++this->numUnresolvedSaturationPressures_;
+        }
+
+        this->compC_.assignSaturationPressure(globalDofIdx, psat.value_or(Scalar{0}));
+    }
+
     const Simulator& simulator_;
     CompositionalContainer<FluidSystem> compC_;
+    CompositionalConfig::EOSType eosType_;
+    std::size_t numUnresolvedSaturationPressures_{};
     std::vector<typename Extractor::Entry> extractors_;
+    typename BlockExtractor::ExecMap blockExtractors_;
 };
 
 } // namespace Opm

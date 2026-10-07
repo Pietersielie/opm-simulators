@@ -29,9 +29,9 @@
 
 #include <opm/common/TimingMacros.hpp>
 
-#include <opm/grid/utility/SparseTable.hpp>
+#include <opm/common/utility/SparseTable.hpp>
 
-#include <opm/input/eclipse/Schedule/BCProp.hpp>
+#include <opm/input/eclipse/Schedule/BCState.hpp>
 
 #include <opm/material/materialstates/MaterialStateTPSA.hpp>
 
@@ -70,6 +70,7 @@ class TpsaLinearizer
 
     using ADVectorBlock = Dune::FieldVector<Evaluation, numEq>;
     using MatrixBlock = typename SparseMatrixAdapter::MatrixBlock;
+    using BlockAddress = typename SparseMatrixAdapter::BlockAddress;
     using VectorBlock = Dune::FieldVector<Scalar, numEq>;
 
     using StressInfoVector = Dune::FieldVector<Scalar, 3>;
@@ -243,17 +244,96 @@ public:
     {
         for (auto& bdyInfo : boundaryInfo_) {
             // Get boundary information from problem
-            const auto [type, displacementAD] = problem_().mechBoundaryCondition(bdyInfo.cell, bdyInfo.dir);
+            const auto& mechBC = problem_().mechBoundaryCondition(bdyInfo.cell, bdyInfo.dir);
 
             // Strip the unnecessary (and zero anyway) derivatives off displacement
             std::vector<double> displacement(3, 0.0);
             for (std::size_t ii = 0; ii < displacement.size(); ++ii) {
-                displacement[ii] = displacementAD[ii].value();
+                displacement[ii] = mechBC.displacement[ii].value();
             }
 
             // Update boundary information
-            bdyInfo.bcdata.type = type;
+            bdyInfo.bcdata.type = mechBC.type;
             bdyInfo.bcdata.displacement = displacement;
+            bdyInfo.bcdata.shearModulus = mechBC.shearModulus;
+            bdyInfo.bcdata.distance = mechBC.distance;
+        }
+    }
+
+    /*!
+    * \brief Compute the stress (or traction) for mechanics output
+    */
+    void updateStressInfo()
+    {
+        OPM_TIMEBLOCK(updateStressInfoTPSA);
+
+        if (stressInfo_.empty()) {
+            return;
+        }
+
+        const auto& geoMechModel = geoMechModel_();
+        auto& problem = problem_();
+        const unsigned int numCells = fullDomain_.cells.size();
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        // Interior traction of every cell, one per face to its neighbors
+        for (unsigned ii = 0; ii < numCells; ++ii) {
+            const unsigned globI = fullDomain_.cells[ii];
+            const MaterialState& materialStateIn =
+                geoMechModel.materialState(globI, /*timeIdx=*/0);
+
+            short loc = 0;
+            for (const auto& nbInfo : neighborInfo_[globI]) {
+                const unsigned globJ = nbInfo.neighbor;
+                const MaterialState& materialStateEx =
+                    geoMechModel.materialState(globJ, /*timeIdx=*/0);
+
+                // Compute local face term
+                ADVectorBlock adres(0.0);
+                LocalResidual::computeFaceTerm(adres,
+                                               materialStateIn,
+                                               materialStateEx,
+                                               problem,
+                                               globI,
+                                               globJ);
+                adres *= nbInfo.faceArea;
+
+                // Insert interior traction vector
+                // OBS: Assume traction vector is the three first entries in residual!
+                stressInfo_[globI][loc].faceNormal = problem.cellFaceNormal(globI, globJ);
+                stressInfo_[globI][loc].faceArea = nbInfo.faceArea;
+                for (unsigned tractionIdx = 0; tractionIdx < 3; ++tractionIdx) {
+                    stressInfo_[globI][loc].traction[tractionIdx] = adres[tractionIdx].value();
+                }
+                ++loc;
+            }
+        }
+
+        // Boundary traction
+        for (const auto& bdyInfo : boundaryInfo_) {
+            const unsigned globI = bdyInfo.cell;
+            const MaterialState& materialStateIn = geoMechModel.materialState(globI, /*timeIdx=*/0);
+
+            // Compute local boundary condition
+            ADVectorBlock adres(0.0);
+            LocalResidual::computeBoundaryTerm(adres,
+                                               materialStateIn,
+                                               bdyInfo.bcdata,
+                                               problem,
+                                               globI);
+            adres *= bdyInfo.bcdata.faceArea;
+
+            // Insert boundary traction vector
+            // OBS: Assume traction vector is the three first entries in residual!
+            const short loc = neighborInfo_[globI].size() + bdyInfo.bfIndex;
+            stressInfo_[globI][loc].faceNormal =
+                problem.cellFaceNormalBoundary(globI, bdyInfo.bfIndex);
+            stressInfo_[globI][loc].faceArea = bdyInfo.bcdata.faceArea;
+            for (unsigned tractionIdx = 0; tractionIdx < 3; ++tractionIdx) {
+                stressInfo_[globI][loc].traction[tractionIdx] = adres[tractionIdx].value();
+            }
         }
     }
 
@@ -386,7 +466,7 @@ private:
                         const auto scvfIdx = dofIdx - 1;
                         const auto& scvf = stencil.interiorFace(scvfIdx);
                         const Scalar area = scvf.area();
-                        loc_nbinfo[dofIdx - 1] = NeighborInfo{ neighborIdx, area, nullptr };
+                        loc_nbinfo[dofIdx - 1] = NeighborInfo{ neighborIdx, area, BlockAddress{} };
 
                         int faceId = scvf.dirId();
                         loc_stressinfo[dofIdx - 1] =
@@ -418,16 +498,21 @@ private:
                         }
 
                         // Get boundary information from problem()
-                        const auto [type, displacementAD] = problem_().mechBoundaryCondition(myIdx, dir_id);
+                        const auto& mechBC = problem_().mechBoundaryCondition(myIdx, dir_id);
 
                         // Strip the unnecessary (and zero anyway) derivatives off displacement
                         std::vector<double> displacement(3, 0.0);
                         for (std::size_t ii = 0; ii < displacement.size(); ++ii) {
-                            displacement[ii] = displacementAD[ii].value();
+                            displacement[ii] = mechBC.displacement[ii].value();
                         }
 
                         // Insert boundary condition data in container
-                        BoundaryConditionData bcdata { type, displacement, bfIndex, bfArea };
+                        BoundaryConditionData bcdata{mechBC.type,
+                                                     displacement,
+                                                     mechBC.shearModulus,
+                                                     mechBC.distance,
+                                                     bfIndex,
+                                                     bfArea};
                         boundaryInfo_.push_back( { myIdx, dir_id, bfIndex, bcdata } );
                         ++bfIndex;
                         continue;
@@ -495,8 +580,7 @@ private:
                 OPM_TIMEBLOCK_LOCAL(faceCalculationForEachCellTPSA, Subsystem::Assembly);
 
                 // Loop over neighboring cells
-                short loc = 0;
-                for (const auto& nbInfo : nbInfos) {
+                for (auto& nbInfo : nbInfos) {
                     OPM_TIMEBLOCK_LOCAL(calculationForEachFaceTPSA, Subsystem::Assembly);
 
                     // Reset local residual and Jacobian
@@ -535,16 +619,6 @@ private:
                     // SparseAdapter syntax: jacobian_->addToBlock(globJ, globI, bMat);
                     bMat *= -1.0;
                     *nbInfo.matBlockAddress += bMat;
-
-                    // Insert interior traction vector
-                    // OBS: Assume traction vector is the three first entries in residual!
-                    const auto& faceNormal = problem.cellFaceNormal(globI, globJ);
-                    stressInfo_[globI][loc].faceNormal = faceNormal;
-                    stressInfo_[globI][loc].faceArea = nbInfo.faceArea;
-                    for (unsigned tractionIdx = 0; tractionIdx < 3; ++tractionIdx) {
-                        stressInfo_[globI][loc].traction[tractionIdx] = res[tractionIdx];
-                    }
-                    ++loc;
                 }
             }
 
@@ -626,17 +700,6 @@ private:
             // Insert contribution to (globI, globI) sub-block
             // SparseAdapter syntax: jacobian_->addToBlock(globI, globI, bMat);
             *diagMatAddress_[globI] += bMat;
-
-            // Insert boundary traction vector
-            // OBS: Assume traction vector is the three first entries in residual!
-            const auto& nbInfos = neighborInfo_[globI];
-            short loc = nbInfos.size() + bdyInfo.bfIndex;
-            const auto& bndyNormal = problem.cellFaceNormalBoundary(globI, bdyInfo.bfIndex);
-            stressInfo_[globI][loc].faceNormal = bndyNormal;
-            stressInfo_[globI][loc].faceArea = bdyInfo.bcdata.faceArea;
-            for (unsigned tractionIdx = 0; tractionIdx < 3; ++tractionIdx) {
-                stressInfo_[globI][loc].traction[tractionIdx] = res[tractionIdx];
-            }
         }
     }
 
@@ -743,7 +806,7 @@ private:
     Simulator* simulatorPtr_{};
     LinearizationType linearizationType_{};
 
-    std::vector<MatrixBlock*> diagMatAddress_{};
+    std::vector<BlockAddress> diagMatAddress_{};
     std::unique_ptr<SparseMatrixAdapter> jacobian_{};
     GlobalEqVector residual_;
 
@@ -757,7 +820,7 @@ private:
     {
         unsigned int neighbor;
         double faceArea;
-        MatrixBlock* matBlockAddress;
+        BlockAddress matBlockAddress;
     };
     SparseTable<NeighborInfo> neighborInfo_{};
 
@@ -781,6 +844,8 @@ private:
     {
         BCMECHType type;
         std::vector<double> displacement;
+        Scalar shearModulus;
+        Scalar distance;
         unsigned boundaryFaceIndex;
         double faceArea;
     };

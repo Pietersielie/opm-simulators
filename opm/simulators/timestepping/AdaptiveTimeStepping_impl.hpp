@@ -42,6 +42,7 @@
 #include <opm/input/eclipse/Units/Units.hpp>
 #include <opm/input/eclipse/Units/UnitSystem.hpp>
 
+#include <opm/models/utils/basicparameters.hh>
 #include <opm/models/utils/parametersystem.hpp>
 
 #include <opm/simulators/timestepping/EclTimeSteppingParams.hpp>
@@ -523,6 +524,34 @@ maybeModifySuggestedTimeStepAtBeginningOfReportStep_(const double original_time_
     this->adaptive_time_stepping_.maybeModifySuggestedTimeStepAtBeginningOfReportStep_(
         original_time_step, this->is_event_
     );
+
+    if (this->adaptive_time_stepping_.time_step_control_type_ != TimeStepControlType::HardCodedTimeStep) {
+        return;
+    }
+
+    struct ZeroRelativeChange final : RelativeChangeInterface {
+        double relativeChange() const override { return 0.0; }
+    } zero_relative_change;
+
+    const auto* hardcoded_control = static_cast<const HardcodedTimeStepControl*>(
+        this->adaptive_time_stepping_.time_step_control_.get());
+    AdaptiveSimulatorTimer report_step_timer{
+        this->simulator_timer_.startDateTime(),
+        original_time_step,
+        this->simulator_timer_.simulationTimeElapsed(),
+        original_time_step,
+        this->simulator_timer_.reportStepNum(),
+        maxTimeStep_()
+    };
+
+    const double hardcoded_initial_step = hardcoded_control->computeTimeStepSize(
+        original_time_step,
+        0,
+        zero_relative_change,
+        report_step_timer);
+    if (std::isfinite(hardcoded_initial_step) && hardcoded_initial_step > 0.0) {
+        this->adaptive_time_stepping_.setSuggestedNextStep(hardcoded_initial_step);
+    }
 }
 
 // The maybeUpdateTuning_() lambda callback is defined in SimulatorFullyImplicit::runStep()
@@ -642,7 +671,7 @@ getRcMasterSyncStepLength_(double prev_step,
         //  dt_ to current_step_length.
     }
     current_step_length = reservoirCouplingMaster_().maybeChopSubStep(current_step_length, current_time);
-    auto num_active = reservoirCouplingMaster_().numActivatedSlaves();
+    auto num_active = reservoirCouplingMaster_().numCoupledSlaves();
     OpmLog::info(fmt::format(
         "\nChoosing next sync time{} between master and {} active slave {}: {:.2f} days",
         sync_at_report_steps ? " (RSYNC)" : "",
@@ -893,6 +922,7 @@ run()
 {
     auto& simulator = solver_().model().simulator();
     auto& problem = simulator.problem();
+    const bool truncateTimeStepToFloat = Parameters::Get<Parameters::TruncateTimeStepToFloat>();
     // counter for solver restarts
     int restarts = 0;
     SimulatorReport report;
@@ -927,14 +957,30 @@ run()
             report += substep_report;
 
             OPM_TIMEBLOCK(convergenceSucceeded);
+            // When the time step is truncated to float precision, advance the timer
+            // by the truncated step size used by the model and base the next step
+            // size on it. This keeps the elapsed time and the step sizes reproducible
+            // from the step sizes alone, which the timestep replay tests rely on.
+            // The step that ends the report step keeps dt so that the report time
+            // is hit exactly.
+            double dt_taken = dt;
+            if (truncateTimeStepToFloat) {
+                const double model_dt = simulator.timeStepSize();
+                const double remaining = this->substep_timer_.totalTime()
+                                       - this->substep_timer_.simulationTimeElapsed();
+                if (model_dt > 0.0 && dt < remaining) {
+                    this->substep_timer_.setCurrentStepLength(model_dt);
+                    dt_taken = model_dt;
+                }
+            }
             ++this->substep_timer_;   // advance by current dt
 
             const int iterations = getNumIterations_(substep_report);
             auto dt_estimate = timeStepControlComputeEstimate_(
-                                     dt, iterations, this->substep_timer_);
+                                     dt_taken, iterations, this->substep_timer_);
 
             assert(dt_estimate > 0);
-            dt_estimate = maybeRestrictTimeStepGrowth_(dt, dt_estimate, restarts);
+            dt_estimate = maybeRestrictTimeStepGrowth_(dt_taken, dt_estimate, restarts);
             restarts = 0;         // solver converged, reset restarts counter
 
             maybeReportSubStep_(substep_report);
@@ -947,6 +993,7 @@ run()
             }
 
             // set new time step length
+            checkTimeStepCanAdvance_(dt_taken, dt_estimate);
             setTimeStep_(dt_estimate);
 
             report.success.converged = this->substep_timer_.done();
@@ -1030,6 +1077,46 @@ checkTimeStepMaxRestartLimit_(const int restarts) const
         // Use throw directly to prevent file and line
         throw TimeSteppingBreakdown{msg};
     }
+}
+
+template<class TypeTag>
+template<class Solver>
+void
+AdaptiveTimeStepping<TypeTag>::SubStepIteration<Solver>::
+checkTimeStepCanAdvance_(const double current_time_step,
+                         const double new_time_step) const
+{
+    // Both dt floors - the minimum step size and the restart count - sit on
+    // the failure path.  A run whose substeps all converge, but for which the
+    // controller keeps proposing ever smaller steps, consults neither: the
+    // step size shrinks without bound while the elapsed time stands still,
+    // and the run never ends.  Hold the accepted path to the same minimum.
+    if (new_time_step >= minTimeStep_()) {
+        return;
+    }
+
+    // A sub-minimum step is valid when the report step is already complete, or
+    // when timestep control is increasing it. Reject only a shrinking
+    // sub-minimum step, which is the one that stalls short of the report-step
+    // boundary.
+    if (this->substep_timer_.done() || new_time_step >= current_time_step) {
+        return;
+    }
+
+    const auto msg =
+        fmt::format("Time step control proposed a step of {:.3E} DAYS, below the "
+                    "minimum of {:.3E} DAYS, while every substep converges.  The "
+                    "run is not advancing past {:.6E} DAYS.",
+                    new_time_step / 86400.0,
+                    minTimeStep_() / 86400.0,
+                    this->substep_timer_.simulationTimeElapsed() / 86400.0);
+
+    if (solverVerbose_()) {
+        OpmLog::error(msg);
+    }
+
+    // Use throw directly to prevent file and line
+    throw TimeSteppingBreakdown{msg};
 }
 
 template<class TypeTag>
@@ -1372,7 +1459,15 @@ runSubStep_()
             (const std::string& failure_reason, const std::exception& e, bool log_exception = true)
     {
         substep_report = solver_().failureReport();
+        // Keep the exception text: it carries the actual reason (e.g. which
+        // equation had a too-large residual), which otherwise only surfaces
+        // at debug verbosity while the PRT shows just the generic category.
         this->cause_of_failure_ = failure_reason;
+        if (const std::string what = e.what();
+            !what.empty() && what != failure_reason)
+        {
+            this->cause_of_failure_ += " (" + what + ")";
+        }
         if (log_exception && solverVerbose_()) {
             OpmLog::debug(std::string("Caught Exception: ") + e.what());
         }

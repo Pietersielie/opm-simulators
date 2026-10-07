@@ -366,8 +366,11 @@ macro(opm-simulators_sources_hook)
     # cuda warns when constxpr functions are used in kernels.
     # since the entire stl is constexpr ..., we enable relaxed flag
     set_source_files_properties(
+      opm/simulators/linalg/gpuistl/GpuBlackoilIntensiveQuantitiesDispatcher.cu
       tests/gpuistl/test_blackoilfluidstategpu.cu
+      tests/gpuistl/test_blackoilintensivequantities_gpu.cu
       tests/gpuistl/test_gpu_ad.cu
+      tests/gpuistl/test_gpu_ecl_thermal_law_manager.cu
       tests/gpuistl/test_gpu_linear_two_phase_material.cu
       tests/gpuistl/test_gpuPvt.cu
       tests/gpuistl/test_gpuBlackOilFluidSystem.cu
@@ -491,6 +494,7 @@ macro(opm-simulators_tests_hook)
     foreach(test
                  AmgxInterface
                  AmgxPreconditioner
+                 blackoilintensivequantities_gpu
                  blackoilfluidstategpu
                  conditional_storage
                  cublas_handle
@@ -503,7 +507,9 @@ macro(opm-simulators_tests_hook)
                  cuVector_operations
                  deviceBlockOperations
                  gpu_ad
+                 gpu_ecl_thermal_law_manager
                  gpu_linear_two_phase_material
+                 gpu_pointer_attributes
                  gpu_resources
                  gpu_safe_call
                  gpu_smart_pointers
@@ -521,7 +527,6 @@ macro(opm-simulators_tests_hook)
                  GpuView
                  HypreInterfaceGPU
                  HyprePreconditionerGPU
-                 is_gpu_pointer
                  MiniMatrix
                  MiniVector
                  preconditioner_factory_gpu
@@ -582,6 +587,23 @@ macro(opm-simulators_tests_hook)
                         ${PROJECT_SOURCE_DIR}/tests/make_failure_report.sh
                         ${OPM_TESTS_ROOT} ${CMAKE_BINARY_DIR} ${sim_dir})
     endif()
+  endif()
+
+  if(BUILD_FLOW)
+    set(drsdt_simulator flow)
+    if(USE_DEV_SIMULATOR_IN_TESTS)
+      set(drsdt_simulator flow_blackoil)
+    endif()
+    add_test(
+      NAME
+        drsdt_initial_rs_no_free_gas
+      COMMAND
+        ${PROJECT_SOURCE_DIR}/tests/run-drsdt-free-gas-test.sh
+          -e $<TARGET_FILE:${drsdt_simulator}>
+          -i ${PROJECT_SOURCE_DIR}/tests
+          -f drsdt_initial_rs
+          -r ${PROJECT_BINARY_DIR}/tests/results/drsdt_initial_rs
+    )
   endif()
 
   if(BUILD_FLOW)
@@ -684,6 +706,7 @@ macro(opm-simulators_targets_hook)
   simulators_add_target_options(TARGET MainDispatchDynamic)
 
   target_sources(test_outputdir PRIVATE $<TARGET_OBJECTS:moduleVersion>)
+  target_sources(test_drsdt_initial_rs PRIVATE $<TARGET_OBJECTS:moduleVersion>)
   target_sources(test_equil PRIVATE $<TARGET_OBJECTS:moduleVersion>)
   target_sources(test_group_higher_constraints PRIVATE $<TARGET_OBJECTS:moduleVersion>)
   target_sources(test_injection_topup_phase_validation PRIVATE $<TARGET_OBJECTS:moduleVersion>)
@@ -706,6 +729,7 @@ macro(opm-simulators_targets_hook)
     brine_precsalt_vapwat
     brine_saltprecipitation
     energy
+    energy_tpsa
     extbo
     foam
     gasoil
@@ -717,6 +741,7 @@ macro(opm-simulators_targets_hook)
     gaswater_dissolution_diffuse
     gaswater_dissolution_tpsa
     gaswater_energy
+    gaswater_energy_tpsa
     gaswater_saltprec_energy
     gaswater_saltprec_vapwat
     gaswater_solvent
@@ -727,6 +752,7 @@ macro(opm-simulators_targets_hook)
     oilwater_polymer_injectivity
     onephase
     onephase_energy
+    onephase_energy_tpsa
     onephase_tpsa
     polymer
     solvent
@@ -742,6 +768,7 @@ macro(opm-simulators_targets_hook)
       SOURCES
         flow/flow_${OBJ}.cpp
     )
+
     simulators_add_target_options(TARGET flow_lib${OBJ})
     list(APPEND FLOW_TGTS $<TARGET_OBJECTS:flow_lib${OBJ}>)
     list(APPEND FLOWMODELS_PREFIXED flow_${OBJ})
@@ -871,6 +898,73 @@ macro(opm-simulators_targets_hook)
   target_compile_definitions(flowexp_comp
     PRIVATE
       OPM_COMPILE_COMPONENTS_TEMPLATE_LIST=${OPM_COMPILE_COMPONENTS_TEMPLATE_LIST}
+  )
+
+  opm_add_executable(
+    TARGET
+      flowexp_comp2_2p
+    SOURCES
+      flowexperimental/comp/flowexp_comp2_2p_main.cpp
+      $<TARGET_OBJECTS:moduleVersion>
+    LIBRARIES
+      opmsimulators
+  )
+
+  opm_add_executable(
+    TARGET
+      flowexp_comp3_2p
+    SOURCES
+      flowexperimental/comp/flowexp_comp3_2p_main.cpp
+      $<TARGET_OBJECTS:moduleVersion>
+    LIBRARIES
+      opmsimulators
+  )
+
+  # One translation unit per (component, water) combination, each defining a
+  # single explicit specialization of dispatchFlowComp<>. Instantiating one
+  # configuration per file keeps per-process compile memory bounded and lets
+  # make -j compile the configurations in parallel.
+  set(FLOW_COMP_DISPATCH_SOURCES)
+  foreach(component IN LISTS OPM_COMPILE_COMPONENTS)
+    list(APPEND FLOW_COMP_DISPATCH_SOURCES flowexperimental/comp/flow_comp_dispatch${component}.cpp)
+    list(APPEND FLOW_COMP_DISPATCH_SOURCES flowexperimental/comp/flow_comp_dispatch${component}_2p.cpp)
+  endforeach()
+
+  opm_add_executable(
+    TARGET
+      flow_comp
+    LIBRARIES
+      opmsimulators
+    SOURCES
+      flowexperimental/comp/flow_comp.cpp
+      ${FLOW_COMP_DISPATCH_SOURCES}
+      $<TARGET_OBJECTS:moduleVersion>
+  )
+  target_compile_definitions(flow_comp
+    PRIVATE
+      OPM_COMPILE_COMPONENTS_TEMPLATE_LIST=${OPM_COMPILE_COMPONENTS_TEMPLATE_LIST}
+  )
+
+  opm_add_executable(
+    TARGET
+      flow_comp2_2p
+    SOURCES
+      flowexperimental/comp/flow_comp2_2p.cpp
+      flowexperimental/comp/flow_comp_dispatch2_2p.cpp
+      $<TARGET_OBJECTS:moduleVersion>
+    LIBRARIES
+      opmsimulators
+  )
+
+  opm_add_executable(
+    TARGET
+      flow_comp3_2p
+    SOURCES
+      flowexperimental/comp/flow_comp3_2p.cpp
+      flowexperimental/comp/flow_comp_dispatch3_2p.cpp
+      $<TARGET_OBJECTS:moduleVersion>
+    LIBRARIES
+      opmsimulators
   )
 
   if(BUILD_FLOW_FLOAT_VARIANTS)

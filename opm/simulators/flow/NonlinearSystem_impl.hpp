@@ -28,6 +28,9 @@
 #include <opm/common/ErrorMacros.hpp>
 #include <opm/common/TimingMacros.hpp>
 
+#include <opm/models/utils/basicparameters.hh>
+#include <opm/models/utils/parametersystem.hpp>
+
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -78,6 +81,8 @@ updateSolution(const GlobalEqVector& dx)
                              /*curSolution=*/solution,
                              /*update=*/dx,
                              /*resid=*/dx);
+
+    postSolutionUpdate();
 
     {
         OPM_TIMEBLOCK(invalidateAndUpdateIntensiveQuantities);
@@ -141,6 +146,7 @@ NonlinearSystem(Simulator& simulator,
     : simulator_(simulator)
     , grid_(simulator_.vanguard().grid())
     , terminal_output_(terminal_output)
+    , enable_state_rollback_(Parameters::Get<Parameters::EnableStateRollback>())
     , param_(param)
     , well_model_(wellModel)
     , current_relaxation_(1.0)
@@ -193,10 +199,13 @@ prepareStep(const SimulatorTimerInterface& timer)
     }
 
     if (lastStepFailed) {
-        simulator_.model().updateFailed();
+        simulator_.problem().updateFailed();
+        if (enable_state_rollback_) {
+            simulator_.model().newtonMethod().eraseMatrix();
+        }
     }
     else {
-        simulator_.model().advanceTimeLevel();
+        simulator_.problem().advanceTimeLevel();
     }
 
     // The model still needs the report-step time context even though flow owns time stepping.

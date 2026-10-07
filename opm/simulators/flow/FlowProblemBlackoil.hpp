@@ -31,27 +31,13 @@
 #ifndef OPM_FLOW_PROBLEM_BLACK_HPP
 #define OPM_FLOW_PROBLEM_BLACK_HPP
 
-#include <opm/material/fluidsystems/BlackOilFluidSystem.hpp>
-#include <opm/material/fluidsystems/blackoilpvt/DryGasPvt.hpp>
-#include <opm/material/fluidsystems/blackoilpvt/WetGasPvt.hpp>
-#include <opm/material/fluidsystems/blackoilpvt/LiveOilPvt.hpp>
-#include <opm/material/fluidsystems/blackoilpvt/DeadOilPvt.hpp>
-#include <opm/material/fluidsystems/blackoilpvt/ConstantCompressibilityOilPvt.hpp>
-#include <opm/material/fluidsystems/blackoilpvt/ConstantCompressibilityWaterPvt.hpp>
-#include <opm/material/fluidsystems/blackoilpvt/ConstantRsDeadOilPvt.hpp>
-
-#include <opm/models/blackoil/blackoilconvectivemixingmoduleparam.hpp>
-#include <opm/models/blackoil/blackoilmoduleparams.hh>
 #include <opm/models/blackoil/blackoilmodules.hpp>
 
 #include <opm/output/eclipse/EclipseIO.hpp>
 
-#include <opm/input/eclipse/Units/Units.hpp>
-
 #include <opm/simulators/flow/ActionHandler.hpp>
 #include <opm/simulators/flow/FlowProblem.hpp>
 #include <opm/simulators/flow/FlowProblemBlackoilProperties.hpp>
-#include <opm/simulators/flow/FlowThresholdPressure.hpp>
 #include <opm/simulators/flow/MixingRateControls.hpp>
 #include <opm/simulators/flow/OutputBlackoilModule.hpp>
 #include <opm/simulators/flow/VtkTracerModule.hpp>
@@ -159,7 +145,6 @@ private:
     using IndexTraits = typename FluidSystem::IndexTraitsType;
     using InitialFluidState = typename EquilInitializer<TypeTag>::ScalarFluidState;
     using HybridNewton = BlackOilHybridNewton<TypeTag>;
-    using ModuleParams = BlackoilModuleParams<ConvectiveMixingModuleParam<Scalar>>;
 
 #if HAVE_DAMARIS
     using DamarisWriterType = DamarisWriter<TypeTag>;
@@ -188,8 +173,8 @@ public:
      */
     explicit FlowProblemBlackoil(Simulator& simulator)
         : FlowProblemType(simulator)
-        , thresholdPressures_(simulator)
         , mixControls_(simulator.vanguard().schedule())
+        , prev_timestep_state_(simulator.vanguard().schedule())
         , actionHandler_(simulator.vanguard().eclState(),
                          simulator.vanguard().schedule(),
                          simulator.vanguard().actionState(),
@@ -323,77 +308,15 @@ public:
      */
     void finishInit()
     {
-        // TODO: there should be room to remove duplication for this
-        // function, but there is relatively complicated logic in the
-        // function calls here.  Some refactoring is needed.
         FlowProblemType::finishInit();
 
         auto& simulator = this->simulator();
-
-        auto finishTransmissibilities = [updated = false, this]() mutable
-        {
-            if (updated) { return; }
-
-            this->transmissibilities_.finishInit([&vg = this->simulator().vanguard()](const unsigned int it) {
-                return vg.gridIdxToEquilGridIdx(it);
-            });
-
-            updated = true;
-        };
-
-        // calculating the TRANX, TRANY, TRANZ and NNC for output purpose
-        // for parallel running, it is based on global trans_
-        // for serial running, it is based on the transmissibilities_
-        // we try to avoid for the parallel running, has both global trans_ and transmissibilities_ allocated at the same time
-        if (enableEclOutput_) {
-            if (simulator.vanguard().grid().comm().size() > 1) {
-                if (simulator.vanguard().grid().comm().rank() == 0)
-                    eclWriter_->setTransmissibilities(&simulator.vanguard().globalTransmissibility());
-            } else {
-                finishTransmissibilities();
-                eclWriter_->setTransmissibilities(&simulator.problem().eclTransmissibilities());
-            }
-
-            std::function<unsigned int(unsigned int)> equilGridToGrid = [&simulator](unsigned int i) {
-                return simulator.vanguard().gridEquilIdxToGridIdx(i);
-            };
-
-            this->eclWriter_->extractOutputTransAndNNC(equilGridToGrid);
-        }
-        simulator.vanguard().releaseGlobalTransmissibilities();
+        const bool transmissibilitiesFinished =
+            this->prepareTransmissibilityOutput_(*eclWriter_, enableEclOutput_);
 
         const auto& eclState = simulator.vanguard().eclState();
         const auto& schedule = simulator.vanguard().schedule();
-
-        // Set the start time of the simulation
-        simulator.setStartTime(schedule.getStartTime());
-        simulator.setEndTime(schedule.simTime(schedule.size() - 1));
-
-        // We want the episode index to be the same as the report step index to make
-        // things simpler, so we have to set the episode index to -1 because it is
-        // incremented by endEpisode(). The size of the initial time step and
-        // length of the initial episode is set to zero for the same reason.
-        simulator.setEpisodeIndex(-1);
-        simulator.setEpisodeLength(0.0);
-
-        // the "NOGRAV" keyword from Frontsim or setting the EnableGravity to false
-        // disables gravity, else the standard value of the gravity constant at sea level
-        // on earth is used
-        this->gravity_ = 0.0;
-        if (Parameters::Get<Parameters::EnableGravity>() &&
-            eclState.getInitConfig().hasGravity())
-        {
-            // unit::gravity is 9.80665 m^2/s--i.e., standard measure at Tellus equator.
-            this->gravity_[dim - 1] = unit::gravity;
-        }
-
-        if (this->enableTuning_) {
-            // if support for the TUNING keyword is enabled, we get the initial time
-            // steping parameters from it instead of from command line parameters
-            const auto& tuning = schedule[0].tuning();
-            this->initialTimeStepSize_ = tuning.TSINIT.has_value() ? tuning.TSINIT.value() : -1.0;
-            this->maxTimeStepAfterWellEvent_ = tuning.TMAXWC;
-        }
+        this->initializeSimulatorTime_();
 
         // conserve inner energy instead of enthalpy if TEMP is used
         // or THERMAL and parameter ConserveInnerEnergyThermal is true (default false)
@@ -402,30 +325,16 @@ public:
         bool conserveInnerEnergy = isTemp || (isThermal && Parameters::Get<Parameters::ConserveInnerEnergyThermal>());
         FluidSystem::setEnergyEqualEnthalpy(conserveInnerEnergy);
 
-        if (FluidSystem::phaseIsActive(FluidSystem::oilPhaseIdx) &&
-            FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx)) {
-            this->maxOilSaturation_.resize(this->model().numGridDof(), 0.0);
-        }
-
-        this->readRockParameters_(simulator.vanguard().cellCenterDepths(),
-                                  [&simulator](const unsigned idx)
-                                  {
-                                      std::array<int,dim> coords;
-                                      simulator.vanguard().cartesianCoordinate(idx, coords);
-                                      std::ranges::transform(coords, coords.begin(),
-                                                             [](const auto c) { return c + 1; });
-                                      return coords;
-                                  });
-
-        this->readMaterialParameters_();
-        this->readThermalParameters_();
+        this->initializeModelProperties_();
 
         // write the static output files (EGRID, INIT)
         if (enableEclOutput_) {
             this->eclWriter_->writeInit();
         }
 
-        finishTransmissibilities();
+        if (!transmissibilitiesFinished) {
+            this->finishTransmissibilities_();
+        }
 
         const auto& initconfig = eclState.getInitConfig();
         this->tracerModel_.init(initconfig.restartRequested());
@@ -490,6 +399,17 @@ public:
         this->mixControls_.init(this->model().numGridDof(),
                                 this->episodeIndex(),
                                 eclState.runspec().tabdims().getNumPVTTables());
+
+        // Seed the DRSDT/DRVDT history from the initial composition.  Left at
+        // zero, the limiter caps Rs at DRSDT * dt on the first step and boils
+        // the dissolved gas out of an undersaturated reservoir.  A restarted
+        // run seeds it from the restart solution instead.
+        if (!initconfig.restartRequested()) {
+            for (std::size_t elemIdx = 0; elemIdx < this->initialFluidStates_.size(); ++elemIdx) {
+                const auto& fs = this->initialFluidStates_[elemIdx];
+                this->mixControls_.updateLastValues(elemIdx, fs.Rs(), fs.Rv());
+            }
+        }
 
         if (this->enableVtkOutput_() && eclState.getIOConfig().initOnly()) {
             simulator.setTimeStepSize(0.0);
@@ -802,8 +722,8 @@ public:
     InitialFluidState boundaryFluidState(unsigned globalDofIdx, const int directionId) const
     {
         OPM_TIMEBLOCK_LOCAL(boundaryFluidState, Subsystem::Assembly);
-        const auto& bcprop = this->simulator().vanguard().schedule()[this->episodeIndex()].bcprop;
-        if (bcprop.size() > 0) {
+        const auto& bcstate = this->simulator().vanguard().schedule()[this->episodeIndex()].bcstate;
+        if (bcstate.size() > 0) {
             FaceDir::DirEnum dir = FaceDir::FromIntersectionIndex(directionId);
 
             // index == 0: no boundary conditions for this
@@ -811,7 +731,7 @@ public:
             if (this->bcindex_(dir)[globalDofIdx] == 0)
                 return initialFluidStates_[globalDofIdx];
 
-            const auto& bc = bcprop[this->bcindex_(dir)[globalDofIdx]];
+            const auto& bc = bcstate[this->bcindex_(dir)[globalDofIdx]];
             if (bc.bctype == BCType::DIRICHLET )
             {
                 InitialFluidState fluidState;
@@ -1181,23 +1101,6 @@ public:
         }
     }
 
-    /*!
-     * \copydoc BlackOilBaseProblem::thresholdPressure
-     */
-    Scalar thresholdPressure(unsigned elem1Idx, unsigned elem2Idx) const
-    { return thresholdPressures_.thresholdPressure(elem1Idx, elem2Idx); }
-
-    const FlowThresholdPressure<TypeTag>& thresholdPressure() const
-    { return thresholdPressures_; }
-
-    FlowThresholdPressure<TypeTag>& thresholdPressure()
-    { return thresholdPressures_; }
-
-    const ModuleParams& moduleParams() const
-    {
-        return moduleParams_;
-    }
-
     template<class Serializer>
     void serializeOp(Serializer& serializer)
     {
@@ -1207,6 +1110,20 @@ public:
     }
 
 protected:
+    //! \brief Snapshot the mixing rate controls before the timestep runs.
+    void captureBeginTimeStepState_() override
+    {
+        FlowProblemType::captureBeginTimeStepState_();
+        prev_timestep_state_.mixControls = mixControls_;
+    }
+
+    //! \brief Restore mixing rate controls after a failed timestep.
+    void restoreBeginTimeStepState_() override
+    {
+        FlowProblemType::restoreBeginTimeStepState_();
+        mixControls_ = prev_timestep_state_.mixControls;
+    }
+
     void updateExplicitQuantities_(int episodeIdx, int timeStepSize, const bool first_step_after_restart) override
     {
         this->updateExplicitQuantities_(first_step_after_restart);
@@ -1614,7 +1531,7 @@ protected:
 
     }
 
-    void handleSolventBC(const BCProp::BCFace& bc, RateVector& rate) const override
+    void handleSolventBC(const BCState::BCFace& bc, RateVector& rate) const override
     {
         if constexpr (!enableSolvent)
             throw std::logic_error("solvent is disabled and you're trying to add solvent to BC");
@@ -1622,7 +1539,7 @@ protected:
         rate[Indices::solventSaturationIdx] = bc.rate;
     }
 
-    void handlePolymerBC(const BCProp::BCFace& bc, RateVector& rate) const override
+    void handlePolymerBC(const BCState::BCFace& bc, RateVector& rate) const override
     {
         if constexpr (!enablePolymer)
             throw std::logic_error("polymer is disabled and you're trying to add polymer to BC");
@@ -1630,7 +1547,7 @@ protected:
         rate[Indices::polymerConcentrationIdx] = bc.rate;
     }
 
-    void handleMicrBC(const BCProp::BCFace& bc, RateVector& rate) const override
+    void handleMicrBC(const BCState::BCFace& bc, RateVector& rate) const override
     {
         if constexpr (!enableMICP)
             throw std::logic_error("MICP is disabled and you're trying to add microbes to BC");
@@ -1638,7 +1555,7 @@ protected:
         rate[Indices::microbialConcentrationIdx] = bc.rate;
     }
 
-    void handleOxygBC(const BCProp::BCFace& bc, RateVector& rate) const override
+    void handleOxygBC(const BCState::BCFace& bc, RateVector& rate) const override
     {
         if constexpr (!enableMICP)
             throw std::logic_error("MICP is disabled and you're trying to add oxygen to BC");
@@ -1646,7 +1563,7 @@ protected:
         rate[Indices::oxygenConcentrationIdx] = bc.rate;
     }
 
-    void handleUreaBC(const BCProp::BCFace& bc, RateVector& rate) const override
+    void handleUreaBC(const BCState::BCFace& bc, RateVector& rate) const override
     {
         if constexpr (!enableMICP)
             throw std::logic_error("MICP is disabled and you're trying to add urea to BC");
@@ -1755,8 +1672,6 @@ protected:
         return true;
     }
 
-    FlowThresholdPressure<TypeTag> thresholdPressures_;
-
     std::vector<InitialFluidState> initialFluidStates_;
 
     bool enableEclOutput_;
@@ -1769,9 +1684,20 @@ protected:
 #endif
     MixingRateControls<FluidSystem> mixControls_;
 
-    ActionHandler<Scalar, IndexTraits> actionHandler_;
+    //! \brief Blackoil part of the begin-of-timestep snapshot; see
+    //!        FlowProblem::PrevTimestepState.
+    struct PrevTimestepState
+    {
+        explicit PrevTimestepState(const Schedule& schedule)
+            : mixControls(schedule)
+        {}
 
-    ModuleParams moduleParams_;
+        MixingRateControls<FluidSystem> mixControls; //!< DRSDT / DRVDT
+    };
+
+    PrevTimestepState prev_timestep_state_;
+
+    ActionHandler<Scalar, IndexTraits> actionHandler_;
 
     HybridNewton hybridNewton_;
 

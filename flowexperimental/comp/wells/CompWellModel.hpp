@@ -23,6 +23,7 @@
 #include <opm/output/data/Wells.hpp>
 
 #include <opm/models/discretization/common/baseauxiliarymodule.hh>
+#include <opm/input/eclipse/Schedule/Events.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellTestState.hpp>
 #include <opm/input/eclipse/Schedule/Schedule.hpp>
 
@@ -35,16 +36,20 @@
 
 #include <opm/simulators/wells/PerforationData.hpp>
 
+#include <opm/simulators/timestepping/SimulatorReport.hpp>
 
+#include <cstddef>
+#include <map>
 #include <vector>
 
 namespace Opm {
 
+class RegionVariableCollection;
 class Schedule;
 struct NewtonIterationContext;
 
 template<typename TypeTag>
-class CompWellModel : WellConnectionAuxiliaryModule<TypeTag, CompWellModel<TypeTag>>
+class CompWellModel : public WellConnectionAuxiliaryModule<TypeTag, CompWellModel<TypeTag>>
 {
     using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
     using FluidSystem = GetPropType<TypeTag, Properties::FluidSystem>;
@@ -91,15 +96,26 @@ public:
     void deserialize(Restarter& /*res*/)
     {}
 
+    // OPMRST restart of compositional wells is not supported yet
+    template<class Serializer>
+    void serializeOp(Serializer& /*serializer*/)
+    {}
+
 
     void beginEpisode() { beginReportStep(simulator_.episodeIndex()); }
     void beginReportStep(unsigned report_step);
     void beginTimeStep();
     void beginIteration();
+    void restoreLastValidState();
+
+     // FlowProblem calls these lifecycle hooks for well models.
+     // Compositional wells currently keep no extra timestep snapshot state.
+     void updateFailed() {}
+     void advanceTimeLevel() {}
 
     void init();
     void endIteration() const {}
-    void endTimeStep() {}
+    void endTimeStep();
     void endEpisode() {}
 
     void computeTotalRatesForDof(RateVector& /*rate*/, unsigned /*globalIdx*/) const;
@@ -116,6 +132,11 @@ public:
          return WellTestState{};
     }
 
+    void reportIntervalConnectionOilProduction([[maybe_unused]] const double              dt,
+                                               [[maybe_unused]] const std::size_t         conn_opt_ix,
+                                               [[maybe_unused]] RegionVariableCollection& regVars) const
+    {}
+
     // using the solution x to recover the solution xw for wells and applying
     // xw to update Well State
     void recoverWellSolutionAndUpdateWellState(const BVector& x);
@@ -126,10 +147,23 @@ public:
     auto begin() const { return well_container_.begin(); }
     auto end() const { return well_container_.end(); }
 
+    const SimulatorReportSingle& lastReport() const { return last_report_; }
+    void prepareDeserialize(const int) {}
+    const std::map<std::string, double>& wellOpenTimes() const { return well_open_times_; }
+    const std::map<std::string, double>& wellCloseTimes() const { return well_close_times_; }
+    const WellGroupEvents& reportStepStartEvents() const { return report_step_start_events_; }
+    bool forceShutWellByName(const std::string& well_name, double simulation_time, bool dont_shut_grup_wells);
+
+    template <class ReservoirCouplingSlave>
+    void setReservoirCouplingSlave(ReservoirCouplingSlave*) {}
+
+    template <class ReservoirCouplingMaster>
+    void setReservoirCouplingMaster(ReservoirCouplingMaster*) {}
+
     bool getWellConvergence() const;
 
     // the following functions are not used while added to avoid modifying WellConnectionAuxiliaryModule.hpp
-    std::size_t compressedIndexForInterior(std::size_t cartesian_cell_idx) const;
+    int compressedIndexForInterior(std::size_t cartesian_cell_idx) const;
 
     std::vector<int> getCellsForConnections(const Well& well) const;
 
@@ -146,15 +180,24 @@ private:
      // we will need two to handle the changes between time stepping
      CompWellState<FluidSystem> comp_well_states_;
 
+     // saved state at beginning of report step, used to restore on failed timestep
+     CompWellState<FluidSystem> last_valid_comp_well_states_;
+
      // this is needed for parallel running, not all the wells will be in the same process
      std::vector<Well> wells_ecl_;
      std::vector<std::vector<CompConnectionData> > well_connection_data_;
+     std::vector<bool> locally_owned_wells_;
+     std::vector<int> local_well_reference_cells_;
      // const Schedule& schedule_;
      std::vector<CompWellPtr> well_container_;
 
      mutable BVector x_local_;
 
      std::size_t local_num_cells_{0};
+     SimulatorReportSingle last_report_{};
+     std::map<std::string, double> well_open_times_;
+     std::map<std::string, double> well_close_times_;
+     WellGroupEvents report_step_start_events_{};
 
      void createWellContainer();
      void initWellContainer();

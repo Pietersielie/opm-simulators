@@ -28,6 +28,7 @@
 #include <opm/common/OpmLog/OpmLog.hpp>
 
 #include <opm/grid/utility/RegionMapping.hpp>
+#include <opm/grid/LookUpData.hh>
 
 #include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/input/eclipse/EclipseState/Tables/PbvdTable.hpp>
@@ -152,7 +153,7 @@ std::pair<Scalar,Scalar> cellCenterXY(const Element& element)
     static constexpr int yCoord = Element::dimension - 2;
     Scalar yy = 0.0;
     Scalar xx = 0.0;
-        
+
 
     const Geometry& geometry = element.geometry();
     const int corners = geometry.corners();
@@ -282,7 +283,7 @@ Scalar calculateTrueVerticalDepth(Scalar z, Scalar x, Scalar y,
                                 const std::array<Scalar, 3>& referencePoint)
 {
     // For True Vertical Depth calculation:
-    // TVD = reference_depth + (z - reference_z) * cos(dipAngle) 
+    // TVD = reference_depth + (z - reference_z) * cos(dipAngle)
     //       + lateral_distance * sin(dipAngle) * cos(azimuth_difference)
 
     // Calculate lateral displacement from reference point
@@ -313,72 +314,6 @@ Scalar calculateTrueVerticalDepth(Scalar z, Scalar x, Scalar y,
     Scalar tvd = referencePoint[2] + dz * std::cos(dipAngle) + lateralInDipDir * std::sin(dipAngle);
 
     return tvd;
-}
-
-template<class Scalar, class RHS>
-RK4IVP<Scalar,RHS>::RK4IVP(const RHS& f,
-                           const std::array<Scalar,2>& span,
-                           const Scalar y0,
-                           const int N)
-    : N_(N)
-    , span_(span)
-{
-    const Scalar h = stepsize();
-    const Scalar h2 = h / 2;
-    const Scalar h6 = h / 6;
-
-    y_.reserve(N + 1);
-    f_.reserve(N + 1);
-
-    y_.push_back(y0);
-    f_.push_back(f(span_[0], y0));
-
-    for (int i = 0; i < N; ++i) {
-        const Scalar x = span_[0] + i*h;
-        const Scalar y = y_.back();
-
-        const Scalar k1 = f_[i];
-        const Scalar k2 = f(x + h2, y + h2*k1);
-        const Scalar k3 = f(x + h2, y + h2*k2);
-        const Scalar k4 = f(x + h, y + h*k3);
-
-        y_.push_back(y + h6*(k1 + 2*(k2 + k3) + k4));
-        f_.push_back(f(x + h, y_.back()));
-    }
-
-    assert (y_.size() == typename std::vector<Scalar>::size_type(N + 1));
-}
-
-template<class Scalar, class RHS>
-Scalar RK4IVP<Scalar,RHS>::
-operator()(const Scalar x) const
-{
-    // Dense output (O(h**3)) according to Shampine
-    // (Hermite interpolation)
-    const Scalar h = stepsize();
-    int i = (x - span_[0]) / h;
-    const Scalar t = (x - (span_[0] + i*h)) / h;
-
-    // Crude handling of evaluation point outside "span_";
-    if (i  <  0) { i = 0;      }
-    if (N_ <= i) { i = N_ - 1; }
-
-    const Scalar y0 = y_[i], y1 = y_[i + 1];
-    const Scalar f0 = f_[i], f1 = f_[i + 1];
-
-    Scalar u = (1 - 2*t) * (y1 - y0);
-    u += h * ((t - 1)*f0 + t*f1);
-    u *= t * (t - 1);
-    u += (1 - t)*y0 + t*y1;
-
-    return u;
-}
-
-template<class Scalar, class RHS>
-Scalar RK4IVP<Scalar,RHS>::
-stepsize() const
-{
-    return (span_[1] - span_[0]) / N_;
 }
 
 namespace PhasePressODE {
@@ -570,88 +505,6 @@ density(const Scalar depth,
 }
 
 template<class FluidSystem, class Region>
-template<class ODE>
-PressureTable<FluidSystem,Region>::
-PressureFunction<ODE>::PressureFunction(const ODE&      ode,
-                                        const InitCond& ic,
-                                        const int       nsample,
-                                        const VSpan&    span)
-    : initial_(ic)
-{
-    this->value_[Direction::Up] = std::make_unique<Distribution>
-        (ode, VSpan {{ ic.depth, span[0] }}, ic.pressure, nsample);
-
-    this->value_[Direction::Down] = std::make_unique<Distribution>
-        (ode, VSpan {{ ic.depth, span[1] }}, ic.pressure, nsample);
-}
-
-template<class FluidSystem, class Region>
-template<class ODE>
-PressureTable<FluidSystem,Region>::
-PressureFunction<ODE>::PressureFunction(const PressureFunction& rhs)
-    : initial_(rhs.initial_)
-{
-    this->value_[Direction::Up] =
-        std::make_unique<Distribution>(*rhs.value_[Direction::Up]);
-
-    this->value_[Direction::Down] =
-        std::make_unique<Distribution>(*rhs.value_[Direction::Down]);
-}
-
-template<class FluidSystem, class Region>
-template<class ODE>
-typename PressureTable<FluidSystem,Region>::template PressureFunction<ODE>&
-PressureTable<FluidSystem,Region>::
-PressureFunction<ODE>::
-operator=(const PressureFunction& rhs)
-{
-    this->initial_ = rhs.initial_;
-
-    this->value_[Direction::Up] =
-        std::make_unique<Distribution>(*rhs.value_[Direction::Up]);
-
-    this->value_[Direction::Down] =
-        std::make_unique<Distribution>(*rhs.value_[Direction::Down]);
-
-    return *this;
-}
-
-template<class FluidSystem, class Region>
-template<class ODE>
-typename PressureTable<FluidSystem,Region>::template PressureFunction<ODE>&
-PressureTable<FluidSystem,Region>::
-PressureFunction<ODE>::
-operator=(PressureFunction&& rhs)
-{
-    this->initial_ = rhs.initial_;
-    this->value_   = std::move(rhs.value_);
-
-    return *this;
-}
-
-template<class FluidSystem, class Region>
-template<class ODE>
-typename PressureTable<FluidSystem,Region>::Scalar
-PressureTable<FluidSystem,Region>::
-PressureFunction<ODE>::
-value(const Scalar depth) const
-{
-    if (depth < this->initial_.depth) {
-        // Value above initial condition depth.
-        return (*this->value_[Direction::Up])(depth);
-    }
-    else if (depth > this->initial_.depth) {
-        // Value below initial condition depth.
-        return (*this->value_[Direction::Down])(depth);
-    }
-    else {
-        // Value *at* initial condition depth.
-        return this->initial_.pressure;
-    }
-}
-
-
-template<class FluidSystem, class Region>
 template<typename PressFunc>
 void PressureTable<FluidSystem,Region>::
 checkPtr(const PressFunc*   phasePress,
@@ -833,6 +686,25 @@ void PhaseSaturations<MaterialLawManager, FluidSystem, Region, CellID>::deriveWa
     if (!oilActive) {
         // for 2p gas+water we set the water saturation to 1.0 - sg
         sw = 1.0 - this->sat_.gas;
+
+        // Honour SWATINIT by scaling the gas/water capillary pressure curve,
+        // as is done for oil/water below.  Not applicable for a sharp
+        // gas/water interface (constant Pc).
+        if (! this->swatInit_.empty() && ! this->isConstCapPress(this->gasPos())) {
+            const auto pcgw = this->press_.gas - this->press_.water;
+
+            auto [swout, newSwatInit] = this->applySwatInit(pcgw);
+            if (newSwatInit) {
+                // Curve possibly changed (e.g., PPCWMAX): re-invert.
+                const auto isIncr = true; // dPcgw/dSg >= 0 for all Sg.
+                this->sat_.gas = this->invertCapPress(pcgw, this->gasPos(), isIncr);
+                sw = 1.0 - this->sat_.gas;
+            }
+            else {
+                sw = swout;
+                this->sat_.gas = 1.0 - sw;
+            }
+        }
     }
     else {
         const auto isIncr = false; // dPcow/dSw <= 0 for all Sw.
@@ -1446,8 +1318,18 @@ equilnum(const EclipseState& eclipseState,
     std::vector<int> eqlnum(gridview.size(0), 0);
 
     if (eclipseState.fieldProps().has_int("EQLNUM")) {
-        const auto& e = eclipseState.fieldProps().get_int("EQLNUM");
-        std::ranges::transform(e, eqlnum.begin(), [](int n) { return n - 1; });
+        // EQLNUM is given on the (unrefined) input grid, but the equilibration
+        // works on the leaf grid. With LGRs the leaf has more cells than the
+        // input grid and a different ordering, so copying the input array
+        // directly into a leaf-sized vector misaligns it (and leaves refined
+        // cells at region 1). LookUpData maps each leaf cell to its input-grid
+        // origin - a refined cell inherits its parent cell's EQLNUM - which for
+        // an unrefined grid reduces to the identity, so non-LGR cases are
+        // unchanged. needsTranslation == true applies the 1-based -> 0-based
+        // shift previously done by the transform.
+        const LookUpData<typename GridView::Grid, GridView> lookUpData(gridview);
+        eqlnum = lookUpData.template assignFieldPropsIntOnLeaf<int>(
+            eclipseState.fieldProps(), "EQLNUM", /*needsTranslation=*/true);
     }
     OPM_BEGIN_PARALLEL_TRY_CATCH();
     const int num_regions = eclipseState.getTableManager().getEqldims().getNumEquilRegions();
@@ -1498,12 +1380,17 @@ InitialStateComputer(MaterialLawManager& materialLawManager,
     //Check for presence of kw SWATINIT
     if (applySwatInit) {
         if (eclipseState.fieldProps().has_double("SWATINIT")) {
-            if constexpr (std::is_same_v<Scalar,double>) {
-                swatInit_ = eclipseState.fieldProps().get_double("SWATINIT");
+            // SWATINIT is given on the (unrefined) input grid but is consumed per
+            // leaf cell; with LGRs the leaf is larger and reordered, so map it
+            // onto the leaf via LookUpData (a refined cell inherits its parent
+            // cell's value; identity without LGRs).
+            const LookUpData<Grid, GridView> lookUpData(gridView);
+            auto input =
+                lookUpData.assignFieldPropsDoubleOnLeaf(eclipseState.fieldProps(), "SWATINIT");
+            if constexpr (std::is_same_v<Scalar, double>) {
+                swatInit_ = std::move(input);
             } else {
-                const auto& input = eclipseState.fieldProps().get_double("SWATINIT");
-                swatInit_.resize(input.size());
-                std::ranges::copy(input, swatInit_.begin());
+                swatInit_.assign(input.begin(), input.end());
             }
         }
     }
@@ -1517,10 +1404,10 @@ InitialStateComputer(MaterialLawManager& materialLawManager,
     const std::vector<EquilRecord> rec = getEquil(eclipseState);
     const auto& tables = eclipseState.getTableManager();
     // Create (inverse) region mapping.
-    const RegionMapping<> eqlmap(equilnum(eclipseState, grid));
+    const RegionMapping<> eqlmap(equilnum(eclipseState, gridView));
     const int invalidRegion = -1;
     regionPvtIdx_.resize(rec.size(), invalidRegion);
-    setRegionPvtIdx(eclipseState, eqlmap);
+    setRegionPvtIdx(eclipseState, gridView, eqlmap);
 
     // Create Rs functions.
     rsFunc_.reserve(rec.size());
@@ -1976,13 +1863,22 @@ void InitialStateComputer<FluidSystem,
                           GridView,
                           ElementMapper,
                           CartesianIndexMapper>::
-setRegionPvtIdx(const EclipseState& eclState, const RMap& reg)
+setRegionPvtIdx(const EclipseState& eclState, const GridView& gridView, const RMap& reg)
 {
-    const auto& pvtnumData = eclState.fieldProps().get_int("PVTNUM");
+    // PVTNUM is given on the (unrefined) input grid, but reg.cells(r) are leaf
+    // cell indices. With LGRs the leaf has more cells (and a different ordering)
+    // than the input grid, so indexing the input PVTNUM array by a leaf index is
+    // wrong (and out of bounds for refined cells). Map PVTNUM onto the leaf via
+    // LookUpData - a refined cell inherits its parent cell's PVTNUM - which is
+    // the identity without LGRs. needsTranslation == true applies the 1-based ->
+    // 0-based shift previously done explicitly.
+    const LookUpData<typename GridView::Grid, GridView> lookUpData(gridView);
+    const auto pvtnumData = lookUpData.template assignFieldPropsIntOnLeaf<int>(
+        eclState.fieldProps(), "PVTNUM", /*needsTranslation=*/true);
 
     for (const auto& r : reg.activeRegions()) {
         const auto& cells = reg.cells(r);
-        regionPvtIdx_[r] = pvtnumData[*cells.begin()] - 1;
+        regionPvtIdx_[r] = pvtnumData[*cells.begin()];
     }
 }
 

@@ -46,6 +46,8 @@
 #include <opm/material/fluidmatrixinteractions/EclMaterialLawManager.hpp>
 #include <opm/material/thermal/EclThermalLawManager.hpp>
 
+#include <opm/models/blackoil/blackoilconvectivemixingmoduleparam.hpp>
+#include <opm/models/blackoil/blackoilmoduleparams.hh>
 #include <opm/models/common/directionalmobility.hh>
 #include <opm/models/utils/pffgridvector.hh>
 #include <opm/models/discretization/ecfv/ecfvdiscretization.hh>
@@ -59,7 +61,10 @@
 #include <opm/simulators/flow/FlowGenericProblem.hpp>
 // TODO: maybe we can name it FlowProblemProperties.hpp
 #include <opm/simulators/flow/FlowBaseProblemProperties.hpp>
+#include <opm/simulators/flow/FlowProblemParameters.hpp>
+#include <opm/simulators/flow/FlowThresholdPressure.hpp>
 #include <opm/simulators/flow/FlowUtils.hpp>
+#include <opm/simulators/flow/LgrOutputTransGather.hpp>
 #include <opm/simulators/flow/TracerModel.hpp>
 #include <opm/simulators/flow/TemperatureModel.hpp>
 #include <opm/simulators/flow/Transmissibility.hpp>
@@ -78,6 +83,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace Opm {
@@ -168,15 +174,23 @@ protected:
     using TemperatureModel = GetPropType<TypeTag, Properties::TemperatureModel>;
     using TracerModel = GetPropType<TypeTag, Properties::TracerModel>;
     using DirectionalMobilityPtr = Utility::CopyablePtr<DirectionalMobility<TypeTag>>;
+    using ModuleParams = BlackoilModuleParams<ConvectiveMixingModuleParam<Scalar>>;
 
 public:
+
+    /// Extra module-specific lines appended to the final simulation trailer
+    /// (e.g. geomechanics timing). Derived problems may shadow this.
+    std::string extraTrailerSummary() const
+    { return {}; }
     using BaseType::briefDescription;
     using BaseType::helpPreamble;
     using BaseType::shouldWriteOutput;
     using BaseType::shouldWriteRestartFile;
     using BaseType::rockBiotComp;
+    using BaseType::rockBiotTemp;
     using BaseType::lame;
     using BaseType::biotCoeff;
+    using BaseType::biotTemp;
     using BaseType::rockCompressibility;
     using BaseType::porosity;
 
@@ -237,6 +251,8 @@ public:
         , pffDofData_(simulator.gridView(), this->elementMapper())
         , tracerModel_(simulator)
         , temperatureModel_(simulator)
+        , thresholdPressures_(simulator)
+        , enable_state_rollback_(Parameters::Get<Parameters::EnableStateRollback>())
     {
         if (! Parameters::Get<Parameters::CheckSatfuncConsistency>()) {
             // User did not enable the "new" saturation function consistency
@@ -369,6 +385,10 @@ public:
         const int episodeIdx = this->episodeIndex();
         const int timeStepSize = this->simulator().timeStepSize();
 
+        if (enable_state_rollback_) {
+            this->captureBeginTimeStepState_();
+        }
+
         this->beginTimeStep_(enableExperiments,
                              episodeIdx,
                              this->simulator().timeStepIndex(),
@@ -391,7 +411,29 @@ public:
         aquiferModel_.beginTimeStep();
         tracerModel_.beginTimeStep();
         temperatureModel_.beginTimeStep();
+    }
 
+    /*!
+     * \brief Called by the simulator to restore the state captured at the
+     *        beginning of the timestep after a failed timestep.
+     */
+    void updateFailed()
+    {
+        if (enable_state_rollback_) {
+            this->restoreBeginTimeStepState_();
+        }
+        wellModel_.updateFailed();
+        this->model().updateFailed();
+    }
+
+    /*!
+     * \brief Called by the simulator to accept the current state as the new
+     *        time level after a successful timestep.
+     */
+    void advanceTimeLevel()
+    {
+        this->model().advanceTimeLevel();
+        wellModel_.advanceTimeLevel();
     }
 
     /*!
@@ -465,9 +507,11 @@ public:
             }
         }
 
-        // Drift compensation needs to be updated before calling the temperature equation
+        // For sequential implicit thermal: finalize TEMP solve,
+        // then refresh cached intensive quantities (temperature-dependent).
         if constexpr(energyModuleType == EnergyModules::SequentialImplicitThermal) {
             this->temperatureModel_.endTimeStep(wellModel_.wellState());
+            this->model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
         }
     }
 
@@ -549,6 +593,21 @@ public:
     {
         return transmissibilities_.transmissibility(globalCenterElemIdx, globalElemIdx);
     }
+
+    /*!
+     * \brief Threshold pressure [Pa] for the intersection between two elements.
+     */
+    Scalar thresholdPressure(unsigned elem1Idx, unsigned elem2Idx) const
+    { return thresholdPressures_.thresholdPressure(elem1Idx, elem2Idx); }
+
+    const FlowThresholdPressure<TypeTag>& thresholdPressure() const
+    { return thresholdPressures_; }
+
+    FlowThresholdPressure<TypeTag>& thresholdPressure()
+    { return thresholdPressures_; }
+
+    const ModuleParams& moduleParams() const
+    { return moduleParams_; }
 
     /*!
      * \copydoc EclTransmissiblity::diffusivity
@@ -731,6 +790,16 @@ public:
     }
 
     /*!
+     * \copydoc BlackoilProblem::rockBiotTemp
+     */
+    template <class Context>
+    Scalar rockBiotTemp(const Context& context, unsigned spaceIdx, unsigned timeIdx) const
+    {
+        unsigned globalSpaceIdx = context.globalSpaceIndex(spaceIdx, timeIdx);
+        return this->rockBiotTemp(globalSpaceIdx);
+    }
+
+    /*!
      * \copydoc BlackoilProblem::lame
      */
     template <class Context>
@@ -748,6 +817,16 @@ public:
     {
         unsigned globalSpaceIdx = context.globalSpaceIndex(spaceIdx, timeIdx);
         return this->biotCoeff(globalSpaceIdx);
+    }
+
+    /*!
+     * \copydoc BlackoilProblem::biotTemp
+     */
+    template <class Context>
+    Scalar biotTemp(const Context& context, unsigned spaceIdx, unsigned timeIdx) const
+    {
+        unsigned globalSpaceIdx = context.globalSpaceIndex(spaceIdx, timeIdx);
+        return this->biotTemp(globalSpaceIdx);
     }
 
     /*!
@@ -1131,8 +1210,34 @@ public:
             tableIdx = this->rockTableIdx_[elementIdx];
 
         const auto& fs = intQuants.fluidState();
-        LhsEval effectivePressure = decay<LhsEval>(fs.pressure(refPressurePhaseIdx_()));
         const auto& rock_config = this->simulator().vanguard().eclState().getSimulationConfig().rock_config();
+
+        if (!this->rockCompPoroMultElastic_.empty()) {
+            // ROCKCOMP HYSTERESIS=HYSTER: follow the deflation (virgin/plastic) curve
+            // at or below the lowest pressure ever reached by this cell, and the
+            // reversible elastic reload curve, anchored at that turning pressure,
+            // above it.
+            LhsEval effectivePressure = decay<LhsEval>(fs.pressure(refPressurePhaseIdx_()));
+            LhsEval turningPressure = this->minRefPressure_[elementIdx];
+
+            if (!this->overburdenPressure_.empty()) {
+                effectivePressure -= this->overburdenPressure_[elementIdx];
+                turningPressure -= this->overburdenPressure_[elementIdx];
+            }
+
+            if (rock_config.store()) {
+                const auto& initialPressure = asImp_().initialFluidState(elementIdx).pressure(refPressurePhaseIdx_());
+                effectivePressure -= initialPressure;
+                turningPressure -= initialPressure;
+            }
+
+            if (effectivePressure <= turningPressure)
+                return this->rockCompPoroMult_[tableIdx].eval(effectivePressure, /*extrapolation=*/true);
+
+            return this->rockCompPoroMultElastic_[tableIdx].eval(turningPressure, effectivePressure, /*extrapolation=*/true);
+        }
+
+        LhsEval effectivePressure = decay<LhsEval>(fs.pressure(refPressurePhaseIdx_()));
         if (!this->minRefPressure_.empty())
             // The pore space change is irreversible
             effectivePressure =
@@ -1198,6 +1303,15 @@ public:
         return trans_mult;
     }
 
+    //! \brief Index of the BCCON region applied to the given face of a cell, 0 if none.
+    int boundaryConditionIndex(const unsigned int globalSpaceIdx, const int directionId) const
+    {
+        if (!nonTrivialBoundaryConditions_) {
+            return 0;
+        }
+        return bcindex_(FaceDir::FromIntersectionIndex(directionId))[globalSpaceIdx];
+    }
+
     std::pair<BCType, RateVector> boundaryCondition(const unsigned int globalSpaceIdx, const int directionId) const
     {
         OPM_TIMEBLOCK_LOCAL(boundaryCondition, Subsystem::Assembly);
@@ -1209,10 +1323,10 @@ public:
         if (bcindex_(dir)[globalSpaceIdx] == 0) {
             return { BCType::NONE, RateVector(0.0) };
         }
-        if (schedule[this->episodeIndex()].bcprop.size() == 0) {
+        if (schedule[this->episodeIndex()].bcstate.size() == 0) {
             return { BCType::NONE, RateVector(0.0) };
         }
-        const auto& bc = schedule[this->episodeIndex()].bcprop[bcindex_(dir)[globalSpaceIdx]];
+        const auto& bc = schedule[this->episodeIndex()].bcstate[bcindex_(dir)[globalSpaceIdx]];
         if (bc.bctype!=BCType::RATE) {
             return { bc.bctype, RateVector(0.0) };
         }
@@ -1256,10 +1370,12 @@ public:
     void serializeOp(Serializer& serializer)
     {
         serializer(static_cast<BaseType&>(*this));
+        serializer(first_step_);
         serializer(drift_);
         serializer(wellModel_);
         serializer(aquiferModel_);
         serializer(tracerModel_);
+        serializer(temperatureModel_);
         serializer(*materialLawManager_);
     }
 
@@ -1276,6 +1392,154 @@ private:
     { return *static_cast<const Implementation *>(this); }
 
 protected:
+    //! \brief Snapshot the explicit quantities before the timestep runs.
+    //!
+    //! updateExplicitQuantities_() advances all of these from the current
+    //! solution at the start of every timestep.  They are running extrema, so
+    //! a step that later fails would otherwise leave the maxima raised (and the
+    //! minima lowered) by a solution that is being thrown away.
+    virtual void captureBeginTimeStepState_()
+    {
+        prev_timestep_state_.first_step = first_step_;
+        prev_timestep_state_.max_polymer_adsorption = this->polymer_.maxAdsorption;
+        prev_timestep_state_.max_oil_saturation = this->maxOilSaturation_;
+        prev_timestep_state_.max_water_saturation = this->maxWaterSaturation_;
+        prev_timestep_state_.min_ref_pressure = this->minRefPressure_;
+        prev_timestep_state_.rock_comp_trans_mult_val = this->rockCompTransMultVal_;
+        if (materialLawManager_ && materialLawManager_->enableHysteresis()) {
+            materialLawManager_->captureBeginTimeStepState();
+        }
+    }
+
+    //! \brief Put the explicit quantities back as they were before the step.
+    virtual void restoreBeginTimeStepState_()
+    {
+        first_step_ = prev_timestep_state_.first_step;
+        this->polymer_.maxAdsorption = prev_timestep_state_.max_polymer_adsorption;
+        this->maxOilSaturation_ = prev_timestep_state_.max_oil_saturation;
+        this->maxWaterSaturation_ = prev_timestep_state_.max_water_saturation;
+        this->minRefPressure_ = prev_timestep_state_.min_ref_pressure;
+        this->rockCompTransMultVal_ = prev_timestep_state_.rock_comp_trans_mult_val;
+        if (materialLawManager_ && materialLawManager_->enableHysteresis()) {
+            materialLawManager_->restoreBeginTimeStepState();
+        }
+    }
+
+    void finishTransmissibilities_()
+    {
+        this->transmissibilities_.finishInit(
+            [&vg = this->simulator().vanguard()](const unsigned int index) {
+                return vg.gridIdxToEquilGridIdx(index);
+            });
+    }
+
+    template<class EclWriterType>
+    bool prepareTransmissibilityOutput_(EclWriterType& eclWriter,
+                                        const bool enableEclOutput)
+    {
+        auto& simulator = this->simulator();
+        bool localTransmissibilitiesFinished = false;
+
+        if (enableEclOutput) {
+            // Parallel TRANX, TRANY, TRANZ and NNC output requires the global
+            // grid's transmissibilities on the I/O rank -- except with LGRs, below.
+            if (simulator.vanguard().grid().comm().size() > 1) {
+                bool wholeGridTransNeeded = simulator.vanguard().grid().comm().rank() == 0;
+                // Parallel LGR: reuse the simulator's own (distributed) transmissibilities for the
+                // INIT output -- each rank contributes its interior connections, gathered on the
+                // I/O rank and keyed by level-Cartesian indices so the output walk over the global
+                // (equil) grid can look them up directly. This reuses the values already computed
+                // in parallel for the simulation itself instead of recomputing a whole-grid
+                // transmissibility. The local transmissibilities are built here, before the INIT
+                // write, and reported as finished so that they are not built again.
+                if constexpr (std::is_same_v<GetPropType<TypeTag, Properties::Grid>, Dune::CpGrid>) {
+                    // Gate on the deck's LGRs -- the same condition the writer keys its LGR
+                    // output walk on (writeInit / extractOutputTransAndNNC). Grid refinement
+                    // alone (grid().maxLevel() > 0, e.g. after adapt()) must not enable the
+                    // gathered mode: the writer would look up different keys than the ones
+                    // the leaf-grid walk records.
+                    if (simulator.vanguard().eclState().getLgrs().size() > 0) {
+                        this->finishTransmissibilities_();
+                        localTransmissibilitiesFinished = true;
+                        const auto& localTrans = simulator.problem().eclTransmissibilities();
+                        eclWriter.setGatheredLgrTrans(
+                            gatherLgrOutputTrans(simulator.vanguard().grid(),
+                                                 simulator.vanguard().gridView(),
+                                                 [&localTrans](unsigned c1, unsigned c2)
+                                                 { return static_cast<double>(localTrans.transmissibility(c1, c2)); }));
+                        // All output values (TRANX/Y/Z and NNC) come from the gathered records --
+                        // no whole-grid transmissibility object is needed on the I/O rank.
+                        wholeGridTransNeeded = false;
+                    }
+                }
+                if (wholeGridTransNeeded) {
+                    eclWriter.setTransmissibilities(&simulator.vanguard().globalTransmissibility());
+                }
+            }
+            else {
+                this->finishTransmissibilities_();
+                localTransmissibilitiesFinished = true;
+                eclWriter.setTransmissibilities(&simulator.problem().eclTransmissibilities());
+            }
+
+            std::function<unsigned int(unsigned int)> equilGridToGrid =
+                [&simulator](const unsigned int index) {
+                    return simulator.vanguard().gridEquilIdxToGridIdx(index);
+                };
+            eclWriter.extractOutputTransAndNNC(equilGridToGrid);
+        }
+
+        simulator.vanguard().releaseGlobalTransmissibilities();
+        return localTransmissibilitiesFinished;
+    }
+
+    void initializeSimulatorTime_()
+    {
+        auto& simulator = this->simulator();
+        const auto& eclState = simulator.vanguard().eclState();
+        const auto& schedule = simulator.vanguard().schedule();
+
+        simulator.setStartTime(schedule.getStartTime());
+        simulator.setEndTime(schedule.simTime(schedule.size() - 1));
+
+        // Represent initialization as a zero-length episode before report step zero.
+        simulator.setEpisodeIndex(-1);
+        simulator.setEpisodeLength(0.0);
+
+        this->initGravity_(eclState);
+
+        if (this->enableTuning_) {
+            // If support for the TUNING keyword is enabled, get the initial time
+            // stepping parameters from it instead of from command line parameters.
+            const auto& tuning = schedule[0].tuning();
+            this->initialTimeStepSize_ = tuning.TSINIT.value_or(-1.0);
+            this->maxTimeStepAfterWellEvent_ = tuning.TMAXWC;
+        }
+    }
+
+    void initializeModelProperties_()
+    {
+        auto& simulator = this->simulator();
+
+        if (FluidSystem::phaseIsActive(FluidSystem::oilPhaseIdx) &&
+            FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx)) {
+            this->maxOilSaturation_.resize(this->model().numGridDof(), 0.0);
+        }
+
+        this->readRockParameters_(
+            simulator.vanguard().cellCenterDepths(),
+            [&simulator](const unsigned int index) {
+                std::array<int, dim> coords;
+                simulator.vanguard().cartesianCoordinate(index, coords);
+                std::ranges::transform(coords, coords.begin(),
+                                       [](const auto coordinate) { return coordinate + 1; });
+                return coords;
+            });
+
+        this->readMaterialParameters_();
+        this->readThermalParameters_();
+    }
+
     template<class UpdateFunc>
     void updateProperty_(const std::string& failureMsg,
                          UpdateFunc func)
@@ -1335,7 +1599,6 @@ protected:
         if (this->maxWaterSaturation_.empty())
             return false;
 
-        this->maxWaterSaturation_[/*timeIdx=*/1] = this->maxWaterSaturation_[/*timeIdx=*/0];
         this->updateProperty_("FlowProblem::updateMaxWaterSaturation_() failed:",
                               [this](unsigned compressedDofIdx, const IntensiveQuantities& iq)
                               {
@@ -1594,6 +1857,26 @@ protected:
     }
 
 protected:
+    /*!
+     * \brief Set the gravity vector from the run's configuration.
+     *
+     * Gravity is switched off by the NOGRAV keyword from Frontsim or by
+     * setting EnableGravity to false, else the standard value of the gravity
+     * constant at sea level on earth is used.  The vertical component is
+     * positive, which is the magnitude the equilibration expects.
+     */
+    void initGravity_(const EclipseState& eclState)
+    {
+        this->gravity_ = 0.0;
+
+        if (Parameters::Get<Parameters::EnableGravity>() &&
+            eclState.getInitConfig().hasGravity())
+        {
+            // unit::gravity is 9.80665 m^2/s--i.e., standard measure at Tellus equator.
+            this->gravity_[dim - 1] = unit::gravity;
+        }
+    }
+
     struct PffDofData_
     {
         ConditionalStorage<enableFullyImplicitThermal, Scalar> thermalHalfTransIn;
@@ -1780,8 +2063,31 @@ protected:
             tableIdx = this->rockTableIdx_[elementIdx];
 
         const auto& fs = intQuants.fluidState();
-        LhsEval effectivePressure = obtain(fs.pressure(refPressurePhaseIdx_()));
         const auto& rock_config = this->simulator().vanguard().eclState().getSimulationConfig().rock_config();
+
+        if (!this->rockCompTransMultElastic_.empty()) {
+            // ROCKCOMP HYSTERESIS=HYSTER: see rockCompPoroMultiplier() above.
+            LhsEval effectivePressure = obtain(fs.pressure(refPressurePhaseIdx_()));
+            LhsEval turningPressure = this->minRefPressure_[elementIdx];
+
+            if (!this->overburdenPressure_.empty()) {
+                effectivePressure -= this->overburdenPressure_[elementIdx];
+                turningPressure -= this->overburdenPressure_[elementIdx];
+            }
+
+            if (rock_config.store()) {
+                const auto& initialPressure = asImp_().initialFluidState(elementIdx).pressure(refPressurePhaseIdx_());
+                effectivePressure -= initialPressure;
+                turningPressure -= initialPressure;
+            }
+
+            if (effectivePressure <= turningPressure)
+                return this->rockCompTransMult_[tableIdx].eval(effectivePressure, /*extrapolation=*/true);
+
+            return this->rockCompTransMultElastic_[tableIdx].eval(turningPressure, effectivePressure, /*extrapolation=*/true);
+        }
+
+        LhsEval effectivePressure = obtain(fs.pressure(refPressurePhaseIdx_()));
         if (!this->minRefPressure_.empty())
             // The pore space change is irreversible
             effectivePressure =
@@ -1820,6 +2126,9 @@ protected:
     TracerModel tracerModel_;
     TemperatureModel temperatureModel_;
 
+    FlowThresholdPressure<TypeTag> thresholdPressures_;
+    ModuleParams moduleParams_;
+
     template<class T>
     struct BCData
     {
@@ -1849,19 +2158,38 @@ protected:
         }
     };
 
-    virtual void handleSolventBC(const BCProp::BCFace&, RateVector&) const = 0;
+    virtual void handleSolventBC(const BCState::BCFace&, RateVector&) const = 0;
 
-    virtual void handlePolymerBC(const BCProp::BCFace&, RateVector&) const = 0;
+    virtual void handlePolymerBC(const BCState::BCFace&, RateVector&) const = 0;
 
-    virtual void handleMicrBC(const BCProp::BCFace&, RateVector&) const = 0;
+    virtual void handleMicrBC(const BCState::BCFace&, RateVector&) const = 0;
 
-    virtual void handleOxygBC(const BCProp::BCFace&, RateVector&) const = 0;
+    virtual void handleOxygBC(const BCState::BCFace&, RateVector&) const = 0;
 
-    virtual void handleUreaBC(const BCProp::BCFace&, RateVector&) const = 0;
+    virtual void handleUreaBC(const BCState::BCFace&, RateVector&) const = 0;
 
     BCData<int> bcindex_;
     bool nonTrivialBoundaryConditions_ = false;
     bool first_step_ = true;
+    bool enable_state_rollback_ = false;
+
+    //! \brief Explicit quantities as they stood at the start of the current
+    //!        timestep, restored if that timestep fails.
+    //!
+    //! Only written by captureBeginTimeStepState_() and only read by
+    //! restoreBeginTimeStepState_(), both of which run inside a single
+    //! timestep, so this never has to survive a restart.
+    struct PrevTimestepState
+    {
+        bool first_step = true;                            //!< first step of the episode
+        std::vector<Scalar> max_polymer_adsorption;        //!< POLYMER
+        std::vector<Scalar> max_oil_saturation;            //!< VAPPARS / DRSDT saturation history
+        std::vector<Scalar> max_water_saturation;          //!< ROCKCOMP water-induced compaction
+        std::vector<Scalar> min_ref_pressure;              //!< ROCKCOMP irreversible compaction
+        std::vector<Scalar> rock_comp_trans_mult_val;      //!< ROCKCOMP transmissibility multiplier
+    };
+
+    PrevTimestepState prev_timestep_state_;
 
     /// Whether or not the current episode will end at the end of the
     /// current time step.

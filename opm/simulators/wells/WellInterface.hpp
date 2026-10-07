@@ -47,6 +47,7 @@ namespace Opm {
 #include <opm/simulators/wells/GasLiftGroupInfo.hpp>
 #include <opm/simulators/wells/GasLiftSingleWell.hpp>
 #include <opm/simulators/wells/GasLiftSingleWellGeneric.hpp>
+#include <opm/simulators/wells/ParallelWellInfo.hpp>
 #include <opm/simulators/wells/PerforationData.hpp>
 #include <opm/simulators/wells/WellInterfaceIndices.hpp>
 #include <opm/simulators/wells/WellProdIndexCalculator.hpp>
@@ -102,6 +103,9 @@ public:
     using SingleWellStateType = SingleWellState<Scalar, IndexTraits>;
     using GroupStateHelperType = GroupStateHelper<Scalar, IndexTraits>;
 
+    //! \brief Temperature and salt concentration of the first perforated cell.
+    using FSInfo = FirstPerfCellConditions<Scalar>;
+
     using RateConverterType =
     typename WellInterfaceFluidSystem<FluidSystem>::RateConverterType;
 
@@ -127,18 +131,22 @@ public:
     static constexpr bool has_bioeffects = getPropValue<TypeTag, Properties::EnableBioeffects>();
     static constexpr bool has_micp = Indices::enableMICP;
 
-    // For the conversion between the surface volume rate and reservoir voidage rate
-    using FluidState = BlackOilFluidState<Eval,
-                                          FluidSystem,
-                                          energyModuleType != EnergyModules::NoTemperature,
-                                          energyModuleType == EnergyModules::FullyImplicitThermal,
-                                          Indices::compositionSwitchIdx != std::numeric_limits<unsigned>::max(),
-                                          has_watVapor,
-                                          has_brine,
-                                          has_saltPrecip,
-                                          has_disgas_in_water,
-                                          has_solvent,
-                                          Indices::numPhases >;
+    template<class ValueType>
+    using BlackOilFluidStateType = BlackOilFluidState<ValueType,
+                                                      FluidSystem,
+                                                      energyModuleType != EnergyModules::NoTemperature,
+                                                      energyModuleType == EnergyModules::FullyImplicitThermal,
+                                                      Indices::compositionSwitchIdx != std::numeric_limits<unsigned>::max(),
+                                                      has_watVapor,
+                                                      has_brine,
+                                                      has_saltPrecip,
+                                                      has_disgas_in_water,
+                                                      has_solvent,
+                                                      Indices::numPhases>;
+
+    // fluid state for the reservoir fluid
+    using FluidState = BlackOilFluidStateType<Eval>;
+
     /// Constructor
     WellInterface(const Well& well,
                   const ParallelWellInfo<Scalar>& pw_info,
@@ -252,6 +260,16 @@ public:
                            const IndividualOrGroup iog,
                            const GroupStateHelperType& groupStateHelper,
                            WellStateType& well_state) /* const */;
+
+    /// Convert the well's WELDRAW maximum drawdown into a maximum
+    /// production rate for the target phase,
+    ///    Qmax = Dmax * sum_j (Tw_j * M_j),
+    /// and store it in the well state.  Should only be called during the
+    /// first NUPCOL iterations of a timestep; afterwards the stored value
+    /// is kept frozen (like the rate targets of wells under group control).
+    void updateWeldrawMaxRate(const Simulator& simulator,
+                              WellStateType& well_state,
+                              DeferredLogger& deferred_logger) const;
 
     bool updateWellControlAndStatusLocalIteration(const Simulator& simulator,
                                                   const GroupStateHelperType& groupStateHelper,
@@ -367,6 +385,18 @@ public:
     virtual void updateIPRImplicit(const Simulator& simulator,
                                    const GroupStateHelperType& groupStateHelper,
                                    WellStateType& well_state) = 0;
+
+    static constexpr int numResDofs = Indices::numEq;
+    static constexpr int numWellDofs = numResDofs + 1;  // NB will fail for for thermal for now
+    using BMatrix = Dune::BCRSMatrix<Dune::FieldMatrix<Scalar, numWellDofs, numResDofs>>;
+    using CMatrix = Dune::BCRSMatrix<Dune::FieldMatrix<Scalar, numResDofs, numWellDofs>>;
+    using DMatrix = Dune::BCRSMatrix<Dune::FieldMatrix<Scalar, numWellDofs, numWellDofs>>;
+    using WVector = Dune::BlockVector<Dune::FieldVector<Scalar, numWellDofs>>;
+
+    virtual void addBCDMatrix(std::vector<BMatrix>& b_matrices,
+        std::vector<CMatrix>& c_matrices,
+        std::vector<DMatrix>& d_matrices,
+        Opm::SparseTable<int>& wcells) const = 0;
 
 protected:
     // simulation parameters
@@ -500,6 +530,10 @@ protected:
     Scalar computeConnectionDFactor(const int perf,
                                     const IntensiveQuantities& intQuants,
                                     const SingleWellStateType& ws) const;
+
+    //! \brief Temperature and salt concentration of the first perforated cell,
+    //! broadcast so that all processes of a distributed well get the values.
+    FSInfo getFirstPerfCellConditions(const Simulator& simulator) const;
 };
 
 } // namespace Opm

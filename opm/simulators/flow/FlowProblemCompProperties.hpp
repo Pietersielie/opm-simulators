@@ -33,6 +33,7 @@
 #include <opm/models/utils/propertysystem.hh>
 
 #include <opm/simulators/flow/FlowBaseProblemProperties.hpp>
+#include <opm/simulators/flow/NonlinearSystemCompositional.hpp>
 #include <opm/material/thermal/EnergyModuleType.hpp>
 
 #include <tuple>
@@ -51,6 +52,10 @@ struct FlowBaseProblemComp {
 };
 
 }
+template<class TypeTag>
+struct NonlinearSystem<TypeTag, TTag::FlowBaseProblemComp>
+{ using type = NonlinearSystemCompositional<TypeTag>; };
+
 // Set the problem property
 template<class TypeTag>
 struct Problem<TypeTag, TTag::FlowBaseProblemComp>
@@ -89,6 +94,11 @@ public:
 // Enable diffusion
 template<class TypeTag>
 struct EnableDiffusion<TypeTag, TTag::FlowBaseProblemComp>
+{ static constexpr bool value = false; };
+
+// Convective mixing is a black-oil feature
+template<class TypeTag>
+struct EnableConvectiveMixing<TypeTag, TTag::FlowBaseProblemComp>
 { static constexpr bool value = false; };
 
 } // namespace Opm::Properties

@@ -26,6 +26,9 @@
 #include <flowexperimental/comp/wells/CompWellModel.hpp>
 #endif
 
+#include <set>
+#include <algorithm>
+
 #include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/input/eclipse/Schedule/Schedule.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellConnections.hpp>
@@ -42,6 +45,7 @@ CompWellModel<TypeTag>::CompWellModel(Simulator& simulator, const NewtonIteratio
     , comm_(simulator.gridView().comm())
     , comp_config_(ecl_state_.compositionalConfig())
     , comp_well_states_(comp_config_)
+    , last_valid_comp_well_states_(comp_config_)
 {
     local_num_cells_ = simulator.gridView().size(0);
 }
@@ -52,9 +56,35 @@ CompWellModel<TypeTag>::
 beginReportStep(unsigned report_step)
 {
     // TODO: not considering the parallel running yet
+    report_step_start_events_ = schedule_[report_step].wellgroup_events();
     wells_ecl_ = schedule_.getWells(report_step);
+
+    constexpr auto events_mask = ScheduleEvents::WELL_STATUS_CHANGE |
+                                 ScheduleEvents::REQUEST_OPEN_WELL |
+                                 ScheduleEvents::REQUEST_SHUT_WELL;
+    for (const auto& well_ecl : wells_ecl_) {
+        if (!well_ecl.hasConnections()) {
+            continue;
+        }
+
+        if (!report_step_start_events_.hasEvent(well_ecl.name(), events_mask)) {
+            continue;
+        }
+
+        if (well_ecl.getStatus() == WellStatus::OPEN) {
+            well_open_times_.insert_or_assign(well_ecl.name(), simulator_.time());
+            well_close_times_.erase(well_ecl.name());
+        }
+        else if (well_ecl.getStatus() == WellStatus::SHUT) {
+            well_close_times_.insert_or_assign(well_ecl.name(), simulator_.time());
+            well_open_times_.erase(well_ecl.name());
+        }
+    }
+
     initWellConnectionData();
     initWellState();
+    // Save the initial accepted state for this report step.
+    last_valid_comp_well_states_.copyDynamicStateFrom(comp_well_states_);
 }
 
 template <typename TypeTag>
@@ -64,6 +94,24 @@ beginTimeStep()
 {
     createWellContainer();
     initWellContainer();
+}
+
+template <typename TypeTag>
+void
+CompWellModel<TypeTag>::
+restoreLastValidState()
+{
+    comp_well_states_.copyDynamicStateFrom(last_valid_comp_well_states_);
+}
+
+template <typename TypeTag>
+void
+CompWellModel<TypeTag>::
+endTimeStep()
+{
+    // Persist the accepted well state so failed retries restart from the last
+    // successful timestep rather than from the beginning of the report step.
+    last_valid_comp_well_states_.copyDynamicStateFrom(comp_well_states_);
 }
 
 template <typename TypeTag>
@@ -79,10 +127,16 @@ void
 CompWellModel<TypeTag>::
 createWellContainer()
 {
-    // const auto& schedule = simulator_.vanguard().schedule();
-    const auto nw = wells_ecl_.size(); // not considering the parallel running yet
+    const auto nw = wells_ecl_.size();
     well_container_.clear();
     for (auto w = 0 * nw; w < nw; ++w) {
+        const auto& well_name = wells_ecl_[w].name();
+        if (!comp_well_states_.has(well_name)
+            || comp_well_states_[well_name].status == WellStatus::SHUT
+            || well_connection_data_[w].empty()) {
+            continue;
+        }
+
         well_container_.emplace_back(std::make_shared<CompWell<TypeTag>>(wells_ecl_[w], w, well_connection_data_[w]));
     }
 }
@@ -102,9 +156,21 @@ void
 CompWellModel<TypeTag>::
 initWellConnectionData()
 {
-    // TODO: we need to consider the parallel running
-    // we can refer to the BlackoilWellModelGeneric::initializeWellPerfData()
-    well_connection_data_.resize(wells_ecl_.size());
+    // Rebuild the local perforation data because schedule events can change
+    // connections between report steps.
+    well_connection_data_.assign(wells_ecl_.size(), {});
+    // Serial runs retain state for every schedule well. In parallel, retain
+    // state on ranks that own a connection's grid cell, even if the connection
+    // is SHUT and may open at a later report step.
+    locally_owned_wells_.assign(wells_ecl_.size(), comm_.size() == 1);
+    local_well_reference_cells_.assign(wells_ecl_.size(), -1);
+
+    // Use the partitioner's set of wells that are active during the schedule
+    // or may be opened by a schedule action.
+    std::set<std::string> everActiveWells;
+    for (const auto& well : schedule_.getActiveWellsAtEnd()) {
+        everActiveWells.insert(well.name());
+    }
 
     int well_index = 0;
     for (const auto& well : wells_ecl_) {
@@ -114,13 +180,23 @@ initWellConnectionData()
 
         well_connection_data.reserve(well_connections.size());
         for (const auto& connection : well_connections) {
-            const auto active_index =
+            const int active_index =
                     this->compressedIndexForInterior(connection.global_index());
 
             const auto connIsOpen =
                     connection.state() == Connection::State::OPEN;
 
-            if (connIsOpen && (active_index >= 0)) {
+            if (active_index >= 0) {
+                locally_owned_wells_[well_index] = true;
+                // Prefer the first local OPEN connection; fall back to the
+                // first local connection if all are SHUT.
+                if (local_well_reference_cells_[well_index] < 0
+                    || (connIsOpen && well_connection_data_[well_index].empty())) {
+                    local_well_reference_cells_[well_index] = active_index;
+                }
+            }
+
+            if (connIsOpen && active_index >= 0) {
                 auto& pd = well_connection_data_[well_index].emplace_back();
 
                 pd.cell_index = active_index;
@@ -129,6 +205,18 @@ initWellConnectionData()
                 pd.ecl_index = connection_index;
             }
             ++connection_index;
+        }
+
+        // Permanently SHUT wells may span ranks because the default
+        // partitioner excludes them from its constraints. They have no well
+        // equations to distribute.
+        const int ranksWithConnections =
+            comm_.sum(locally_owned_wells_[well_index] ? 1 : 0);
+        if ((ranksWithConnections > 1) && everActiveWells.count(well.name()) > 0) {
+            throw std::runtime_error {
+                "Distributed compositional wells are not supported: well '" +
+                well.name() + "' has connections on multiple MPI ranks"
+            };
         }
         ++well_index;
     }
@@ -157,7 +245,7 @@ initWellState()
     auto cell_mole_fractions = std::vector<std::vector<Scalar>>(this->local_num_cells_,
                                            std::vector<Scalar>(FluidSystem::numComponents, Scalar{0.}));
 
-    auto cell_temperature = std::vector<Scalar>(this->local_num_cells_, Scalar{0.});
+    auto cell_temperatures = std::vector<Scalar>(this->local_num_cells_, Scalar{0.});
 
     auto elemCtx = ElementContext { this->simulator_ };
     const auto& gridView = this->simulator_.vanguard().gridView();
@@ -171,25 +259,44 @@ initWellState()
         const auto& fs = elemCtx.intensiveQuantities(/*spaceIdx=*/0, /*timeIdx=*/0).fluidState();
 
         cell_pressure[ix] = fs.pressure(pressIx).value();
-        // TODO: we are not simulating dynamic temperature, so all the phases and cells have the same temperature for now
-        cell_temperature[ix] = fs.temperature(0).value();
+        cell_temperatures[ix] = fs.temperature(0).value();
         for (unsigned compIdx = 0; compIdx < FluidSystem::numComponents; ++compIdx) {
             cell_mole_fractions[ix][compIdx] = fs.moleFraction(compIdx).value();
         }
     }
+
     OPM_END_PARALLEL_TRY_CATCH("ComposotionalWellModel::initializeWellState() failed: ",
                            this->simulator_.vanguard().grid().comm());
 
-    /* TODO: no prev well state for now */
-    // \Note:: we are not supporting dynamic temperature, so the temperature is constant, so we just pass in a single value
+    // Use the reservoir temperature at the first local OPEN connection, or
+    // the first local connection if all are SHUT. Wells that may become active
+    // must have a single owner, so their reference cell is independent of the
+    // partition. Retain the first-cell fallback for serial wells without
+    // connections.
+    auto well_temperatures = std::vector<Scalar>(
+        wells_ecl_.size(), cell_temperatures.empty() ? Scalar{0.} : cell_temperatures.front());
+    for (std::size_t wellIdx = 0; wellIdx < wells_ecl_.size(); ++wellIdx) {
+        const int cellIdx = local_well_reference_cells_[wellIdx];
+        if (cellIdx >= 0) {
+            well_temperatures[wellIdx] = cell_temperatures[cellIdx];
+        }
+    }
+
+    // Start each report step from freshly initialized schedule state. Retry
+    // recovery still comes from last_valid_comp_well_states_ via
+    // restoreLastValidState()/endTimeStep(). Passing the last valid state as
+    // prev_well_state here would carry dynamic state across report steps, but
+    // that currently changes regression results, so we pass nullptr for now.
     this->comp_well_states_.init(this->wells_ecl_,
-                                 cell_pressure, cell_temperature[0], cell_mole_fractions, this->well_connection_data_,
-                                 this->summary_state_);
+                                 cell_pressure, well_temperatures, cell_mole_fractions, this->well_connection_data_,
+                                 this->summary_state_,
+                                 this->locally_owned_wells_,
+                                 /*prev_well_state=*/nullptr);
 }
 
 
 template <typename TypeTag>
-std::size_t
+int
 CompWellModel<TypeTag>::
 compressedIndexForInterior(std::size_t cartesian_cell_idx) const
 {
@@ -242,6 +349,9 @@ assemble(const double dt)
 {
     const int iterationIdx = simulator_.problem().iterationContext().iteration();
 
+    // Well calculations run only on the owner. Propagate failures to every
+    // rank before reservoir assembly so all ranks take the same recovery path.
+    OPM_BEGIN_PARALLEL_TRY_CATCH();
     if (iterationIdx == 0) {
         this->calculateExplicitQuantities();
     }
@@ -251,6 +361,7 @@ assemble(const double dt)
         // currently we use the converged assembly of well equations directly without a new assembling
         // well->assembleWellEq(simulator_, well_state, dt);
     }
+    OPM_END_PARALLEL_TRY_CATCH("CompositionalWellModel::assemble() failed: ", comm_);
 }
 
 template <typename TypeTag>
@@ -296,13 +407,45 @@ recoverWellSolutionAndUpdateWellState(const BVector& x)
 template <typename TypeTag>
 bool
 CompWellModel<TypeTag>::
+forceShutWellByName(const std::string& well_name,
+                    double simulation_time,
+                    bool)
+{
+    int well_was_shut = 0;
+
+    if (comp_well_states_.has(well_name)) {
+        auto& well_state = comp_well_states_[well_name];
+        if (well_state.status != WellStatus::SHUT) {
+            well_state.status = WellStatus::SHUT;
+            well_close_times_.insert_or_assign(well_name, simulation_time);
+            well_open_times_.erase(well_name);
+
+            if (last_valid_comp_well_states_.has(well_name)) {
+                last_valid_comp_well_states_[well_name].status = WellStatus::SHUT;
+            }
+
+            std::erase_if(well_container_,
+                          [&well_name](const auto& well)
+                          { return well->name() == well_name; });
+
+            well_was_shut = 1;
+        }
+    }
+
+    well_was_shut = comm_.max(well_was_shut);
+    return well_was_shut == 1;
+}
+
+template <typename TypeTag>
+bool
+CompWellModel<TypeTag>::
 getWellConvergence() const
 {
-    bool converged = true;
+    int converged = 1;
     for (const auto& well : this->well_container_) {
         converged = converged && well->getConvergence();
     }
-    return converged;
+    return comm_.min(converged) == 1;
 }
 
 template <typename TypeTag>

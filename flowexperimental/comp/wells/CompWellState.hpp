@@ -47,17 +47,27 @@ public:
 
     void init(const std::vector<Well>& wells_ecl,
               const std::vector<Scalar>& cell_pressures,
-              const Scalar cell_temperature,
+              const std::vector<Scalar>& well_temperatures,
               const std::vector<std::vector<Scalar>>& cell_mole_fractions,
               const std::vector<std::vector<CompConnectionData> >& well_connection_data,
               const SummaryState& sumary_state,
+              const std::vector<bool>& locally_owned_wells,
               const CompWellState* prev_well_state = nullptr);
 
     const SingleWellState& operator[](const std::string& well_name) const;
 
     SingleWellState& operator[](const std::string& well_name);
 
+    bool has(const std::string& well_name) const
+    { return wells_.has(well_name); }
+
     data::Wells report() const;
+
+    // Copy dynamic well variables function for now copy all
+    void copyDynamicStateFrom(const CompWellState& other)
+    {
+      wells_ = other.wells_;
+    }
 
 private:
     WellContainer<SingleWellState> wells_;
@@ -66,14 +76,15 @@ private:
 
     void base_init(const std::vector<Well>& wells_ecl,
                    const std::vector<Scalar>& cell_pressures,
-                   const Scalar temperature,
+                   const std::vector<Scalar>& well_temperatures,
                    const std::vector<std::vector<Scalar>>& cell_mole_fractions,
                    const std::vector<std::vector<CompConnectionData> >& well_connection_data,
-                   const SummaryState& summary_state);
+                   const SummaryState& summary_state,
+                   const std::vector<bool>& locally_owned_wells);
 
     void initSingleWell(const Well& well,
                         const std::vector<Scalar>& cell_pressures,
-                        const Scalar tempearture,
+                        const Scalar temperature,
                         const std::vector<std::vector<Scalar>>& cell_mole_fractions,
                         const std::vector<CompConnectionData >& conn_data,
                         const SummaryState& summary_state);

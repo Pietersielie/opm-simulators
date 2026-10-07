@@ -41,6 +41,7 @@
 #include <opm/simulators/wells/ParallelWellInfo.hpp>
 #include <opm/simulators/wells/PerforationData.hpp>
 #include <opm/simulators/wells/WellFilterCake.hpp>
+#include <opm/simulators/wells/WellPerformanceEventTracker.hpp>
 #include <opm/simulators/wells/GroupStateHelper.hpp>
 #include <opm/simulators/wells/WellProdIndexCalculator.hpp>
 #include <opm/simulators/wells/WellTracerRate.hpp>
@@ -68,6 +69,7 @@ namespace Opm {
     template<class Scalar> class GasLiftWellState;
     class Group;
     class GuideRateConfig;
+    class RegionVariableCollection;
     class RestartValue;
     class Schedule;
     struct SimulatorUpdate;
@@ -215,6 +217,43 @@ public:
 
     data::GroupAndNetworkValues groupAndNetworkData(const int reportStepIdx) const;
 
+    // Snapshot dynamic state at start of timestep for failure recovery.
+    //! \brief Snapshot the mutable well-model state at the start of a timestep.
+    //!
+    //! Everything a timestep can modify and that the next attempt must not
+    //! inherit goes in here; see PrevTimestepState for what each member is for.
+    //! Guide rates are deliberately absent: they are updated between timesteps,
+    //! not during the Newton iterations, so a failed step leaves them untouched
+    //! (GuideRate is also non-copyable).
+    void advanceTimeLevel()
+    {
+        if (enable_state_rollback_) {
+            this->prev_timestep_state_.wgstate = this->active_wgstate_;
+            this->prev_timestep_state_.nupcol_wgstate = this->nupcol_wgstate_;
+            this->prev_timestep_state_.closed_this_step = this->closed_this_step_;
+            this->prev_timestep_state_.well_open_times = this->well_open_times_;
+            this->prev_timestep_state_.well_close_times = this->well_close_times_;
+            this->genNetwork_.commitState();
+        }
+    }
+
+    //! \brief Restore the state captured at the start of the failing timestep.
+    void updateFailed()
+    {
+        if (enable_state_rollback_) {
+            this->active_wgstate_ = this->prev_timestep_state_.wgstate;
+            this->nupcol_wgstate_ = this->prev_timestep_state_.nupcol_wgstate;
+            this->closed_this_step_ = this->prev_timestep_state_.closed_this_step;
+            this->well_open_times_ = this->prev_timestep_state_.well_open_times;
+            this->well_close_times_ = this->prev_timestep_state_.well_close_times;
+            this->genNetwork_.resetState();
+            this->group_state_helper_.updateState(this->wellState(), this->groupState());
+        }
+    }
+
+    void reportIntervalConnectionOilProduction(const double              dt,
+                                               const std::size_t         conn_opt_ix,
+                                               RegionVariableCollection& regVars) const;
     /// Shut down any single well
     /// Returns true if the well was actually found and shut.
     bool forceShutWellByName(const std::string& wellname,
@@ -255,11 +294,13 @@ public:
         serializer(initial_step_);
         serializer(report_step_starts_);
         serializer(last_run_wellpi_);
+        serializer(well_perf_data_);
         serializer(local_shut_wells_);
         serializer(closed_this_step_);
         serializer(guideRate_);
         serializer(genNetwork_);
         serializer(prev_inj_multipliers_);
+        serializer(filter_cake_);
         serializer(active_wgstate_);
         serializer(last_valid_wgstate_);
         serializer(nupcol_wgstate_);
@@ -267,6 +308,7 @@ public:
         serializer(switched_inj_groups_);
         serializer(closed_offending_wells_);
         serializer(gen_gaslift_);
+        serializer(well_performance_event_tracker_);
     }
 
     bool operator==(const BlackoilWellModelGeneric& rhs) const;
@@ -396,6 +438,36 @@ protected:
     std::vector<std::reference_wrapper<ParallelWellInfo<Scalar>>>
     createLocalParallelWellInfo(const std::vector<Well>& wells);
 
+    /// \brief Look up a well's parallel well information
+    /// \param wname Well name
+    /// \return Pointer to the well's information, or nullptr if the well is
+    ///         not known to the parallel well bookkeeping.
+    const ParallelWellInfo<Scalar>* findParallelWellInfo(const std::string& wname) const;
+
+    /// \brief Look up a well's parallel well information for modification
+    ///
+    /// A non-const handle is genuinely needed: initializeWellPerfData() calls
+    /// beginReset(), pushBackEclIndex() and endReset() on the entries that
+    /// createLocalParallelWellInfo() hands it.
+    /// \param wname Well name
+    /// \return Pointer to the well's information, or nullptr if the well is
+    ///         not known to the parallel well bookkeeping.
+    ParallelWellInfo<Scalar>* findParallelWellInfo(const std::string& wname);
+
+    /// \brief Add parallel well information for wells that entered the model
+    ///        after start-up
+    ///
+    /// The parallel well bookkeeping is built once, from the wells known at
+    /// the end of the schedule.  Wells introduced by WELSPECS inside an
+    /// ACTIONX block are not among those, so they need an entry of their own
+    /// before they can be used.
+    ///
+    /// Collective.  The schedule is replicated on all ranks, so every rank
+    /// visits the same new wells in the same order, which is what the
+    /// communicator split in ParallelWellInfo's constructor requires.
+    ///
+    /// \param reportStepIdx Report step whose well set to register
+    void registerNewParallelWells(int reportStepIdx);
     void initializeWellProdIndCalculators();
     void initializeWellPerfData();
 
@@ -413,6 +485,20 @@ protected:
     /// \param[in,out] wsrpt Well solution object.  On exit, holds current
     /// values for \code data::Well::dynamicStatus \endcode.
     void assignDynamicWellStatus(data::Wells& wsrpt) const;
+
+    /// Assign well performance evaluation indicators (WPWE0 .. WPWE7) for
+    /// each well owned by the current rank.
+    ///
+    /// \param[in,out] wsrpt Well solution object.  On exit, holds current
+    /// values for \code data::Well::performanceEvents \endcode.
+    void assignWellPerformanceEventTracker(data::Wells& wsrpt) const;
+
+    /// Dynamic status of the wells owned by the current rank, covering every
+    /// connection of each well, including those in cells on other ranks.
+    ///
+    /// The deck status of each well and connection amended by the runtime
+    /// decisions in WellState and WellTestState.
+    WellStatusSnapshot wellStatusSnapshot() const;
 
     /// Assign basic result quantities for shut connections of wells owned
     /// by current rank.
@@ -527,6 +613,7 @@ protected:
     bool wells_active_{false};
     bool initial_step_{};
     bool report_step_starts_{};
+    bool deserialized_state_pending_{false};
 
     std::optional<int> last_run_wellpi_{};
 
@@ -547,7 +634,10 @@ protected:
 
     std::vector<int> local_shut_wells_{};
 
-    std::vector<ParallelWellInfo<Scalar>> parallel_well_info_;
+    // Sorted on well name.  Held by pointer so that entries added for wells
+    // that appear mid-run (ACTIONX) do not invalidate references handed out
+    // earlier, e.g. those held by the well container and the well state.
+    std::vector<std::unique_ptr<ParallelWellInfo<Scalar>>> parallel_well_info_;
     std::vector<std::reference_wrapper<ParallelWellInfo<Scalar>>> local_parallel_well_info_;
 
     std::vector<WellProdIndexCalculator<Scalar>> prod_index_calc_;
@@ -555,6 +645,8 @@ protected:
     std::vector<int> pvt_region_idx_;
 
     mutable std::unordered_set<std::string> closed_this_step_;
+
+    WellPerformanceEventTracker well_performance_event_tracker_;
 
     GuideRate guideRate_;
     std::unique_ptr<VFPProperties<Scalar, IndexTraits>> vfp_properties_{};
@@ -574,6 +666,26 @@ protected:
     WGState<Scalar, IndexTraits> active_wgstate_;
     WGState<Scalar, IndexTraits> last_valid_wgstate_;
     WGState<Scalar, IndexTraits> nupcol_wgstate_;
+
+    //! \brief Well-model state as it was at the start of the current timestep.
+    //!
+    //! Retaken by advanceTimeLevel() at the start of every timestep and only
+    //! read by updateFailed(), so it never has to survive a restart and is not
+    //! serialized.
+    struct PrevTimestepState
+    {
+        explicit PrevTimestepState(const PhaseUsageInfo<IndexTraits>& pu)
+            : wgstate(pu), nupcol_wgstate(pu)
+        {}
+
+        WGState<Scalar, IndexTraits> wgstate;        //!< well and group rates, pressures, controls
+        WGState<Scalar, IndexTraits> nupcol_wgstate; //!< NUPCOL: the state group control targets are computed from
+        std::unordered_set<std::string> closed_this_step; //!< wells shut by the solver during this step
+        std::map<std::string, double> well_open_times;    //!< WCYCLE
+        std::map<std::string, double> well_close_times;   //!< WCYCLE
+    };
+
+    PrevTimestepState prev_timestep_state_;
     GroupStateHelperType group_state_helper_;
     WellGroupEvents report_step_start_events_; //!< Well group events at start of report step
 
@@ -586,8 +698,11 @@ protected:
     std::map<std::string, std::pair<std::string, std::string>> closed_offending_wells_;
 
     BlackoilWellModelNetworkGeneric<Scalar,IndexTraits>& genNetwork_;
+    bool enable_state_rollback_{false};
 
-    bool allConnectionsClosed(const Well& well_ecl) const;
+    /// Effective status applied during time-step setup to a well closed in
+    /// WellTestState.
+    WellStatus closedWellStatus(const Well& well_ecl) const;
 
 private:
     WellInterfaceGeneric<Scalar, IndexTraits>* getGenWell(const std::string& well_name);
@@ -618,13 +733,9 @@ private:
     template <typename Predicate>
     bool parallelWellSatisfies(const std::string& wname, Predicate&& p) const
     {
-        const auto pwInfoPos =
-            std::ranges::find_if(this->parallel_well_info_,
-                                 [&wname](const auto& pwInfo)
-                                 { return pwInfo.name() == wname; });
+        const auto* pwInfo = this->findParallelWellInfo(wname);
 
-        return (pwInfoPos != this->parallel_well_info_.end())
-            && p(*pwInfoPos);
+        return (pwInfo != nullptr) && p(*pwInfo);
     }
 
     /// Run caller-defined code for each well owned by current rank

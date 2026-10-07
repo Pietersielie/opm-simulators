@@ -21,16 +21,23 @@
 */
 /*!
  * \file
- * \copydoc Opm::OutputBlackOilModule
+ * \brief Common output functionality shared by simulator formulations.
  */
-#ifndef OPM_GENERIC_OUTPUT_BLACK_OIL_MODULE_HPP
-#define OPM_GENERIC_OUTPUT_BLACK_OIL_MODULE_HPP
+#ifndef OPM_GENERIC_OUTPUT_MODULE_HPP
+#define OPM_GENERIC_OUTPUT_MODULE_HPP
 
+#include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/FaceDir.hpp>
 #include <opm/input/eclipse/EclipseState/SummaryConfig/SummaryConfig.hpp>
+#include <opm/input/eclipse/Units/UnitSystem.hpp>
 
+#include <opm/material/common/MathToolbox.hpp>
+
+#include <opm/output/data/RegionVariableMapping.hpp>
 #include <opm/output/data/Wells.hpp>
+
 #include <opm/output/eclipse/Inplace.hpp>
+#include <opm/output/eclipse/RegionVariableCollection.hpp>
 
 #include <opm/simulators/flow/BioeffectsContainer.hpp>
 #include <opm/simulators/flow/CO2H2Container.hpp>
@@ -44,15 +51,20 @@
 #include <opm/simulators/flow/RFTContainer.hpp>
 #include <opm/simulators/flow/RSTConv.hpp>
 #include <opm/simulators/flow/GeochemistryContainer.hpp>
+#include <opm/simulators/flow/TpsaContainer.hpp>
 #include <opm/simulators/flow/TracerContainer.hpp>
 
 #include <opm/simulators/utils/ParallelCommunication.hpp>
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
+#include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -68,6 +80,7 @@ namespace Opm {
 
 namespace data { class Solution; }
 class EclHysteresisConfig;
+class EclipseGrid;
 class EclipseState;
 class Schedule;
 class SummaryConfig;
@@ -75,12 +88,12 @@ class SummaryConfigNode;
 class SummaryState;
 
 template<class FluidSystem>
-class GenericOutputBlackoilModule {
+class GenericOutputModule {
 public:
     using Scalar = typename FluidSystem::Scalar;
 
     // Virtual destructor for safer inheritance.
-    virtual ~GenericOutputBlackoilModule();
+    virtual ~GenericOutputModule();
 
     /*!
      * \brief Register all run-time parameters for the Vtk output module.
@@ -159,9 +172,9 @@ public:
     /*!
      * \brief Move all buffers to data::Solution.
      */
-    void assignToSolution(data::Solution& sol);
+    virtual void assignToSolution(data::Solution& sol);
 
-    void setRestart(const data::Solution& sol,
+    virtual void setRestart(const data::Solution& sol,
                     unsigned elemIdx,
                     unsigned globalDofIndex);
 
@@ -248,6 +261,16 @@ public:
         return extraBlockData_;
     }
 
+    // Per-LGR-cell block-summary results.  Cell identity is the
+    // (keyword, grid level, level-local linearised Cartesian cell index)
+    // tuple — the same identity data::Connection carries as
+    // (lgr_grid, index) for LC* connection vectors.  Empty for runs
+    // without LB* summary requests.
+    const std::map<std::tuple<std::string, int, int>, double>& getLgrBlockData() const
+    {
+        return lgrBlockData_;
+    }
+
     const Inplace* initialInplace() const
     {
         return this->initialInplace_.has_value()
@@ -263,7 +286,10 @@ public:
         local_data_valid_ = false;
     }
 
-    void validateLocalData(){
+    /// Finalize per-cell output and mark it valid. Call this method on every
+    /// rank because overrides may perform collectives.
+    virtual void validateLocalData()
+    {
         local_data_valid_ = true;
     }
 
@@ -278,6 +304,16 @@ public:
 
     const RSTConv& getConv() const
     { return this->rst_conv_; }
+
+    const data::RegionVariableMapping& regVarMapping() const
+    {
+        return this->regVarMap_;
+    }
+
+    RegionVariableCollection& regionVariables()
+    {
+        return this->regionVars_;
+    }
 
     //! \brief Assign fields that are in global numbering to the solution.
     //! \detail This is used to add fields that for some reason cannot be collected
@@ -298,34 +334,149 @@ protected:
     enum { waterCompIdx = FluidSystem::waterCompIdx };
     using Dir = FaceDir::DirEnum;
 
-    GenericOutputBlackoilModule(const EclipseState& eclState,
-                                const Schedule& schedule,
-                                const SummaryConfig& summaryConfig,
-                                const SummaryState& summaryState,
-                                const std::string& moduleVersionName,
-                                RSTConv::LocalToGlobalCellFunc globalCell,
-                                std::function<bool(const unsigned)> isInterior,
-                                const Parallel::Communication& comm,
-                                bool enableEnergy,
-                                bool constantTemperature,
-                                bool enableMech,
-                                bool enableSolvent,
-                                bool enablePolymer,
-                                bool enableFoam,
-                                bool enableBrine,
-                                bool enableSaltPrecipitation,
-                                bool enableExtbo,
-                                bool enableBioeffects,
-                                bool enableGeochemistry);
+    /// Fraction of pore volume occupied by hydrocarbons.
+    template <class FluidState>
+    Scalar hydroCarbonFraction(const FluidState& fs) const
+    {
+        if (this->eclState_.runspec().co2Storage()) {
+            // CO2 storage uses the full pore volume.
+            return 1.0;
+        }
+
+        // Sum the saturations of the active hydrocarbon phases.
+        auto hydrocarbon = Scalar {0};
+        if (FluidSystem::phaseIsActive(oilPhaseIdx)) {
+            hydrocarbon += getValue(fs.saturation(oilPhaseIdx));
+        }
+
+        if (FluidSystem::phaseIsActive(gasPhaseIdx)) {
+            hydrocarbon += getValue(fs.saturation(gasPhaseIdx));
+        }
+
+        return hydrocarbon;
+    }
+
+    /// Accumulate pore volumes and pressure-volume products used by pressure
+    /// and pore-volume summary vectors.
+    template <class IntensiveQuantities>
+    void updateTotalVolumesAndPressures_(const unsigned             globalDofIdx,
+                                         const IntensiveQuantities& intQuants,
+                                         const double               totVolume,
+                                         const Scalar               referencePorosity)
+    {
+        const auto& fs = intQuants.fluidState();
+
+        const double pv = totVolume * getValue(intQuants.porosity());
+        const auto hydrocarbon = this->hydroCarbonFraction(fs);
+
+        this->fipC_.assignPoreVolume(globalDofIdx,
+                                    totVolume * referencePorosity,
+                                    pv);
+        if (! this->hydrocarbonPoreVolume_.empty()) {
+            this->hydrocarbonPoreVolume_[globalDofIdx] = pv * hydrocarbon;
+        }
+
+        if (!this->pressureTimesHydrocarbonVolume_.empty() &&
+            !this->pressureTimesPoreVolume_.empty())
+        {
+            assert(this->hydrocarbonPoreVolume_.size() == this->pressureTimesHydrocarbonVolume_.size());
+            assert(this->fipC_.get(Inplace::Phase::PoreVolume).size() == this->pressureTimesPoreVolume_.size());
+
+            if (FluidSystem::phaseIsActive(oilPhaseIdx)) {
+                this->pressureTimesPoreVolume_[globalDofIdx] =
+                    getValue(fs.pressure(oilPhaseIdx)) * pv;
+
+                this->pressureTimesHydrocarbonVolume_[globalDofIdx] =
+                    this->pressureTimesPoreVolume_[globalDofIdx] * hydrocarbon;
+            }
+            else if (FluidSystem::phaseIsActive(gasPhaseIdx)) {
+                this->pressureTimesPoreVolume_[globalDofIdx] =
+                    getValue(fs.pressure(gasPhaseIdx)) * pv;
+
+                this->pressureTimesHydrocarbonVolume_[globalDofIdx] =
+                    this->pressureTimesPoreVolume_[globalDofIdx] * hydrocarbon;
+            }
+            else if (FluidSystem::phaseIsActive(waterPhaseIdx)) {
+                this->pressureTimesPoreVolume_[globalDofIdx] =
+                    getValue(fs.pressure(waterPhaseIdx)) * pv;
+            }
+        }
+    }
+
+    /// Names under which the phase densities and viscosities are reported.
+    /// The black-oil and compositional formulations use different names for
+    /// these quantities, so the derived module supplies them.
+    struct PhasePropertyNames
+    {
+        std::string_view oilDensity{};
+        std::string_view gasDensity{};
+        std::string_view waterDensity{};
+        std::string_view oilViscosity{};
+        std::string_view gasViscosity{};
+        std::string_view waterViscosity{};
+    };
+
+    /// Move the phase density and viscosity buffers to \p sol under \p names.
+    void assignPhaseProperties(data::Solution& sol,
+                               const PhasePropertyNames& names);
+
+    /// Resize \p buffer when the restart keyword \p kw is requested, and mark
+    /// the request as handled.
+    static bool allocBufferIfRequested(std::map<std::string, int>& rstKeywords,
+                                       unsigned bufferSize,
+                                       std::vector<Scalar>& buffer,
+                                       std::string_view kw,
+                                       bool supported,
+                                       bool required = false);
+
+    /// Move a single buffer to \p sol.  An unallocated buffer has nothing to
+    /// report.
+    void assignBuffer(data::Solution& sol,
+                      std::string_view name,
+                      UnitSystem::measure measure,
+                      std::vector<Scalar>& buffer);
+
+    /// A negative \p index marks an inactive phase and reports nothing.
+    void assignBuffer(data::Solution& sol,
+                      std::string_view name,
+                      UnitSystem::measure measure,
+                      std::vector<Scalar>& buffer,
+                      int index);
+
+    GenericOutputModule(const EclipseState& eclState,
+                        const Schedule& schedule,
+                        const SummaryConfig& summaryConfig,
+                        const SummaryState& summaryState,
+                        const std::string& moduleVersionName,
+                        RSTConv::LocalToGlobalCellFunc globalCell,
+                        std::function<bool(const unsigned)> isInterior,
+                        const Parallel::Communication& comm,
+                        bool enableEnergy,
+                        bool constantTemperature,
+                        bool enableMech,
+                        bool enableSolvent,
+                        bool enablePolymer,
+                        bool enableFoam,
+                        bool enableBrine,
+                        bool enableSaltPrecipitation,
+                        bool enableExtbo,
+                        bool enableBioeffects,
+                        bool enableGeochemistry);
 
     void doAllocBuffers(unsigned bufferSize,
                         unsigned reportStepNum,
                         const bool substep,
                         const bool log,
-                        const bool isRestart,
+                        const bool forceRestartFieldAllocation,
                         const EclHysteresisConfig* hysteresisConfig,
                         unsigned numOutputNnc = 0,
                         std::map<std::string, int> rstKeywords = {});
+
+    /// Allocate the buffers a derived module owns.  Called while the restart
+    /// keywords are being handled, so that a keyword consumed here is marked
+    /// as handled before the unhandled-keyword check.
+    virtual void allocFormulationBuffers(std::map<std::string, int>& rstKeywords,
+                                         unsigned bufferSize) = 0;
 
     void makeRegionSum(Inplace& inplace,
                        const std::string& region_name,
@@ -360,6 +511,23 @@ protected:
     void setupExtraBlockData(const std::size_t        reportStepNum,
                              std::function<bool(int)> isCartIdxOnThisRank);
 
+    // Allocate lgrBlockData_ slots for every Block-category summary node
+    // that names an LGR cell.  The level component of the key is resolved
+    // through EclipseGrid::get_lgr_cell_index (the same call data::Connection
+    // uses for lgr_grid on LC* connection vectors); the level-local
+    // linearised Cartesian index is recovered from node.number - 1.
+    //
+    // No rank check here — ownership for LGR leaf cells is decided in the
+    // walk via Dune::InteriorEntity on the leaf entity; the existing
+    // isCartIdxOnThisRank predicate operates in the global Cartesian space,
+    // which LGR cells do not inhabit.
+    //
+    // Caller-supplied via parameter rather than read from a member to keep
+    // this module decoupled from EclipseState ownership (matching how the
+    // existing block path receives its rank predicate as an argument).
+    void setupLgrBlockData(const std::map<std::string, int>& lgrNameToLevel,
+                           const std::function<bool(int, int)>& isLgrCellOnThisRank);
+
     virtual bool isDefunctParallelWell(const std::string& wname) const = 0;
     virtual bool isOwnedByCurrentRank(const std::string& wname) const = 0;
     virtual bool isOnCurrentRank(const std::string& wname) const = 0;
@@ -385,10 +553,19 @@ protected:
     bool enableExtbo_{false};
     bool enableBioeffects_{false};
     bool enableGeochemistry_{false};
-    
+
     bool forceDisableFipOutput_{false};
     bool forceDisableFipresvOutput_{false};
     bool computeFip_{false};
+
+    /// Current values of input data for region-level summary vectors.
+    ///
+    /// Acceleration structure for region-level summary vector calculations,
+    /// aimed at minimising MPI overhead for calculating these vectors.
+    /// Contents depend on runtime configuration in summaryConfig_.
+    ///
+    /// Populated by initialiseRegionVariableSupport().
+    RegionVariableCollection regionVars_;
 
     FIPContainer<FluidSystem> fipC_;
     std::unordered_map<std::string, std::vector<int>> regions_;
@@ -397,6 +574,11 @@ protected:
     std::vector<SummaryConfigNode> RPRNodes_;
     std::vector<SummaryConfigNode> RPRPNodes_;
 
+    /// Map region variable names and region set names to numeric indices.
+    ///
+    /// Populated by initialiseRegionVariableSupport().
+    data::RegionVariableMapping regVarMap_{};
+
     std::vector<int> failedCellsPb_;
     std::vector<int> failedCellsPd_;
 
@@ -404,13 +586,10 @@ protected:
     ScalarBuffer hydrocarbonPoreVolume_;
     ScalarBuffer pressureTimesPoreVolume_;
     ScalarBuffer pressureTimesHydrocarbonVolume_;
-    ScalarBuffer dynamicPoreVolume_;
     ScalarBuffer rPorV_;
     ScalarBuffer fluidPressure_;
     ScalarBuffer temperature_;
-    ScalarBuffer rs_;
     ScalarBuffer rsw_;
-    ScalarBuffer rv_;
     ScalarBuffer rvw_;
     ScalarBuffer overburdenPressure_;
     ScalarBuffer oilSaturationPressure_;
@@ -434,8 +613,6 @@ protected:
     ScalarBuffer oilVaporizationFactor_;
     ScalarBuffer gasDissolutionFactorInWater_;
     ScalarBuffer waterVaporizationFactor_;
-    ScalarBuffer bubblePointPressure_;
-    ScalarBuffer dewPointPressure_;
     ScalarBuffer rockCompPorvMultiplier_;
     ScalarBuffer minimumOilPressure_;
     ScalarBuffer saturatedOilFormationVolumeFactor_;
@@ -448,12 +625,11 @@ protected:
 
     // buffers for mechanical output
     MechContainer<Scalar> mech_;
+    TpsaContainer<Scalar> tpsaC_;
 
     std::array<ScalarBuffer, numPhases> saturation_;
-    std::array<ScalarBuffer, numPhases> invB_;
     std::array<ScalarBuffer, numPhases> density_;
     std::array<ScalarBuffer, numPhases> viscosity_;
-    std::array<ScalarBuffer, numPhases> relativePermeability_;
 
     GeochemistryContainer<Scalar> geochemC_;
 
@@ -471,12 +647,25 @@ protected:
     // Example is the block pressures for RPTSCHED WELLS=2
     std::map<std::pair<std::string, int>, double> extraBlockData_;
 
+    // Per-LGR-cell block-summary results.  Keyed by (keyword, grid level,
+    // level-local linearised Cartesian cell index).  The map type matches
+    // Summary::DynamicSimulatorState::LgrBlockValues so the writer can hand
+    // a pointer to this member directly to the summary engine.  Empty for
+    // runs that request no LB* summary vectors (zero non-LGR cost).
+    std::map<std::tuple<std::string, int, int>, double> lgrBlockData_;
+
     std::optional<Inplace> initialInplace_;
     bool local_data_valid_{false};
 
     std::optional<RegionPhasePoreVolAverage> regionAvgDensity_;
+
+private:
+    /// Initialise acceleration structures for region-level summary vector calculations.
+    ///
+    /// Populates regionVars_ and regVarMap_.
+    void initialiseRegionVariableSupport();
 };
 
 } // namespace Opm
 
-#endif // OPM_GENERIC_OUTPUT_BLACK_OIL_MODULE_HPP
+#endif // OPM_GENERIC_OUTPUT_MODULE_HPP

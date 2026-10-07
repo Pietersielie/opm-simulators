@@ -20,9 +20,12 @@
 #ifndef OPM_SINGLE_COMP_WELL_STATE_HPP
 #define OPM_SINGLE_COMP_WELL_STATE_HPP
 
+#include <opm/common/ErrorMacros.hpp>
+
 #include <opm/input/eclipse/Schedule/Well/WellEnums.hpp>
 #include <opm/simulators/wells/PerforationData.hpp>
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -93,6 +96,8 @@ public:
                                  const SummaryState& st);
 
     void update_injector_targets(const Well& well, const SummaryState& st);
+
+    void copyRuntimeStateFrom(const SingleCompWellState& other);
 
     Scalar get_total_surface_rate() const;
 };

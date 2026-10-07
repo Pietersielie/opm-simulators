@@ -7,6 +7,116 @@ set(coarse_rel_tol_parallel 1e-2)
 
 add_test_compare_parallel_simulation(
   CASENAME
+    equil_1d_compvd_water_gascap
+  FILENAME
+    EQUIL_1D_COMPVD_WATER_GASCAP
+  SIMULATOR
+    flow_comp
+  # Exercise COMPVD phase flags and water-only output across gas, oil and water
+  # zones. Use tight tolerances for serial/MPI agreement while allowing small
+  # differences from partitioning.
+  ABS_TOL
+    1e-6
+  REL_TOL
+    1e-6
+  DIR
+    compositional/equilibration
+  MPI_PROCS
+    2
+)
+
+add_test_compare_parallel_simulation(
+  CASENAME
+    sshift_compositional
+  FILENAME
+    SIMPLE_COMP_SSHIFT
+  SIMULATOR
+    flow_comp
+  DEV_SIMULATOR
+    flow_comp3_2p
+  # Check explicit ZMF distribution and wells owned by different ranks.
+  # Use the compositional tolerances for summary and restart comparisons.
+  ABS_TOL
+    1e-3
+  REL_TOL
+    1e-5
+  DIR
+    compositional
+  MPI_PROCS
+    2
+)
+
+add_test_compare_parallel_simulation(
+  CASENAME
+    oil_into_water_zone_compositional
+  FILENAME
+    OIL_INTO_WATER_ZONE
+  SIMULATOR
+    flow_comp
+  # Hydrocarbon flowing into cells that hold water alone, with the column cut into
+  # four parts so that the linear solve is inexact. With the TUNING minimum time step,
+  # a stalled Newton iteration aborts the run.
+  ABS_TOL
+    1e-3
+  REL_TOL
+    1e-4
+  DIR
+    compositional
+  MPI_PROCS
+    4
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compare_parallel_simulation(
+  CASENAME
+    thpres_default_compositional
+  FILENAME
+    THPRES_DEFAULT
+  SIMULATOR
+    flow_comp
+  # The two equilibration regions end up on different ranks, so the defaulted
+  # threshold pressure is reduced over the ranks and applied at a face between
+  # them. Nothing crosses the boundary, so the runs agree exactly.
+  ABS_TOL
+    1e-6
+  REL_TOL
+    1e-6
+  DIR
+    compositional/thpres
+  MPI_PROCS
+    2
+)
+
+if(MPIEXEC_MAX_NUMPROCS GREATER_EQUAL 2)
+  if(USE_DEV_SIMULATOR_IN_TESTS)
+    set(_split_well_simulator flow_comp3_2p)
+  else()
+    set(_split_well_simulator flow_comp)
+  endif()
+
+  add_test(
+    NAME
+      runSimulator/flow_comp_split_well_rejected
+    COMMAND
+      ${PROJECT_SOURCE_DIR}/tests/run-parallel-compositional-split-well.sh
+      ${MPIEXEC_EXECUTABLE}
+      ${MPIEXEC_NUMPROC_FLAG}
+      $<TARGET_FILE:${_split_well_simulator}>
+      ${OPM_TESTS_ROOT}/compositional/SIMPLE_COMP_SSHIFT.DATA
+      ${BASE_RESULT_PATH}/parallel/flow_comp+split_well_rejected
+  )
+  set_tests_properties(
+    runSimulator/flow_comp_split_well_rejected
+    PROPERTIES
+      PROCESSORS 2
+      TIMEOUT 30
+  )
+  unset(_split_well_simulator)
+endif()
+
+add_test_compare_parallel_simulation(
+  CASENAME
     spe1
   FILENAME
     SPE1CASE2
@@ -64,6 +174,29 @@ add_test_compare_parallel_simulation(
     --tolerance-mb=1e-8
 )
 
+# WECON 'CON' on a well whose lumped completion is split across two ranks.
+add_test_compare_parallel_simulation(
+  CASENAME
+    wecon_con_complump_distributed
+  FILENAME
+    WECON_CON_COMPLUMP_DISTRIBUTED
+  DIR
+    wecon_wtest
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol_parallel}
+  REL_TOL
+    ${rel_tol_parallel}
+  MPI_PROCS
+    2
+  TEST_ARGS
+    --allow-distributed-wells=true
+    --partition-method=simple
+)
+
 # A test for distributed standard wells. We load distribute only along the z-axis
 add_test_compare_parallel_simulation(
   CASENAME
@@ -106,6 +239,29 @@ add_test_compare_parallel_simulation(
     --linear-solver-reduction=1e-7
     --tolerance-cnv=5e-6
     --tolerance-mb=1e-8
+)
+
+# Check WPWE events from a +CON workover on a standard well split across ranks.
+add_test_compare_parallel_simulation(
+  CASENAME
+    spe9_wpwe_cecon
+  FILENAME
+    SPE9_WPWE_CECON
+  DIR
+    wpwe
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol_parallel}
+  REL_TOL
+    1e-3
+  MPI_PROCS
+    4
+  TEST_ARGS
+    --allow-distributed-wells=true
+    --partition-method=simple
 )
 
 # A test for distributed multisegment wells.
@@ -944,6 +1100,33 @@ add_test_compare_parallel_simulation(
   TEST_ARGS
     --enable-tuning=true
     --linear-solver-reduction=1e-7
+)
+
+# Parallel LGR INIT/EGRID regression: reuses the existing SPE1CASE1_CARFIN deck (opm-tests/lgr,
+# already registered for spe1case1_carfin/spe1case1_carfin_parallel in compareECLFiles.cmake) and
+# the existing run-parallel-regressionTest.sh driver (COMPARE_MODE init: dry-run, compares
+# EGRID+INIT instead of SMRY+UNRST). Guards the parallel LGR INIT transmissibility output
+# (gatherLgrOutputTrans + the EclGenericWriter gathered-record lookups) -- pre-fix, the
+# parallel run deadlocks here.
+add_test_compare_parallel_simulation(
+  CASENAME
+    spe1case1_carfin
+  FILENAME
+    SPE1CASE1_CARFIN
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  DIR
+    lgr
+  ABS_TOL
+    1e-3
+  REL_TOL
+    1e-5
+  COMPARE_MODE
+    init
+  TEST_ARGS
+    --parsing-strictness=low
 )
 
 opm_set_test_driver(${PROJECT_SOURCE_DIR}/tests/run-comparison.sh "")

@@ -29,6 +29,7 @@
 #include <dune/istl/matrixmatrix.hh>
 
 #include <opm/common/OpmLog/OpmLog.hpp>
+#include <opm/common/utility/SparseTable.hpp>
 
 #include <opm/input/eclipse/Schedule/Group/Group.hpp>
 #include <opm/input/eclipse/Schedule/Group/GuideRate.hpp>
@@ -41,6 +42,7 @@
 #include <opm/simulators/flow/FlowBaseVanguard.hpp>
 
 #include <opm/simulators/linalg/matrixblock.hh>
+#include <opm/simulators/linalg/system/SystemTypes.hpp>
 
 #include <opm/simulators/timestepping/SimulatorReport.hpp>
 #include <opm/simulators/timestepping/gatherConvergenceReport.hpp>
@@ -156,6 +158,10 @@ template<class Scalar> class WellContributions;
 
             void beginTimeStep();
 
+            void updateFailed();
+
+            void advanceTimeLevel();
+
             void beginIteration()
             {
                 OPM_TIMEBLOCK(beginIteration);
@@ -235,6 +241,8 @@ template<class Scalar> class WellContributions;
 
                 this->assignDynamicWellStatus(wsrpt);
 
+                this->assignWellPerformanceEventTracker(wsrpt);
+
                 // Assigning (a subset of the) property values in shut
                 // connections should be the last step of wellData().
                 this->assignShutConnections(wsrpt, this->reportStepIndex());
@@ -283,6 +291,18 @@ template<class Scalar> class WellContributions;
             bool updateGroupControls(const Group& group,
                                     DeferredLogger& deferred_logger,
                                     const int reportStepIdx);
+
+            static constexpr int numResDofs = Indices::numEq;
+            static constexpr int numWellDofs = numResDofs + 1;//NB will fail for for thermal for now
+            using BMatrix = Dune::BCRSMatrix<Dune::FieldMatrix<Scalar, numWellDofs, numResDofs>>;
+            using CMatrix = Dune::BCRSMatrix<Dune::FieldMatrix<Scalar, numResDofs, numWellDofs>>;
+            using DMatrix = Dune::BCRSMatrix<Dune::FieldMatrix<Scalar, numWellDofs, numWellDofs>>;
+            using WVector = Dune::BlockVector<Dune::FieldVector<Scalar, numWellDofs>>;
+
+            void addBCDMatrix(std::vector<BMatrix>& b_matrices,
+                                            std::vector<CMatrix>& c_matrices,
+                                            std::vector<DMatrix>& d_matrices,
+                                            Opm::SparseTable<int>& wcells) const;
 
             const WellInterface<TypeTag>& getWell(const std::string& well_name) const;
 
@@ -463,6 +483,48 @@ template<class Scalar> class WellContributions;
             // TODO: finding a better naming
             void assembleWellEqWithoutIteration(const double dt);
 
+            //! \brief Assemble the well equations at an already-converged state
+            //!        that the caller has restored, without advancing anything.
+            //!
+            //! \warning Not part of the forward process. It assumes the well and
+            //!   group state already hold this step's converged values, and it
+            //!   deliberately skips the machinery that would re-derive them.
+            //!
+            //! updatePrimaryVariables() here is a *restore*, not a fresh
+            //! derivation: a converged step writes its primary variables into
+            //! SingleWellState::primaryvar (see
+            //! StandardWellPrimaryVariables::copyToWellState), that member is
+            //! serialized, and the update reads it back. The forward path throws
+            //! those values away when controls change --
+            //! WellInterface::updateWellStateWithTarget does
+            //! \c ws.primaryvar.resize(0) -- which is one of the reasons this
+            //! entry point exists rather than reusing assemble().
+            //!
+            //! Also skipped: updateWellControlsAndNetwork, which re-derives the
+            //! group/control state. From a restored snapshot it does not
+            //! reproduce the forward's converged values (different allocation)
+            //! and aborts on wells that were shut at the point being restored.
+            //! Likewise skipped is the forward-only preparation that precedes a
+            //! normal assemble().
+            //!
+            //! \note The restore is exact for BHP and the phase fractions.
+            //!   WQTotal is *not* taken from the stored primary variables; it is
+            //!   recomputed from the well state's surface rates, and forced to
+            //!   zero for a stopped or zero-rate-target well.
+            //!
+            //! Used by an out-of-tree adjoint module to re-linearize a
+            //! previously converged step.
+            void assembleWellEqAtRestoredState(const double dt)
+            {
+                // restore the well primary variables from the (converged) well
+                // state, then the well-local quantities, then assemble --
+                // without touching the group/control state.
+                auto logger_guard = this->groupStateHelper().pushLogger();
+                updatePrimaryVariables();
+                assembleWellEqWithoutIteration(dt);
+                updateCellRates();
+            }
+
             const std::vector<Scalar>& B_avg() const
             { return B_avg_; }
 
@@ -541,6 +603,7 @@ template<class Scalar> class WellContributions;
             std::map<std::string, std::unique_ptr<AverageRegionalPressureType>> regionalAveragePressureCalculator_{};
 
             SimulatorReportSingle last_report_{};
+            typename WellInterface<TypeTag>::WellSolveStats pending_solve_stats_{};
             GuideRateHandler<Scalar, IndexTraits> guide_rate_handler_{};
             ReservoirCoupling::Proxy<Scalar> rescoup_{};
 
@@ -558,6 +621,15 @@ template<class Scalar> class WellContributions;
             // compute the well fluxes and assemble them in to the reservoir equations as source terms
             // and in the well equations.
             void assemble(const double dt);
+
+            // collect the statistics for the standalone well solves gathered
+            // since the last call into last_report_ and reset them.
+            void collectWellSolveStats();
+
+            // Move the wells' solve statistics into pending_solve_stats_; needed
+            // before the well container is rebuilt, which discards them.
+            void stashWellSolveStats();
+            void addSolveStats(const WellInterface<TypeTag>& well);
 
             // well controls and network pressures affect each other and are solved in an iterative manner.
             // the function handles one iteration of updating well controls and network pressures.
@@ -577,8 +649,11 @@ template<class Scalar> class WellContributions;
             /// \param[in] enableWellPIScaling Whether or not to enable WELPI
             ///   scaling.  Typically enabled (i.e., true) only at the start
             ///   of a report step.
+            /// \param[in] initializeWellState Whether or not to initialize well state.
+            ///   Typically true, false is used during serialized restart.
             void initializeLocalWellStructure(const int  reportStepIdx,
-                                              const bool enableWellPIScaling);
+                                              const bool enableWellPIScaling,
+                                              const bool initializeWellState);
 
             /// Initialize group control modes/constraints and group solution state.
             ///
@@ -726,6 +801,14 @@ template<class Scalar> class WellContributions;
 
             // Store cell rates after assembling to avoid iterating all wells and connections for every element
             std::map<int, RateVector> cellRates_;
+
+            // Cached well solution from the system solver, consumed by
+            // recoverWellSolutionAndUpdateWellState during postSolve.
+            std::optional<WellVector<Scalar>> cachedSystemWellSolution_;
+            std::vector<int> cachedWellDofOffsets_;
+
+            void assignWellTracerRates(data::Wells& wsrpt) const;
+            void assignWellSpeciesRates(data::Wells& wsrpt) const;
 
             [[nodiscard]] auto rsConstInfo() const
                 -> typename WellState<Scalar,IndexTraits>::RsConstInfo;

@@ -22,8 +22,10 @@
 
 #include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 
+#include <opm/input/eclipse/Schedule/Group/Group.hpp>
 #include <opm/input/eclipse/Schedule/Group/GroupEconProductionLimits.hpp>
 #include <opm/input/eclipse/Schedule/Schedule.hpp>
+#include <opm/input/eclipse/Schedule/ScheduleState.hpp>
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellTestConfig.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellTestState.hpp>
@@ -33,32 +35,18 @@
 #include <opm/simulators/utils/DeferredLoggingErrorHelpers.hpp>
 
 #include <opm/simulators/wells/BlackoilWellModelGeneric.hpp>
+#include <opm/simulators/wells/EconomicLimitsMessage.hpp>
 #include <opm/simulators/wells/GroupStateHelper.hpp>
 #include <opm/simulators/wells/SingleWellState.hpp>
 #include <opm/simulators/wells/WellState.hpp>
 
 #include <fmt/format.h>
 
-#include <chrono>
 #include <ctime>
-#include <iomanip>
 #include <limits>
-#include <sstream>
 #include <vector>
 
 namespace Opm {
-
-std::string simTimeToString(const std::time_t start_time, const double sim_time)
-{
-    const auto start_timep = std::chrono::system_clock::from_time_t(start_time);
-    const auto sim_duration = std::chrono::duration_cast<std::chrono::system_clock::duration>(
-        std::chrono::duration<double>(sim_time)
-    );
-    const std::time_t cur_time = std::chrono::system_clock::to_time_t(start_timep + sim_duration);
-    std::ostringstream ss;
-    ss << std::put_time(std::localtime(&cur_time), "%d-%b-%Y");
-    return ss.str();
-}
 
 template<typename Scalar, typename IndexTraits>
 GroupEconomicLimitsChecker<Scalar, IndexTraits>::
@@ -73,13 +61,11 @@ GroupEconomicLimitsChecker(const BlackoilWellModelGeneric<Scalar, IndexTraits>& 
     , simulation_time_{simulation_time}
     , report_step_idx_{report_step_idx}
     , deferred_logger_{deferred_logger}
-    , date_string_{simTimeToString(well_model.schedule().getStartTime(),simulation_time)}
+    , date_string_{economicLimitDateString(well_model.schedule().getStartTime(), simulation_time)}
     , unit_system_{well_model.eclipseState().getUnits()}
     , well_state_{well_model.wellState()}
     , well_test_state_{well_test_state}
-    , schedule_{well_model.schedule()}
-    , gecon_props_{schedule_[report_step_idx_].gecon().get_group_prop(
-                   schedule_, well_model_.summaryState(), group_.name())}
+    , gecon_props_{well_model_.schedule()[report_step_idx_].gecon().get_group_prop(well_model_.summaryState(), group_.name())}
 {
     for (std::size_t i = 0; i < this->phase_idx_map_.size(); i++) {
         auto phase_idx = this->phase_idx_map_[i];
@@ -341,9 +327,13 @@ closeWellsRecursive(const Group& group, int level)
         const std::string msg = fmt::format("closing wells recursive : group {} ", group.name());
         displayDebugMessage(msg);
     }
-    for (const std::string& group_name : group.groups()) {
-        auto next_group = this->schedule_.getGroup(group_name, this->report_step_idx_);
-        wells_closed = wells_closed | closeWellsRecursive(next_group, level+1);
+    for (const auto& sched = this->well_model_.schedule()[this->report_step_idx_];
+         const auto& group_name : group.groups())
+    {
+        const auto did_close = this->
+            closeWellsRecursive(sched.groups(group_name), level + 1);
+
+        wells_closed = wells_closed || did_close;
     }
     const auto indent = std::string(2*(level+1), ' ');
     if (level > 0) {
@@ -372,8 +362,8 @@ closeWellsRecursive(const Group& group, int level)
                     "closing well {}", well_name);
                 displayDebugMessage(msg);
             }
-            const bool will_shut =
-                this->schedule_.getWell(well_name, this->report_step_idx_).getAutomaticShutIn();
+            const bool will_shut = this->well_model_.schedule()[this->report_step_idx_]
+                .wells(well_name).getAutomaticShutIn();
             const std::string msg = fmt::format("\n{} {} well {}", indent,
                                                 will_shut ? "Shutting" : "Stopping",
                                                 well_name);
@@ -409,13 +399,16 @@ template<typename Scalar, typename IndexTraits>
 void GroupEconomicLimitsChecker<Scalar, IndexTraits>::
 collectProducerWells(const Group& group, std::vector<std::string>& well_names) const
 {
-    for (const std::string& group_name : group.groups()) {
-        const auto& sub_group = this->schedule_.getGroup(group_name, this->report_step_idx_);
-        this->collectProducerWells(sub_group, well_names);
+    for (const auto& sched = this->well_model_.schedule()[this->report_step_idx_];
+         const std::string& group_name : group.groups())
+    {
+        this->collectProducerWells(sched.groups(group_name), well_names);
     }
-    for (const std::string& well_name : group.wells()) {
-        const auto& well_ecl = this->schedule_.getWell(well_name, this->report_step_idx_);
-        if (well_ecl.isProducer()) {
+
+    for (const auto& sched = this->well_model_.schedule()[this->report_step_idx_];
+         const std::string& well_name : group.wells())
+    {
+        if (sched.wells(well_name).isProducer()) {
             well_names.push_back(well_name);
         }
     }
@@ -625,8 +618,8 @@ closeWorstOffendingRatioWell(const RatioDetails& ratio_details)
         const Scalar group_ratio_display = this->unit_system_.from_si(ratio_details.measure, ratio_details.ratio);
         const Scalar limit_display = this->unit_system_.from_si(ratio_details.measure, ratio_details.limit);
         const std::string unit_name = this->unit_system_.name(ratio_details.measure);
-        const bool will_shut =
-            this->schedule_.getWell(worst_well, this->report_step_idx_).getAutomaticShutIn();
+        const bool will_shut = this->well_model_.schedule()[this->report_step_idx_]
+            .wells(worst_well).getAutomaticShutIn();
 
         const std::string msg = fmt::format(
             "{}\nAt time = {:.2f} {} (date = {}): Well {} will be {} because:\n"

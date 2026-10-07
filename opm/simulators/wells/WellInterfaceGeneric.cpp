@@ -24,9 +24,11 @@
 #include <opm/simulators/wells/WellInterfaceGeneric.hpp>
 
 #include <opm/common/ErrorMacros.hpp>
+#include <opm/common/OpmLog/OpmLog.hpp>
 
 #include <opm/input/eclipse/Schedule/Schedule.hpp>
 #include <opm/input/eclipse/Schedule/Well/FilterCake.hpp>
+#include <opm/input/eclipse/Schedule/Well/WELDRAW.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellBrineProperties.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellConnections.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellFoamProperties.hpp>
@@ -48,12 +50,15 @@
 #include <opm/simulators/wells/WellState.hpp>
 #include <opm/simulators/wells/WellTest.hpp>
 
+#include <unordered_set>
+
 #include <fmt/format.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <ctime>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -329,7 +334,10 @@ wellHasTHPConstraints(const SummaryState& summaryState) const
     }
 
     if (dynamic_thp_limit_) {
-        return true;
+        // An imposed limit cannot be evaluated without a VFP table. A THP
+        // limit from the deck is left alone, so that the missing table is
+        // still reported.
+        return this->wellEcl().vfp_table_number() > 0;
     }
 
     return WellBhpThpCalculator(*this).wellHasTHPConstraints(summaryState);
@@ -340,17 +348,26 @@ void WellInterfaceGeneric<Scalar, IndexTraits>::
 updateWellTestState(const SingleWellState<Scalar, IndexTraits>& ws,
                     const double& simulationTime,
                     const bool& writeMessageToOPMLog,
+                    const bool during_well_test,
                     const bool zero_group_target,
                     WellTestState& wellTestState,
-                    DeferredLogger& deferred_logger) const
+                    const UnitSystem& unit_system,
+                    const std::time_t start_time,
+                    DeferredLogger& deferred_logger,
+                    std::string* closure_reason) const
 {
+    const WellTest<Scalar, IndexTraits> well_test(*this);
     // updating well test state based on Economic limits for operable wells
     if (this->isOperableAndSolvable()) {
-        WellTest(*this).updateWellTestStateEconomic(ws, simulationTime, writeMessageToOPMLog, wellTestState,
-                                                    zero_group_target, deferred_logger);
+        well_test.updateWellTestStateEconomic(ws, simulationTime, writeMessageToOPMLog,
+                                              during_well_test, wellTestState,
+                                              zero_group_target, unit_system, start_time,
+                                              deferred_logger, closure_reason);
+        well_test.updateWellTestStateCECON(ws, simulationTime, writeMessageToOPMLog, wellTestState,
+                                           unit_system, start_time, deferred_logger);
     } else {
         // updating well test state based on physical (THP/BHP) limits.
-        WellTest(*this).updateWellTestStatePhysical(simulationTime, writeMessageToOPMLog, wellTestState, deferred_logger);
+        well_test.updateWellTestStatePhysical(simulationTime, writeMessageToOPMLog, wellTestState, deferred_logger);
     }
 
     // TODO: well can be shut/closed due to other reasons
@@ -405,14 +422,16 @@ template<typename Scalar, typename IndexTraits>
 void WellInterfaceGeneric<Scalar, IndexTraits>::
 closeCompletions(const WellTestState& wellTestState)
 {
-    const auto& connections = well_ecl_.getConnections();
-    int perfIdx = 0;
-    for (const auto& connection : connections) {
-        if (connection.state() == Connection::State::OPEN) {
-            if (wellTestState.completion_is_closed(name(), connection.complnum())) {
-                this->well_index_[perfIdx] = 0.0;
+    // completions_ holds only this rank's perforations, as well_index_ does.
+    for (const auto& [complnum, perfs] : completions_) {
+        if (!wellTestState.completion_is_closed(name(), complnum)) {
+            continue;
+        }
+        for (const int perf : perfs) {
+            this->well_index_[perf] = 0.0;
+            if (!this->well_index_fracture_.empty()) {
+                this->well_index_fracture_[perf] = WellIndexFracture {};
             }
-            perfIdx++;
         }
     }
 }
@@ -657,13 +676,49 @@ isPressureControlled(const WellState<Scalar, IndexTraits>& well_state) const
 }
 
 template<typename Scalar, typename IndexTraits>
+void WellInterfaceGeneric<Scalar, IndexTraits>::
+applyWeldrawRateLimit(const Well& well_ecl,
+                      const std::optional<Scalar>& weldraw_max_rate,
+                      Well::ProductionControls& controls)
+{
+    if (!weldraw_max_rate.has_value()) {
+        return;
+    }
+
+    const bool gas_target =
+        well_ecl.getWELDRAW().targetPhase() == WELDRAW::TargetPhase::GAS;
+    const auto cmode = gas_target ? Well::ProducerCMode::GRAT
+                                  : Well::ProducerCMode::LRAT;
+    double& rate = gas_target ? controls.gas_rate : controls.liquid_rate;
+
+    // Only ever tighten: an existing target below the drawdown limit stands.
+    const Scalar max_rate = *weldraw_max_rate;
+    if (!controls.hasControl(cmode) || (max_rate < rate)) {
+        rate = max_rate;
+        controls.addControl(cmode);
+    }
+}
+
+template<typename Scalar, typename IndexTraits>
+Well::ProductionControls
+WellInterfaceGeneric<Scalar, IndexTraits>::
+productionControlsWithWeldraw(const SummaryState& summary_state,
+                              const SingleWellState<Scalar, IndexTraits>& ws) const
+{
+    auto controls = this->well_ecl_.productionControls(summary_state);
+    applyWeldrawRateLimit(this->well_ecl_, ws.weldraw_max_rate, controls);
+    return controls;
+}
+
+template<typename Scalar, typename IndexTraits>
 bool WellInterfaceGeneric<Scalar, IndexTraits>::
 wellUnderZeroRateTargetIndividual(const SummaryState& summary_state,
                                   const WellState<Scalar, IndexTraits>& well_state) const
 {
     if (this->isProducer()) { // producers
-        const auto prod_controls = this->well_ecl_.productionControls(summary_state);
-        const auto prod_mode = well_state.well(this->indexOfWell()).production_cmode;
+        const auto& ws = well_state.well(this->indexOfWell());
+        const auto prod_controls = this->productionControlsWithWeldraw(summary_state, ws);
+        const auto prod_mode = ws.production_cmode;
         return wellhelpers::rateControlWithZeroProdTarget(prod_controls, prod_mode);
     } else { // injectors
         const auto inj_controls = this->well_ecl_.injectionControls(summary_state);
@@ -714,6 +769,43 @@ void WellInterfaceGeneric<Scalar, IndexTraits>::addPerforations(const std::vecto
                 .push_back(this->saturation_table_number_.front());
 
             ++this->number_of_local_perforations_;
+        }
+    }
+}
+
+template<typename Scalar, typename IndexTraits>
+void WellInterfaceGeneric<Scalar, IndexTraits>::
+addFracturePerforations(const std::vector<RuntimePerforation>& perfs)
+{
+    if (perfs.empty()) {
+        return;
+    }
+
+    if (this->well_index_fracture_.empty()) {
+        this->well_index_fracture_.resize(this->number_of_local_perforations_);
+    }
+
+    for (const auto& perf : perfs) {
+        const auto it = std::ranges::find(well_cells_, perf.cell);
+        if (it != this->well_cells_.end()) {
+            // Update the fracture contribution in place; assumes at most one
+            // fracture crosses a given cell.
+            const auto ind = std::distance(this->well_cells_.begin(), it);
+            auto& frac = this->well_index_fracture_[ind];
+            frac.ctf = perf.ctf;
+            frac.pressure = perf.pressure;
+        }
+        else {
+            // The fracture reached a cell that is not perforated by this
+            // well locally; the corresponding schedule connection has not
+            // (yet) been created.  Warn once per (well, cell).
+            static std::unordered_set<std::string> warned;
+            const auto key = fmt::format("{}:{}", this->name(), perf.cell);
+            if (warned.insert(key).second) {
+                OpmLog::info(fmt::format("Skipping fracture perforation for cell {} in well {}: "
+                                         "not present in the current local well structure",
+                                         perf.cell, this->name()));
+            }
         }
     }
 }
@@ -960,7 +1052,7 @@ updateGroupTargetFallbackFlag(WellState<Scalar, IndexTraits>& well_state,
                               DeferredLogger& deferred_logger) const
 {
     auto& ws = well_state.well(this->index_of_well_);
-    if (!wellUnderGroupControl(ws) || this->isInjector() || 
+    if (!wellUnderGroupControl(ws) || this->isInjector() ||
         !ws.group_target_fallback.has_value() || !ws.group_target.has_value())
     {
         ws.use_group_target_fallback = false;
@@ -977,7 +1069,7 @@ updateGroupTargetFallbackFlag(WellState<Scalar, IndexTraits>& well_state,
         ws.use_group_target_fallback = false;
         return;
     }
-    // Check whether guiderate ratio or well fraction of production_cmode is too small, 
+    // Check whether guiderate ratio or well fraction of production_cmode is too small,
     // if so, switch to fallback (original) control mode
     const Scalar fraction_tolerance = this->param_.group_control_fraction_tolerance_;
     if (ws.group_target->guiderate_ratio < fraction_tolerance) {
@@ -1017,7 +1109,7 @@ updateGroupTargetFallbackFlag(WellState<Scalar, IndexTraits>& well_state,
             cmode_frac += scaled_well_fractions[gas_pos];
         }
     }
-    ws.use_group_target_fallback = (cmode_frac < fraction_tolerance); 
+    ws.use_group_target_fallback = (cmode_frac < fraction_tolerance);
 }
 
 template class WellInterfaceGeneric<double, BlackOilDefaultFluidSystemIndices>;

@@ -74,11 +74,16 @@ update_injector_targets(const Well& well,
 {
     const auto& inj_controls = well.injectionControls(st);
     const auto& injection_properties = well.getInjectionProperties();
+
+    // Report this the way the black-oil model does in WellAssemble.
+    if (inj_controls.cmode == Well::InjectorCMode::CMODE_UNDEFINED) {
+        OPM_THROW(std::runtime_error,
+                  "Well control must be specified for well " + this->name);
+    }
+
     const auto& inj_composition = injection_properties.gasInjComposition();
 #ifndef NDEBUG
     assert(this->total_molar_fractions.size() == inj_composition.size());
-    const bool cmode_is_undefined = (inj_controls.cmode == Well::InjectorCMode::CMODE_UNDEFINED);
-    assert(!cmode_is_undefined && "control types should be specified");
     const auto injection_type = injection_properties.injectorType;
     const bool is_gas_injecting = (injection_type == InjectorType::GAS);
     assert(is_gas_injecting && "Only gas injection is supported for now");
@@ -120,12 +125,18 @@ update_producer_targets(const Well& well,
                         const SummaryState& st)
 {
     const auto& prod_controls = well.productionControls(st);
-#ifndef NDEBUG
-    const auto cmode_is_undefined = (prod_controls.cmode == Well::ProducerCMode::CMODE_UNDEFINED);
-    assert(!cmode_is_undefined && "control types should be specified");
-#endif
 
-    this->total_molar_fractions = cell_mole_fractions[this->connection_data.ecl_index[0]];
+    // Report this the way the black-oil model does in WellAssemble.
+    if (prod_controls.cmode == Well::ProducerCMode::CMODE_UNDEFINED) {
+        OPM_THROW(std::runtime_error,
+                  "Well control must be specified for well " + this->name);
+    }
+
+    // Read the reservoir composition only when an open perforation is
+    // available. Initialize schedule targets below even without perforations.
+    if (!this->connection_data.ecl_index.empty()) {
+        this->total_molar_fractions = cell_mole_fractions[this->connection_data.ecl_index[0]];
+    }
 
     this->bhp = prod_controls.bhp_limit;
     this->production_cmode = prod_controls.cmode;
@@ -142,6 +153,22 @@ update_producer_targets(const Well& well,
         if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx)) {
             this->surface_phase_rates[FluidSystem::gasPhaseIdx] = 100. * production_rate;
         }
+    }
+}
+
+template <typename FluidSystem>
+void SingleCompWellState<FluidSystem>::
+copyRuntimeStateFrom(const SingleCompWellState& other)
+{
+    // Keep the freshly initialized schedule-derived status, controls, and
+    // injector targets from base_init(); only reuse the dynamic state.
+    bhp = other.bhp;
+    surface_phase_rates = other.surface_phase_rates;
+    phase_fractions = other.phase_fractions;
+    reservoir_phase_rates = other.reservoir_phase_rates;
+    if (producer) {
+        total_molar_fractions = other.total_molar_fractions;
+        phase_molar_fractions = other.phase_molar_fractions;
     }
 }
 

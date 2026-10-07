@@ -77,7 +77,7 @@ template <class TypeTag>
 NonlinearSystemBlackOilReservoir<TypeTag>::
 NonlinearSystemBlackOilReservoir(Simulator& simulator,
               const ModelParameters& param,
-              BlackoilWellModel<TypeTag>& well_model,
+              typename ParentType::WellModel& well_model,
               const bool terminal_output)
     : ParentType(simulator, param, well_model, terminal_output)
     , conv_monitor_(param.monitor_params_)
@@ -115,6 +115,9 @@ prepareStep(const SimulatorTimerInterface& timer)
     unsigned numDof = this->simulator_.model().numGridDof();
     wasSwitched_.resize(numDof);
     std::fill(wasSwitched_.begin(), wasSwitched_.end(), false);
+    if (this->enable_state_rollback_) {
+        this->simulator_.model().newtonMethod().resetPrimaryVariableSwitches();
+    }
 
     if (this->param_.update_equations_scaling_) {
         OpmLog::error("Equation scaling not supported");
@@ -173,6 +176,11 @@ initialLinearization(SimulatorReportSingle& report,
         auto convrep = getConvergence(timer, maxIter, residual_norms);
         report.converged = convrep.converged() &&
                            this->simulator_.problem().iterationContext().iteration() >= minIter;
+        if (report.converged &&
+            convrep.cnvRelaxSource() != ConvergenceReport::CnvRelaxSource::None)
+        {
+            ++report.relaxed_cnv_acceptances;
+        }
         ConvergenceReport::Severity severity = convrep.severityOfWorstFailure();
         this->convergence_reports_.back().report.push_back(std::move(convrep));
 
@@ -290,8 +298,21 @@ nonlinearIterationNewton(const SimulatorTimerInterface& timer,
             if (isOscillate) {
                 this->current_relaxation_ -= nonlinear_solver.relaxIncrement();
                 this->current_relaxation_ = std::max(this->current_relaxation_, nonlinear_solver.relaxMax());
+                // The detector reads reservoir residual history and the response damps the
+                // reservoir update, but the oscillation may originate in the well/group
+                // control layer.  Record what was unsatisfied here so the two can be told
+                // apart.
+                auto source = ConvergenceReport::OscillationSource::NotDetected;
+                if (!this->convergence_reports_.empty() &&
+                    !this->convergence_reports_.back().report.empty())
+                {
+                    auto& convrep = this->convergence_reports_.back().report.back();
+                    source = classifyOscillationSource(convrep);
+                    convrep.setOscillationSource(source);
+                }
                 if (this->terminalOutputEnabled()) {
-                    OpmLog::info("    Oscillating behavior detected: Relaxation set to "
+                    OpmLog::info("    Oscillating behavior detected (" + to_string(source)
+                                 + "): Relaxation set to "
                                  + std::to_string(this->current_relaxation_));
                 }
             }
@@ -380,8 +401,12 @@ relativeChange() const
                 Scalar tmpSat = saturationsNew[phaseIdx] - saturationsOld[phaseIdx];
                 resultDelta += tmpSat*tmpSat;
                 resultDenom += saturationsNew[phaseIdx]*saturationsNew[phaseIdx];
-                assert(std::isfinite(resultDelta));
-                assert(std::isfinite(resultDenom));
+                // Non-finite here comes from the solution, not from a broken
+                // invariant, so report it instead of vanishing in release.
+                if (!std::isfinite(resultDelta) || !std::isfinite(resultDenom)) {
+                    OPM_THROW(std::runtime_error,
+                              "Non-finite solution change in the convergence measure");
+                }
             }
         }
     }
@@ -422,7 +447,7 @@ solveJacobianSystem(BVector& x)
             linSolver.setResidual(residual);
             perfTimer.start();
             linSolver.solve(x_trial[solver]);
-            times[solver] = perfTimer.stop();
+            times[solver] = setupTimes[solver] + perfTimer.stop();
             perfTimer.reset();
             if (this->terminal_output_) {
                 OpmLog::debug(fmt::format(fmt::runtime("Solver time {}: {}"), solver, times[solver]));
@@ -816,6 +841,18 @@ getReservoirConvergence(const double reportTime,
 
     const auto tol_cnv = use_relaxed_cnv ? tolerance_cnv_relaxed : this->param_.tolerance_cnv_;
     const auto tol_mb  = use_relaxed_mb ? this->param_.tolerance_mb_relaxed_ : this->param_.tolerance_mb_;
+
+    // Record which condition granted the relaxation, so the accepted state's quality is
+    // visible in the output. Order mirrors the code's own precedence.
+    {
+        using RS = ConvergenceReport::CnvRelaxSource;
+        const auto source = relax_dsol_cnv          ? RS::SolChange
+                          : relax_pv_fraction_cnv   ? RS::PvFraction
+                          : relax_final_iteration_cnv ? RS::FinalIter
+                          : relax_iter_cnv          ? RS::IterCount
+                                                    : RS::None;
+        report.setCnvRelaxation(source, static_cast<double>(tol_cnv));
+    }
     const auto tol_cnv_energy = use_relaxed_cnv ? this->param_.tolerance_cnv_energy_relaxed_ : this->param_.tolerance_cnv_energy_;
     const auto tol_eb = use_relaxed_mb ?  this->param_.tolerance_energy_balance_relaxed_ : this->param_.tolerance_energy_balance_;
 

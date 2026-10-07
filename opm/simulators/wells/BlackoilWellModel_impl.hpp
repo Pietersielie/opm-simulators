@@ -46,6 +46,7 @@
 #include <opm/simulators/wells/ParallelPAvgDynamicSourceData.hpp>
 #include <opm/simulators/wells/ParallelWBPCalculation.hpp>
 #include <opm/simulators/wells/VFPProperties.hpp>
+#include <opm/simulators/wells/WellFractureFlowSplit.hpp>
 #include <opm/simulators/wells/GroupStateHelper.hpp>
 
 #include <opm/simulators/utils/DeferredLoggingErrorHelpers.hpp>
@@ -102,7 +103,9 @@ namespace Opm {
 
             this->parallel_well_info_.reserve(parallel_wells.size());
             for( const auto& name_bool : parallel_wells) {
-                this->parallel_well_info_.emplace_back(name_bool, grid().comm());
+                this->parallel_well_info_.push_back
+                    (std::make_unique<ParallelWellInfo<Scalar>>
+                     (name_bool, grid().comm()));
             }
         }
 
@@ -206,9 +209,12 @@ namespace Opm {
             (std::vector<int>(this->local_num_cells_, 0));
 
         {
-            // WELPI scaling runs at start of report step.
+            const bool initializeWellState = !this->deserialized_state_pending_;
             const auto enableWellPIScaling = true;
-            this->initializeLocalWellStructure(timeStepIdx, enableWellPIScaling);
+            this->initializeLocalWellStructure(timeStepIdx,
+                                               enableWellPIScaling,
+                                               initializeWellState);
+            this->deserialized_state_pending_ = false;
         }
 
         this->initializeGroupStructure(timeStepIdx);
@@ -246,12 +252,18 @@ namespace Opm {
     void
     BlackoilWellModel<TypeTag>::
     initializeLocalWellStructure(const int  reportStepIdx,
-                                 const bool enableWellPIScaling)
+                                 const bool enableWellPIScaling,
+                                 const bool initializeWellState)
     {
         auto logger_guard = this->groupStateHelper().pushLogger();
         auto& local_deferredLogger = this->groupStateHelper().deferredLogger();
 
         const auto& comm = this->simulator_.vanguard().grid().comm();
+
+        // Wells drilled by an action are not part of the well set the
+        // parallel well bookkeeping was built from.  Register them before
+        // anything looks them up.  Collective, hence outside the try/catch.
+        this->registerNewParallelWells(reportStepIdx);
 
         // Wells_ecl_ holds this rank's wells, both open and stopped/shut.
         this->wells_ecl_ = this->getLocalWells(reportStepIdx);
@@ -263,12 +275,14 @@ namespace Opm {
         // scope a bit.
         OPM_BEGIN_PARALLEL_TRY_CATCH()
         {
-            this->initializeWellPerfData();
-            this->initializeWellState(reportStepIdx);
+            if (initializeWellState) {
+                this->initializeWellPerfData();
+                this->initializeWellState(reportStepIdx);
+            }
             this->wbp_.initializeWBPCalculationService();
 
-            if (this->param_.use_multisegment_well_ && this->anyMSWellOpenLocal()) {
-                this->wellState().initWellStateMSWell(this->wells_ecl_, &this->prevWellState());
+            if (initializeWellState && this->param_.use_multisegment_well_ && this->anyMSWellOpenLocal()) {
+                this->wellState().initWellStateMSWell(this->wells_ecl_, &this->prevWellState(), has_energy_);
             }
 
             this->initializeWellProdIndCalculators();
@@ -351,7 +365,7 @@ namespace Opm {
             // middle of a report step.
             const auto enableWellPIScaling = false;
 
-            this->initializeLocalWellStructure(reportStepIdx, enableWellPIScaling);
+            this->initializeLocalWellStructure(reportStepIdx, enableWellPIScaling, true);
             this->initializeGroupStructure(reportStepIdx);
 
             this->commitWGState();
@@ -370,13 +384,28 @@ namespace Opm {
         this->wellState().gliftTimeStepInit();
 
         const double simulationTime = simulator_.time();
+
+        this->well_performance_event_tracker_.beginTimeStep(this->schedule(), reportStepIdx,
+                                              this->wellStatusSnapshot());
+
         OPM_BEGIN_PARALLEL_TRY_CATCH();
         {
             // test wells
             wellTesting(reportStepIdx, simulationTime, local_deferredLogger);
 
+            // Rebuilding the container discards the wells' solve statistics.
+            stashWellSolveStats();
+
+            // A WTEST reopen is the simulator's own decision, so record it
+            // before the deck is applied below.
+            this->well_performance_event_tracker_.accumulate(this->wellStatusSnapshot());
+
             // create the well container
             createWellContainer(reportStepIdx);
+
+            // The deck has now been applied for this time step.  Its
+            // connection changes are events; its well status changes are not.
+            this->well_performance_event_tracker_.applyDeckChanges(this->wellStatusSnapshot());
 
 #ifdef RESERVOIR_COUPLING_ENABLED
             if (this->isReservoirCouplingMaster()) {
@@ -469,12 +498,17 @@ namespace Opm {
 #ifdef RESERVOIR_COUPLING_ENABLED
         if (this->isReservoirCouplingSlave()) {
             if (this->reservoirCouplingSlave().isFirstSubstepOfSyncTimestep()) {
+                // The wells have not been solved for this sync step yet, so a well that
+                // opens in this report step still carries its WCONPROD target as its rate.
+                // See RescoupSendSlaveGroupData::collectSlaveGroupSurfaceProductionRates_().
+                this->reservoirCouplingSlave().setWellsSolvedThisSyncStep(false);
                 this->rescoupHelper_.sendSlaveGroupDataToMaster();
                 this->rescoupHelper_.receiveGroupConstraintsFromMaster();
                 this->rescoupHelper_.receiveCoupledNetworkActiveStatus();
                 this->groupStateHelper().updateSlaveGroupCmodesFromMaster();
                 this->reservoirCouplingSlave().markSlaveGroupsInSchedule(
                     this->schedule_, reportStepIdx);
+                this->rescoupHelper_.refreshSlaveGroupTargets();
                 slave_needs_well_solution = true;
             }
         }
@@ -531,6 +565,8 @@ namespace Opm {
 
 #ifdef RESERVOIR_COUPLING_ENABLED
         if (slave_needs_well_solution) {  // isReservoirCouplingSlave()
+            // The initial well solve above has run, so the well states now hold solved rates.
+            this->reservoirCouplingSlave().setWellsSolvedThisSyncStep(true);
             // Need to update group data based on new well solution.
             this->updateAndCommunicateGroupData(reportStepIdx, /*update_wellgrouptarget*/ false);
             this->rescoupHelper_.sendSlaveGroupDataToMaster();
@@ -553,6 +589,22 @@ namespace Opm {
         logAndCheckForExceptionsAndThrow(local_deferredLogger,
                                          exc_type, "beginTimeStep() failed: " + exc_msg, this->terminal_output_, comm);
 
+    }
+
+    template<typename TypeTag>
+    void
+    BlackoilWellModel<TypeTag>::
+    updateFailed()
+    {
+        this->BlackoilWellModelGeneric<Scalar, IndexTraits>::updateFailed();
+    }
+
+    template<typename TypeTag>
+    void
+    BlackoilWellModel<TypeTag>::
+    advanceTimeLevel()
+    {
+        this->BlackoilWellModelGeneric<Scalar, IndexTraits>::advanceTimeLevel();
     }
 
     template<typename TypeTag>
@@ -589,10 +641,8 @@ namespace Opm {
                 well->setPrevSurfaceRates(this->wellState(), this->prevWellState());
             }
 
-            const auto& network = this->schedule()[timeStepIdx].network();
-            if (network.active()) {
-                this->network_.initializeWell(*well);
-            }
+            this->network_.initializeWell(*well);
+
             try {
                 using GLiftEclWells = typename GasLiftGroupInfo<Scalar, IndexTraits>::GLiftEclWells;
                 GLiftEclWells ecl_well_map;
@@ -610,6 +660,8 @@ namespace Opm {
                                            "Exception message: {}"), wellEcl.name(), e.what());
                 deferred_logger.warning("WELL_TESTING_FAILED", msg);
             }
+            // The tested well is a temporary; keep its solve statistics.
+            addSolveStats(*well);
         }
     }
 
@@ -666,6 +718,13 @@ namespace Opm {
         }
 
         if (Indices::waterEnabled) {
+            if constexpr (getPropValue<TypeTag, Properties::EnableMech>()) {
+                // Split injector connection flow between matrix and fracture
+                // for wells with registered fracture contributions.
+                updateWellFractureFlowSplit<FluidSystem, Scalar>(
+                    this->simulator_, this->well_container_,
+                    this->wellState(), this->nupcolWellState());
+            }
             this->updateFiltrationModelsPostStep(dt, FluidSystem::waterPhaseIdx, local_deferredLogger);
         }
 
@@ -695,14 +754,22 @@ namespace Opm {
             local_deferredLogger.warning("WELL_POTENTIAL_CALCULATION_FAILED", msg);
         }
 
-        updateWellTestState(simulationTime, this->wellTestState());
+        // simulationTime is the start of the step that has just been completed,
+        // but a well shut by the economic or physical limit checks below keeps
+        // flowing until its end. Record that instant as the closure time, so
+        // the WTEST re-test countdown starts when the well actually stops.
+        const double closure_time = simulationTime + dt;
+
+        updateWellTestState(closure_time, this->wellTestState());
 
         // check group sales limits at the end of the timestep
         const Group& fieldGroup = this->schedule_.getGroup("FIELD", reportStepIdx);
-        this->checkGEconLimits(fieldGroup, simulationTime,
+        this->checkGEconLimits(fieldGroup, closure_time,
                                simulator_.episodeIndex(), local_deferredLogger);
         this->checkGconsaleLimits(fieldGroup, this->wellState(),
                                   simulator_.episodeIndex(), local_deferredLogger);
+
+        this->well_performance_event_tracker_.accumulate(this->wellStatusSnapshot());
 
         this->calculateProductivityIndexValues(local_deferredLogger);
 
@@ -711,6 +778,7 @@ namespace Opm {
 #ifdef RESERVOIR_COUPLING_ENABLED
         this->rescoupHelper_.rescoupSyncSummaryData();
 #endif
+        this->well_performance_event_tracker_.commitTimeStep(this->schedule(), reportStepIdx);
         this->commitWGState();
 
         //reporting output temperatures
@@ -889,7 +957,17 @@ namespace Opm {
                     // a timestep without the well in question, after it caused
                     // repeated timestep cuts. It should therefore not be opened,
                     // even if it was new or received new targets this report step.
-                    const bool closed_this_step = (this->wellTestState().lastTestTime(well_name) == simulator_.time());
+                    //
+                    // The time stamp alone cannot establish that, since a shut-in
+                    // decided at the *end* of the previous step carries that
+                    // step's end time, which coincides with the current step's
+                    // start time. Such shut-ins are the ones a new WCON keyword
+                    // may undo, and are exactly what wasDynamicallyShutThisTimeStep()
+                    // reports; mid-step ones from forceShutWellByName() are not
+                    // registered there, so they still block the re-open.
+                    const bool closed_this_step =
+                        (this->wellTestState().lastTestTime(well_name) == simulator_.time()) &&
+                        !this->wasDynamicallyShutThisTimeStep(well_name);
                     // TODO: more checking here, to make sure this standard more specific and complete
                     // maybe there is some WCON keywords will not open the well
                     auto& events = this->wellState().well(w).events;
@@ -954,9 +1032,7 @@ namespace Opm {
                 // something like wellTestState().hasWell(well_name)?
                 if (this->wellTestState().well_is_closed(well_name))
                 {
-                    if (well_ecl.getAutomaticShutIn() ||
-                        !well_ecl.getAllowCrossFlow() ||
-                        this->allConnectionsClosed(well_ecl))
+                    if (this->closedWellStatus(well_ecl) == WellStatus::SHUT)
                     {
                         this->wellState().shutWell(w);
                         this->well_close_times_.erase(well_name);
@@ -1149,8 +1225,7 @@ namespace Opm {
                 this->updateNetworkActiveState_();
             }
             const int episodeIdx = simulator_.episodeIndex();
-            const auto& network = this->schedule()[episodeIdx].network();
-            if (!this->wellsActive() && !network.active()) {
+            if (!this->wellsActive() && !details::anyNetworkActive(this->schedule(), episodeIdx)) {
                 return;
             }
         }
@@ -1158,6 +1233,8 @@ namespace Opm {
         // Timestep initialization: should run once at the start of each timestep.
         if (iterCtx.needsTimestepInit() && this->wellsActive()) {
             OPM_TIMEBLOCK(firstIterationAssemble);
+            Dune::Timer prepareTimer;
+            prepareTimer.start();
             // try-catch is needed here as updateWellControls
             // contains global communication and has either to
             // be reached by all processes or all need to abort
@@ -1170,12 +1247,20 @@ namespace Opm {
             OPM_END_PARALLEL_TRY_CATCH_LOG(local_deferredLogger,
                                            "assemble() failed during well initialization: ",
                                            this->terminal_output_, grid().comm());
+            last_report_.well_facility_time += prepareTimer.stop();
         }
 
+        Dune::Timer networkTimer;
+        networkTimer.start();
         const bool well_group_control_changed = updateWellControlsAndNetwork(
                             /*mandatory_network_balance=*/false,
                             dt,
                             local_deferredLogger);
+        // the control/network update is part of the facility calculations,
+        // together with the time step preparation of the wells above
+        const double network_time = networkTimer.stop();
+        last_report_.well_control_network_time += network_time;
+        last_report_.well_facility_time += network_time;
 
         // even when there is no wells active, the network nodal pressure still need to be updated through updateWellControlsAndNetwork()
         // but there is no need to assemble the well equations
@@ -1187,10 +1272,60 @@ namespace Opm {
         // Pre-compute cell rates to we don't have to do this for every cell during linearization...
         updateCellRates();
 
+        // collect the statistics for the standalone well solves done since
+        // the last assembly (prepareTimeStep, well testing and well
+        // potential calculations)
+        collectWellSolveStats();
+
         // if group or well control changes we don't consider the
         // case converged
         last_report_.well_group_control_changed = well_group_control_changed;
         last_report_.assemble_time_well += perfTimer.stop();
+    }
+
+
+
+
+    template<typename TypeTag>
+    void
+    BlackoilWellModel<TypeTag>::
+    collectWellSolveStats()
+    {
+        stashWellSolveStats();
+        const auto& stats = pending_solve_stats_;
+        last_report_.well_solve_time += stats.solve_time;
+        last_report_.well_potential_solve_time += stats.potential_solve_time;
+        last_report_.well_solve_assemble_time += stats.assemble_time;
+        last_report_.well_solve_linear_solve_time += stats.linear_solve_time;
+        last_report_.total_well_iterations += stats.iterations;
+        last_report_.total_well_potential_iterations += stats.potential_iterations;
+        pending_solve_stats_ = {};
+    }
+
+    template<typename TypeTag>
+    void
+    BlackoilWellModel<TypeTag>::
+    stashWellSolveStats()
+    {
+        for (const auto& well : well_container_) {
+            addSolveStats(*well);
+        }
+    }
+
+    template<typename TypeTag>
+    void
+    BlackoilWellModel<TypeTag>::
+    addSolveStats(const WellInterface<TypeTag>& well)
+    {
+        auto& pending = pending_solve_stats_;
+        const auto& stats = well.solveStats();
+        pending.solve_time += stats.solve_time;
+        pending.potential_solve_time += stats.potential_solve_time;
+        pending.assemble_time += stats.assemble_time;
+        pending.linear_solve_time += stats.linear_solve_time;
+        pending.iterations += stats.iterations;
+        pending.potential_iterations += stats.potential_iterations;
+        well.resetSolveStats();
     }
 
 
@@ -1217,8 +1352,15 @@ namespace Opm {
         while (do_network_update) {
             if (!this->isRescoupSlaveCoupledNetworkIteration_()
                 && network_update_iteration >= max_iteration ) {
-                // only output to terminal if we at the last newton iterations where we try to balance the network.
                 const int episodeIdx = simulator_.episodeIndex();
+                const auto& balance = this->schedule()[episodeIdx].network_balance();
+                // If the imbalance is already within tolerance, the network is converged; the
+                // outer loop continued only due to ALQ or control changes. Don't report this
+                // as an unconverged result -- just break quietly.
+                if (network_imbalance <= balance.pressure_tolerance()) {
+                    break;
+                }
+                // only output to terminal if we at the last newton iterations where we try to balance the network.
                 if (this->network_.willBalanceOnNextIteration(episodeIdx)) {
                     if (this->terminal_output_) {
                         const std::string msg = fmt::format("Maximum of {:d} network iterations has been used and we stop the update, \n"
@@ -1252,6 +1394,10 @@ namespace Opm {
         if (this->isRescoupMasterCoupledNetworkIteration_()) {
             this->sendSlaveNetworkLoopTerminationSignal_();
         }
+        // only count the balancing iterations when a network is active
+        if (this->schedule()[simulator_.episodeIndex()].network().active()) {
+            last_report_.total_network_iterations += network_update_iteration;
+        }
         return well_group_control_changed;
     }
 
@@ -1275,16 +1421,26 @@ namespace Opm {
             this->rescoupHelper_.receiveMasterGroupNodePressuresFromMaster();
         }
 #endif
+        Dune::Timer groupTimer;
+        groupTimer.start();
         this->updateAndCommunicateGroupData(reportStepIdx, /*update_wellgrouptarget*/ true);
         // We need to call updateWellControls before we update the network as
         // network updates are only done on thp controlled wells.
         // Note that well controls are allowed to change during updateNetwork
         // and in prepareWellsBeforeAssembling during well solves.
         bool well_group_control_changed = updateWellControls(local_deferredLogger);
+        last_report_.group_control_time += groupTimer.stop();
+
+        Dune::Timer networkBalanceTimer;
+        networkBalanceTimer.start();
         const auto [more_inner_network_update, network_imbalance] =
                 this->network_.update(mandatory_network_balance,
                                       local_deferredLogger,
                                       relax_network_tolerance);
+        // only account for the time when a network is active
+        if (this->schedule()[reportStepIdx].network().active()) {
+            last_report_.network_balance_time += networkBalanceTimer.stop();
+        }
 #ifdef RESERVOIR_COUPLING_ENABLED
         if (this->isReservoirCouplingMaster()) {
             this->rescoupHelper_.maybeExchangeNetworkOuterIterationWithSlaves(more_inner_network_update);
@@ -1299,6 +1455,8 @@ namespace Opm {
                 // the network balancing
                 const bool updatePotentials = (this->network_.shouldBalance(reportStepIdx) ||
                                                mandatory_network_balance);
+                Dune::Timer gliftTimer;
+                gliftTimer.start();
                 alq_updated = gaslift_.maybeDoGasLiftOptimize(simulator_,
                                                           well_container_,
                                                           this->network_.nodePressures(),
@@ -1306,8 +1464,17 @@ namespace Opm {
                                                           this->wellState(),
                                                           this->groupState(),
                                                           local_deferredLogger);
+                // only account for the time when gas lift optimization is in use
+                if (this->schedule().glo(reportStepIdx).active()) {
+                    last_report_.gaslift_time += gliftTimer.stop();
+                }
             }
+            // the well solves triggered by control changes are part of the
+            // control/network update, keep track of the time separately
+            Dune::Timer prepareWellsTimer;
+            prepareWellsTimer.start();
             prepareWellsBeforeAssembling(dt);
+            last_report_.control_well_solve_time += prepareWellsTimer.stop();
         }
         OPM_END_PARALLEL_TRY_CATCH_LOG(local_deferredLogger,
                                        "updateWellControlsAndNetworkIteration() failed: ",
@@ -1317,12 +1484,15 @@ namespace Opm {
         if (alq_updated || BlackoilWellModelGuideRates(*this).
                               guideRateUpdateIsNeeded(reportStepIdx)) {
             const double simulationTime = simulator_.time();
+            Dune::Timer guideRateTimer;
+            guideRateTimer.start();
             // NOTE: For reservoir coupling: Slave group potentials are only communicated
             //    at the start of the time step, see beginTimeStep(). Here, we assume those
             //    potentials remain unchanged during the time step when updating guide rates below.
             this->guide_rate_handler_.updateGuideRates(
                 reportStepIdx, simulationTime, this->wellState(), this->groupState()
             );
+            last_report_.group_control_time += guideRateTimer.stop();
         }
         // we need to re-iterate the network when the well group controls changed or gaslift/alq is changed or
         // the inner iterations are did not converge
@@ -1463,6 +1633,19 @@ namespace Opm {
     {
         for ( const auto& well: well_container_ ) {
             well->addWellContributions(jacobian);
+        }
+    }
+
+    template<typename TypeTag>
+    void
+    BlackoilWellModel<TypeTag>::addBCDMatrix(std::vector<BMatrix>& b_matrices,
+                                            std::vector<CMatrix>& c_matrices,
+                                            std::vector<DMatrix>& d_matrices,
+                                            Opm::SparseTable<int>& wcells) const
+    {
+        wcells.clear();
+        for ( const auto& well: well_container_ ) {
+            well->addBCDMatrix(b_matrices, c_matrices, d_matrices, wcells);
         }
     }
 
@@ -1647,11 +1830,29 @@ namespace Opm {
     updateWellControls(DeferredLogger& deferred_logger)
     {
         OPM_TIMEFUNCTION();
-        if (!this->wellsActive()) {
+        if (!this->wellsActive() && !this->isReservoirCouplingMaster()) {
             return false;
         }
         const int episodeIdx = simulator_.episodeIndex();
         const auto& comm = simulator_.vanguard().grid().comm();
+
+        // Convert WELDRAW drawdown limits into maximum production rates.
+        // Like the rate targets of wells under group control, these are
+        // only updated during the first NUPCOL iterations of each timestep
+        // and kept frozen for the remaining iterations.
+        {
+            const auto nupcol = this->schedule()[episodeIdx].nupcol();
+            const auto& iter_ctx = simulator_.problem().iterationContext();
+            if (iter_ctx.withinNupcol(nupcol)) {
+                OPM_BEGIN_PARALLEL_TRY_CATCH()
+                    for (const auto& well : well_container_) {
+                        well->updateWeldrawMaxRate(simulator_, this->wellState(), deferred_logger);
+                    }
+                OPM_END_PARALLEL_TRY_CATCH("BlackoilWellModel: updating WELDRAW rate limits failed: ",
+                                           simulator_.gridView().comm());
+            }
+        }
+
         size_t iter = 0;
         bool changed_well_group = false;
         const Group& fieldGroup = this->schedule().getGroup("FIELD", episodeIdx);
@@ -1756,15 +1957,6 @@ namespace Opm {
                         const int reportStepIdx)
     {
         OPM_TIMEFUNCTION();
-        // Reservoir coupling: a master group's control and target are assigned
-        // by RescoupConstraintsCalculator at the start of each sync step and
-        // must be treated as read-only for the remainder of the step.  Skip
-        // higher-level and individual-control checks so they don't override
-        // the assigned state.  Master groups have no subordinate wells or
-        // groups, so no recursion is needed.
-        if (this->isReservoirCouplingMasterGroup(group.name())) {
-            return false;
-        }
         const auto& iterCtx = simulator_.problem().iterationContext();
         bool changed = false;
         // restrict the number of group switches but only after nupcol iterations.
@@ -1821,8 +2013,11 @@ namespace Opm {
             well->updateWellTestState(this->wellState().well(wname),
                                       simulationTime,
                                       /*writeMessageToOPMLog=*/ true,
+                                      /*during_well_test=*/ false,
                                       under_zero_target,
                                       wellTestState,
+                                      this->eclipseState().getUnits(),
+                                      this->schedule().getStartTime(),
                                       local_deferredLogger);
 
             if (!wasClosed && wellTestState.well_is_closed(wname)) {
@@ -2092,6 +2287,9 @@ namespace Opm {
     int
     BlackoilWellModel<TypeTag>::numConservationQuantities() const
     {
+        // TODO: energy is also a conservation equation, so numConservationQuantities()
+        // may need refactoring once it is enabled outside MSW.
+
         // The numPhases() functions returns 1-3, depending on which
         // of the (oil, water, gas) phases are active. For each of those phases,
         // if the phase is active the corresponding component is present and
@@ -2329,6 +2527,13 @@ namespace Opm {
         if (!is_final) {
             this->updateAndCommunicateGroupData(reportStepIdx, /*update_wellgrouptarget=*/false);
             this->rescoupHelper_.sendSlaveGroupDataToMaster();
+            // The master turns the rates just sent into fresh injection targets
+            // for the groups it controls through a derived GCONINJE mode, and
+            // sends them straight back.  See
+            // BlackoilWellModelRescoup::refreshAndSendInjectionTargets_().
+            this->rescoupHelper_.receiveGroupConstraintsFromMaster();
+            // The targets in force, and the UDQs built on them, follow suit.
+            this->rescoupHelper_.refreshSlaveGroupTargets();
             return /*more_network_update=*/true;
         }
         return /*more_network_update=*/false;

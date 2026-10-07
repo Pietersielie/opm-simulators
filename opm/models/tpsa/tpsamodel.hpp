@@ -32,6 +32,8 @@
 
 #include <opm/grid/utility/ElementChunks.hpp>
 
+#include <opm/common/utility/SymmTensor.hpp>
+#include <opm/common/utility/VoigtArray.hpp>
 #include <opm/material/common/MathToolbox.hpp>
 
 #include <opm/models/parallel/threadmanager.hpp>
@@ -77,7 +79,8 @@ class TpsaModel
     using MaterialState = MaterialStateTPSA<Evaluation>;
 
     using DimVector = Dune::FieldVector<Scalar, dimWorld>;
-    using SymTensor = Dune::FieldVector<Scalar, 6>;
+    using SymTensor = SymmTensor<Scalar>;
+    using PotForceVector = Dune::BlockVector<Scalar>;
 
 public:
     /*!
@@ -179,6 +182,10 @@ public:
         for (unsigned timeIdx = 0; timeIdx < historySize; ++timeIdx) {
             solution_[timeIdx] = std::make_unique<TpsaBlockVectorWrapper>("solution", numDof);
         }
+
+        // Initialize potential force vectors
+        mechPotPresForce_.resize(numDof);
+        mechPotTempForce_.resize(numDof);
     }
 
     /*!
@@ -423,17 +430,40 @@ public:
     }
 
     /*!
-    * \brief Output (del?)stress tensor
+    * \brief Output rotation vector
     *
     * \param globalIdx Cell index
-    * \returns (Del?)stress tensor (Voigt notation) at grid cell
-    *
-    * \note Needed in OutputBlackOilModule, but zero for now!
+    * \returns Rotation vector at grid cell
     */
-    SymTensor delstress(const unsigned /*globalIdx*/) const
+    DimVector rotation(const unsigned globalIdx) const
     {
-        SymTensor val;
-        return val;
+        DimVector rot;
+        for (std::size_t i = 0; i < 3; ++i) {
+            rot[i] = decay<Scalar>(materialState_[globalIdx].rotation(i));
+        }
+        return rot;
+    }
+
+    /*!
+     * \brief Output solid pressure
+     *
+     * \param globalIdx Cell index
+     * \return Solid pressure at grid cell
+     */
+    Scalar solidPressure(const unsigned globalIdx) const
+    {
+        return decay<Scalar>(materialState_[globalIdx].solidPressure());
+    }
+
+    /*!
+    * \brief Output stress tensor without fracture contribution
+    *
+    * \param globalIdx Cell index
+    * \returns Stress tensor (Voigt notation) at grid cell
+    */
+    SymTensor delstress(const unsigned globalIdx) const
+    {
+        return stress(globalIdx, false);
     }
 
     /*!
@@ -453,15 +483,21 @@ public:
     /*!
     * \brief Output linear stress tensor
     *
+    * Linear stress equals the C*strain part of the stress tensor, where C is the stiffness tensor
+    *
     * \param globalIdx Cell index
     * \returns Linear stress tensor (Voigt notation) at grid cell
-    *
-    * \note Needed in OutputBlackOilModule, but zero for now!
     */
-    SymTensor linstress(const unsigned /*globalIdx*/) const
+    SymTensor linstress(const unsigned globalIdx) const
     {
-        SymTensor val;
-        return val;
+        // Subtract the potential forces from pressure and temperature from the main diagonal of
+        // the total stress
+        SymTensor linStressTensor = stress(globalIdx, false);
+        const auto potForce = mechPotentialForce(globalIdx);
+        for (const auto& dirIdx : SymTensor::diag_indices) {
+            linStressTensor[dirIdx] -= potForce;
+        }
+        return -1.0 * linStressTensor;
     }
 
     /*!
@@ -558,14 +594,55 @@ public:
 
             // Reconstructed stress tensor at cell center
             const auto& stress = lsq.x();
-            stressOutput[0] = stress[0]; // XX
-            stressOutput[1] = stress[1]; // YY
-            stressOutput[2] = stress[2]; // ZZ
-            stressOutput[3] = stress[5]; // YZ
-            stressOutput[4] = stress[4]; // XZ
-            stressOutput[5] = stress[3]; // XY
+            stressOutput[VoigtIndex::XX] = stress[0]; // XX
+            stressOutput[VoigtIndex::YY] = stress[1]; // YY
+            stressOutput[VoigtIndex::ZZ] = stress[2]; // ZZ
+            stressOutput[VoigtIndex::YZ] = stress[5]; // YZ
+            stressOutput[VoigtIndex::XZ] = stress[4]; // XZ
+            stressOutput[VoigtIndex::XY] = stress[3]; // XY
         }
         return stressOutput;
+    }
+
+    /*!
+    * \brief Output traction vector for each of the 6 face directions
+    *
+    * \param globalIdx Cell index
+    * \returns Traction vector (force per area) for each face direction (X-, X+, Y-, Y+, Z-, Z+)
+    * at grid cell
+    *
+    * \warning NNC are not implemented with TPSA, therefore traction on NNC faces is not output!
+    */
+    std::array<DimVector, 6> traction(const unsigned globalIdx) const
+    {
+        std::array<DimVector, 6> tractionOutput{};
+        const auto& stressInfo = linearizer_->getStressInfo();
+        if (stressInfo.empty()) {
+            return tractionOutput;
+        }
+
+        // Average traction (force per area) over all face entries sharing the same face
+        // direction, consistent with the face-area weighting used in stress().
+        std::array<Scalar, 6> sumFaceArea{};
+        for (const auto& faceStressInfo : stressInfo[globalIdx]) {
+            const auto faceId = faceStressInfo.faceId;
+
+            // OBS: NNC faces are not added, since TPSA does not handle NNC connections yet!
+            if (faceId < 0 || faceStressInfo.faceArea == 0.0) {
+                continue;
+            }
+
+            tractionOutput[faceId] += faceStressInfo.traction;
+            sumFaceArea[faceId] += faceStressInfo.faceArea;
+        }
+
+        for (std::size_t faceId = 0; faceId < 6; ++faceId) {
+            if (sumFaceArea[faceId] > 0.0) {
+                tractionOutput[faceId] /= sumFaceArea[faceId];
+            }
+        }
+
+        return tractionOutput;
     }
 
     /*!
@@ -574,26 +651,46 @@ public:
     * \param globalIdx Cell index
     * \param with_fracture Boolean to activate fracture output
     * \returns Strain tensor (Voigt notation) at grid cell
-    *
-    * \note Needed in OutputBlackOilModule, but zero for now!
     */
-    SymTensor strain(const unsigned /*globalIdx*/, const bool /*with_fracture*/) const
+    SymTensor strain(const unsigned globalIdx, const bool /*with_fracture*/) const
     {
-        SymTensor val;
-        return val;
+        // Deviatoric stress
+        auto stressDev = this->linstress(globalIdx);
+        Scalar traceStress = 1.0 / 3.0 * stressDev.trace();
+        stressDev[VoigtIndex::XX] -= traceStress;
+        stressDev[VoigtIndex::YY] -= traceStress;
+        stressDev[VoigtIndex::ZZ] -= traceStress;
+
+        // Deviatoric strain
+        auto& problem = simulator_.problem();
+        const auto sMod = problem.shearModulus(globalIdx);
+        SymTensor strainDev = 1.0 / (2.0 * sMod) * stressDev;
+
+        // Volumetric strain
+        const auto lameParam = problem.lame(globalIdx);
+        Scalar strainVolTerm = traceStress / (3.0 * lameParam + 2 * sMod);
+
+        SymTensor strainVol;
+        strainVol[VoigtIndex::XX] = strainVolTerm;
+        strainVol[VoigtIndex::YY] = strainVolTerm;
+        strainVol[VoigtIndex::ZZ] = strainVolTerm;
+
+        // Total
+        SymTensor strainOutput = strainDev + strainVol;
+        return strainOutput;
     }
 
     /*!
-    * \brief Output potential forces
+    * \brief Output total potential forces
+    *
+    * This is the sum of pressure and temperature potential forces
     *
     * \param globalIdx Cell index
     * \returns Potential forces at grid cell
-    *
-    * \note Needed in OutputBlackOilModule, but zero for now!
     */
-    Scalar mechPotentialForce(unsigned /*globalIdx*/) const
+    Scalar mechPotentialForce(unsigned globalIdx) const
     {
-        return Scalar(0.0);
+        return mechPotentialPressForce(globalIdx) + mechPotentialTempForce(globalIdx);
     }
 
     /*!
@@ -601,12 +698,21 @@ public:
     *
     * \param globalIdx Cell index
     * \returns Potential pressure forces at grid cell
-    *
-    * \note Needed in OutputBlackOilModule, but zero for now!
     */
-    Scalar mechPotentialPressForce(unsigned /*globalIdx*/) const
+    Scalar mechPotentialPressForce(unsigned globalIdx) const
     {
-        return Scalar(0.0);
+        return mechPotPresForce_[globalIdx];
+    }
+
+    /*!
+    * \brief Sets potential pressure force
+    *
+    * \param globalIdx Cell index
+    * \param val Potential pressure force at grid cell
+    */
+    void setMechPotentialPressForce(unsigned globalIdx, Scalar val)
+    {
+        mechPotPresForce_[globalIdx] = val;
     }
 
     /*!
@@ -614,12 +720,21 @@ public:
     *
     * \param globalIdx Cell index
     * \returns Potential temperature forces at grid cell
-    *
-    * \note Needed in OutputBlackOilModule, but zero for now!
     */
-    Scalar mechPotentialTempForce(unsigned /*globalIdx*/) const
+    Scalar mechPotentialTempForce(unsigned globalIdx) const
     {
-        return Scalar(0.0);
+        return mechPotTempForce_[globalIdx];
+    }
+
+    /*!
+    * \brief Sets potential temperature force
+    *
+    * \param globalIdx Cell index
+    * \param val Potential temperature force at grid cell
+    */
+    void setMechPotentialTempForce(unsigned globalIdx, Scalar val)
+    {
+        mechPotTempForce_[globalIdx] = val;
     }
 
 protected:
@@ -668,6 +783,8 @@ private:
     std::array<std::unique_ptr<TpsaBlockVectorWrapper>, historySize> solution_;
     std::vector<Scalar> eqWeights_;
     std::vector<MaterialState> materialState_;
+    PotForceVector mechPotPresForce_;
+    PotForceVector mechPotTempForce_;
 };  // class TpsaModel
 
 }  // namespace Opm

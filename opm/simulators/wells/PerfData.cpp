@@ -33,6 +33,7 @@ PerfData<Scalar>::PerfData(const std::size_t num_perf,
                            const std::size_t num_phases)
     : injector(injector_)
     , pressure(num_perf)
+    , temperature(num_perf)
     , rates(num_perf)
     , phase_rates(num_perf * num_phases)
     , phase_mixing_rates(num_perf)
@@ -67,6 +68,9 @@ void PerfData<Scalar>::prepareInjectorContainers()
     this->skin_pressure.resize(num_perf);
     this->water_velocity.resize(num_perf);
     this->filtrate_data.resize(num_perf);
+    // fracture_data is deliberately not sized here: a fracture model calls
+    // resize() when it has something to store, so a run without one pays
+    // nothing.  Everything reading it must tolerate the empty state.
 }
 
 template<class Scalar>
@@ -75,6 +79,7 @@ PerfData<Scalar> PerfData<Scalar>::serializationTestObject()
     PerfData result;
     result.injector = true;
     result.pressure = {2.0, 3.0, 4.0};
+    result.temperature = {345.};
     result.rates = {5.0, 6.0};
     result.phase_rates = {7.0};
     result.phase_mixing_rates = { {1.0, 2.0, 3.0, 4.0}};
@@ -97,6 +102,7 @@ PerfData<Scalar> PerfData<Scalar>::serializationTestObject()
     result.skin_pressure = {27.0, 28.0};
     result.water_velocity = {29.0, 30.0};
     result.filtrate_data = ConnFiltrateData<Scalar>::serializationTestObject();
+    result.fracture_data = ConnFractureData<Scalar>::serializationTestObject();
     result.connFracStatistics.assign(3, ConnFracStatistics<Scalar>::serializationTestObject());
     result.gas_mass_rates = {31.0};
     result.wat_mass_rates = {32.0};
@@ -128,6 +134,7 @@ bool PerfData<Scalar>::try_assign(const PerfData& other)
     }
 
     this->pressure = other.pressure;
+    this->temperature = other.temperature;
     this->rates = other.rates;
     this->phase_rates = other.phase_rates;
     this->phase_mixing_rates = other.phase_mixing_rates;
@@ -142,6 +149,7 @@ bool PerfData<Scalar>::try_assign(const PerfData& other)
     this->skin_pressure = other.skin_pressure;
     this->water_velocity = other.water_velocity;
     this->filtrate_data = other.filtrate_data;
+    this->fracture_data = other.fracture_data;
     this->connFracStatistics = other.connFracStatistics;
     this->gas_mass_rates = other.gas_mass_rates;
     this->wat_mass_rates = other.wat_mass_rates;
@@ -154,6 +162,7 @@ bool PerfData<Scalar>::operator==(const PerfData& rhs) const
 {
     return (this->injector == rhs.injector)
         && (this->pressure == rhs.pressure)
+        && (this->temperature == rhs.temperature)
         && (this->rates == rhs.rates)
         && (this->phase_rates == rhs.phase_rates)
         && (this->phase_mixing_rates == rhs.phase_mixing_rates)
@@ -176,6 +185,7 @@ bool PerfData<Scalar>::operator==(const PerfData& rhs) const
         && (this->skin_pressure == rhs.skin_pressure)
         && (this->water_velocity == rhs.water_velocity)
         && (this->filtrate_data == rhs.filtrate_data)
+        && (this->fracture_data == rhs.fracture_data)
         && (this->connFracStatistics == rhs.connFracStatistics)
         && (this->gas_mass_rates == rhs.gas_mass_rates)
         && (this->wat_mass_rates == rhs.wat_mass_rates)

@@ -21,6 +21,7 @@
 #define OPM_PERFDATA_HEADER_INCLUDED
 
 #include <opm/simulators/wells/ConnFiltrateData.hpp>
+#include <opm/simulators/wells/ConnFractureData.hpp>
 #include <opm/simulators/wells/ConnFracStatistics.hpp>
 
 #include <cstddef>
@@ -57,6 +58,7 @@ public:
     {
         serializer(injector);
         serializer(pressure);
+        serializer(temperature);
         serializer(rates);
         serializer(phase_rates);
         serializer(phase_mixing_rates);
@@ -79,6 +81,7 @@ public:
         serializer(skin_pressure);
         serializer(water_velocity);
         serializer(filtrate_data);
+        serializer(fracture_data);
         serializer(connFracStatistics);
         serializer(gas_mass_rates);
         serializer(wat_mass_rates);
@@ -93,6 +96,7 @@ public:
     // result, e.g., a flow rate, then please update try_assign() as well.
 
     std::vector<Scalar> pressure{};
+    std::vector<Scalar> temperature{};
     std::vector<Scalar> rates{};
     std::vector<Scalar> phase_rates{};
     std::vector<std::array<Scalar,4>> phase_mixing_rates{};
@@ -121,6 +125,7 @@ public:
     std::vector<Scalar> water_velocity{};
 
     ConnFiltrateData<Scalar> filtrate_data{};
+    ConnFractureData<Scalar> fracture_data{};
     std::vector<ConnFracStatistics<Scalar>> connFracStatistics{};
 };
 

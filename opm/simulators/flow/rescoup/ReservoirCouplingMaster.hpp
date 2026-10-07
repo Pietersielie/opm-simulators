@@ -24,12 +24,16 @@
 #include <opm/simulators/flow/rescoup/ReservoirCoupling.hpp>
 #include <opm/simulators/flow/rescoup/ReservoirCouplingMasterReportStep.hpp>
 #include <opm/simulators/flow/rescoup/ReservoirCouplingTimeStepper.hpp>
+#include <opm/input/eclipse/EclipseState/Phase.hpp>
 #include <opm/input/eclipse/Schedule/Schedule.hpp>
 #include <opm/common/OpmLog/OpmLog.hpp>
 
 #include <mpi.h>
 
 #include <filesystem>
+#include <map>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace Opm {
@@ -79,10 +83,36 @@ public:
         this->effective_gcw_[group_name] = value;
     }
 
-    /// @brief Clear all effective-GCW entries.  Call at the start of each
-    ///   master-group constraint calculation before any entries are set, so stale
-    ///   caps from a previous sync step do not leak in.
-    void resetEffectiveGCW() { this->effective_gcw_.clear(); }
+    /// @brief Effective group-controlled-wells (GCW) count for a master group in
+    ///   the injection guide-rate distribution of one phase.
+    /// @details The injection counterpart of effectiveGCW().  A master group that
+    ///   is available for higher-level injection control (GCONINJE item 8 = YES)
+    ///   defaults to 1, so it is counted in its parent's injection guide-rate sum
+    ///   for that phase even while on individual control; it is set to 0 when its
+    ///   target for the phase is capped at its slave's injection potential, or
+    ///   when its slave is inactive.
+    /// @return The stored effective GCW, or 1 if the group has no explicit entry
+    ///   for the phase (the participating-and-uncapped default).
+    int effectiveInjectionGCW(const std::string& group_name, Phase phase) const {
+        const auto it = this->effective_injection_gcw_.find({group_name, phase});
+        return (it == this->effective_injection_gcw_.end()) ? 1 : it->second;
+    }
+    void setEffectiveInjectionGCW(const std::string& group_name, Phase phase, int value) {
+        this->effective_injection_gcw_[{group_name, phase}] = value;
+    }
+
+    /// @brief Clear all effective-GCW entries, production and injection.  Call at
+    ///   the start of each master-group constraint calculation before any entries
+    ///   are set, so stale caps from a previous sync step do not leak in.
+    void resetEffectiveGCW() {
+        this->effective_gcw_.clear();
+        this->resetEffectiveInjectionGCW();
+    }
+
+    /// @brief Clear the injection effective-GCW entries only, keeping the
+    ///   production ones.  Used when the injection targets are recomputed within
+    ///   a sync step while the production caps decided earlier stay in force.
+    void resetEffectiveInjectionGCW() { this->effective_injection_gcw_.clear(); }
 
     double getActivationDate() const { return this->activation_date_; }
     int getArgc() const { return this->argc_; }
@@ -125,6 +155,7 @@ public:
     std::map<std::string, std::vector<std::string>> &getSlaveNameToMasterGroupsMap() {
         return this->slave_name_to_master_groups_map_;
     }
+    const Potentials& getSlaveGroupInjectionPotentials(const std::string &master_group_name);
     const Potentials& getSlaveGroupPotentials(const std::string &master_group_name);
     int getSlaveIdx(const std::string &slave_name) const;
     const std::string &getSlaveName(int index) const { return this->slave_names_[index]; }
@@ -157,7 +188,11 @@ public:
     std::size_t numSlaveGroups(unsigned int index);
     std::size_t numSlaves() const { return this->numSlavesStarted(); }
     std::size_t numSlavesStarted() const;
-    std::size_t numActivatedSlaves() const;
+
+    /// @brief Number of slaves that currently take part in the coupling.
+    /// @details Counts the slaves for which slaveIsCoupled() holds, i.e. activated and not
+    ///   yet ended.
+    std::size_t numCoupledSlaves() const;
     void rebuildSlaveIdxToMasterGroupsVector();
     void receiveNextReportDateFromSlaves();
     void receiveProductionDataFromSlaves();
@@ -216,7 +251,43 @@ public:
     void setSlaveActivationDate(int index, double date) { this->slave_activation_dates_[index] = date; }
     void setSlaveNextReportTimeOffset(int index, double offset);
     void setSlaveStartDate(int index, std::time_t date) { this->slave_start_dates_[index] = date; }
+    /// @brief Whether the slave has completed its activation handshake with the master.
+    /// @details Monotonic: once true it never becomes false again, not even when the slave
+    ///   later reaches the end of its own schedule.  Callers that ask "does this slave take
+    ///   part in the coupling right now?" want slaveIsCoupled() instead.
     bool slaveIsActivated(int index) const { return this->slave_activation_status_[index] != 0; }
+
+    /// @brief Whether the slave has reached the end of its own schedule and left the coupling.
+    /// @details A slave whose deck runs out of report steps before the master's does notifies
+    ///   the master, and the two disconnect their intercommunicator.  From that point on the
+    ///   master must not communicate with the slave, and must treat the slave's master groups
+    ///   as producing and injecting nothing.
+    /// @param index Index of the slave process.
+    /// @return true once the slave has notified the master that its run has ended.
+    bool slaveHasEnded(int index) const
+    {
+        return (static_cast<std::size_t>(index) < this->slave_ended_.size())
+            && (this->slave_ended_[index] != 0);
+    }
+
+    /// @brief Whether the slave currently takes part in the coupling.
+    /// @details True only for a slave that has activated and has not ended.  This is the
+    ///   predicate to use before any master-slave message exchange, and before letting a
+    ///   master group contribute rates, potentials or guide rates: a slave that is not
+    ///   coupled contributes zeros.
+    bool slaveIsCoupled(int index) const
+    {
+        return this->slaveIsActivated(index) && !this->slaveHasEnded(index);
+    }
+
+    /// @brief Record that a slave has ended, and close its intercommunicator.
+    /// @details Must be called on **every** master rank, because MPI_Comm_disconnect() is
+    ///   collective over the whole intercommunicator.  Rank 0 additionally sends the
+    ///   acknowledging terminate signal the slave is waiting for.  After this call
+    ///   slaveIsCoupled() returns false for the slave and no further message may be sent to
+    ///   it or received from it.
+    /// @param index Index of the slave process that has ended.
+    void markSlaveEndedAndDisconnect(int index);
 
     /// @brief Whether the master syncs with slaves at slave report-step boundaries
     ///        (true) or at every master actual time step (false, default CLI flag value).
@@ -280,12 +351,22 @@ private:
     // Reset and repopulated on each master-group constraint calculation.
     std::map<std::string, int> effective_gcw_;
 
+    // Effective group-controlled-wells count per (master group, injection phase),
+    // the injection counterpart of effective_gcw_ (see effectiveInjectionGCW()).
+    std::map<std::pair<std::string, Phase>, int> effective_injection_gcw_;
+
     mutable ReservoirCoupling::Logger logger_;
 
     // Whether the slave has activated. Unfortunatley, we cannot use std::vector<bool> since
     // it is not supported to get a pointer to the underlying array of bools needed
     // with MPI broadcast().
     std::vector<std::uint8_t> slave_activation_status_;
+
+    // Whether the slave has reached the end of its own schedule and disconnected. Same
+    // std::uint8_t-instead-of-bool reasoning as slave_activation_status_ above: the value is
+    // derived on every rank from the broadcast next-report-date vector, so it must be a plain
+    // array of bytes.
+    std::vector<std::uint8_t> slave_ended_;
 
     // A mapping from master group names to slave names
     std::map<std::string, std::string> master_group_slave_names_;

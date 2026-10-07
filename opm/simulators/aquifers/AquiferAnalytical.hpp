@@ -163,6 +163,18 @@ public:
                                    this->simulator_.vanguard().grid().comm());
     }
 
+    // Tracer assembly only: scalar readout after the flow step. Never call
+    // calculateInflowRate() here (mutates Carter–Tracy state after endTimeStep).
+    Scalar cachedConnectionInfluxRate(unsigned cellIdx) const override
+    {
+        const int idx = this->cellToConnectionIdx_[cellIdx];
+        if (idx < 0) {
+            return Scalar{0};
+        }
+
+        return getValue(this->Qai_[idx]);
+    }
+
     void addToSource(RateVector& rates,
                      const unsigned cellIdx,
                      const unsigned timeIdx) override
@@ -179,7 +191,9 @@ public:
         this->updateCellPressure(this->pressure_current_, idx, intQuants);
         this->calculateInflowRate(idx, this->simulator_);
 
-        rates[BlackoilIndices::conti0EqIdx + compIdx_()]
+        // Qai_[idx] is Evaluation: must not pass through getValue() or Newton loses
+        // pressure derivatives and the aquifer source becomes explicit.
+        rates[BlackoilIndices::conti0EqIdx + this->activeCompIdx_]
             += this->Qai_[idx] / model.dofTotalVolume(cellIdx);
 
         if constexpr (energyModuleType == EnergyModules::FullyImplicitThermal) {
@@ -196,7 +210,7 @@ public:
                 fs.setEnthalpy(this->phaseIdx_(), h);
             }
             rates[BlackoilIndices::contiEnergyEqIdx]
-            += this->Qai_[idx] *fs.enthalpy(this->phaseIdx_()) * FluidSystem::referenceDensity( this->phaseIdx_(), intQuants.pvtRegionIndex()) / model.dofTotalVolume(cellIdx);
+            += this->Qai_[idx] * fs.enthalpy(this->phaseIdx_()) * FluidSystem::referenceDensity(this->phaseIdx_(), intQuants.pvtRegionIndex()) / model.dofTotalVolume(cellIdx);
 
         }
     }
@@ -235,14 +249,6 @@ protected:
     Scalar gravity_() const
     {
         return this->simulator_.problem().gravity()[2];
-    }
-
-    int compIdx_() const
-    {
-        if (this->co2store_or_h2store_())
-            return FluidSystem::oilCompIdx;
-
-        return FluidSystem::waterCompIdx;
     }
 
     void initQuantities()

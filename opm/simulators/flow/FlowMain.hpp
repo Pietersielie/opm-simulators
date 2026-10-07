@@ -26,9 +26,11 @@
 #include <opm/input/eclipse/EclipseState/IOConfig/IOConfig.hpp>
 #include <opm/input/eclipse/EclipseState/InitConfig/InitConfig.hpp>
 
+#include <opm/models/ptflash/flashparameters.hh>
 #include <opm/models/utils/start.hh>
 
 #include <opm/simulators/flow/Banners.hpp>
+#include <opm/simulators/flow/ConvergenceOutputConfiguration.hpp>
 #include <opm/simulators/flow/FlowUtils.hpp>
 #include <opm/simulators/flow/NlddReporting.hpp>
 #include <opm/simulators/flow/SimulatorFullyImplicit.hpp>
@@ -53,6 +55,8 @@ namespace Opm::Parameters {
 // Do not merge parallel output files or warn about them
 struct EnableLoggingFalloutWarning { static constexpr bool value = false; };
 struct OutputInterval { static constexpr int value = 1; };
+// Stop after this report step; negative means run to the end of the schedule
+struct EndStep { static constexpr int value = -1; };
 // Set global debug verbosity level
 struct DebugVerbosityLevel { static constexpr int value = 1; };
 } // namespace Opm::Parameters
@@ -60,6 +64,21 @@ struct DebugVerbosityLevel { static constexpr int value = 1; };
 namespace Opm {
 
     class Deck;
+
+    namespace detail
+    {
+
+        inline bool allRanksDebugLoggingEnabled()
+        {
+            // FlashVerbosity is only registered by compositional models, so neither
+            // query may insist on prior registration: IsSet() only looks for a
+            // user-supplied value, and Get() must read it without the registry.
+            return Parameters::Get<Parameters::EnableLoggingFalloutWarning>()
+                || (Parameters::IsSet<Parameters::FlashVerbosity>(false)
+                    && (Parameters::Get<Parameters::FlashVerbosity>(false) > 0));
+        }
+
+    } // namespace detail
 
     // The FlowMain class is the standard fully implicit flow simulator.
     template <class TypeTag>
@@ -104,6 +123,9 @@ namespace Opm {
                  "In that case it will be appended to the *.DBG or *.PRT files");
             Parameters::Register<Parameters::DebugVerbosityLevel>
                 ("Set debug verbosity level globally. Default is 1, increasing values give additional output and 0 disables most messages to the .DBG file");
+            Parameters::Register<Parameters::EndStep>
+                ("Stop the simulation after this report step. "
+                 "A negative value runs to the end of the schedule");
 
             // register the base parameters
             registerAllParameters_<TypeTag>(/*finalizeRegistration=*/false);
@@ -208,6 +230,15 @@ namespace Opm {
         SimulatorTimer* getSimTimer()
         {
             return simtimer_.get();
+        }
+
+        /// The report-step driver, for callers that step the simulation
+        /// themselves via executeStep() and need to configure it -- e.g. to
+        /// install a SimulatorFullyImplicit::setRestoreStateHook. Null until
+        /// executeInitStep() has run.
+        Simulator* getStepDriverPtr()
+        {
+            return simulator_.get();
         }
 
         /// Get the size of the previous report step
@@ -342,7 +373,7 @@ namespace Opm {
 
             detail::mergeParallelLogFiles(eclState().getIOConfig().getOutputDir(),
                                           Parameters::Get<Parameters::EclDeckFileName>(),
-                                          Parameters::Get<Parameters::EnableLoggingFalloutWarning>());
+                                          detail::allRanksDebugLoggingEnabled());
         }
 
         void setupModelSimulator()
@@ -421,7 +452,14 @@ namespace Opm {
                 = omp_get_max_threads();
 #endif
 
-            printFlowTrailer(mpi_size_, threads, total_setup_time_, deck_read_time_, report);
+            const auto extraConvOutput = ConvergenceOutputConfiguration {
+                Parameters::Get<Parameters::OutputExtraConvergenceInfo>(),
+                R"(OutputExtraConvergenceInfo (--output-extra-convergence-info))"
+            };
+
+            printFlowTrailer(mpi_size_, threads, total_setup_time_, deck_read_time_, report,
+                             simulator_->model().simulator().problem().extraTrailerSummary(),
+                             extraConvOutput.want(ConvergenceOutputConfiguration::Option::Performance));
 
             detail::handleExtraConvergenceOutput(report,
                                                  Parameters::Get<Parameters::OutputExtraConvergenceInfo>(),
@@ -440,7 +478,9 @@ namespace Opm {
 
             // initialize variables
             const auto& initConfig = eclState().getInitConfig();
-            simtimer_->init(schedule, static_cast<std::size_t>(initConfig.getRestartStep()));
+            simtimer_->init(schedule,
+                            static_cast<std::size_t>(initConfig.getRestartStep()),
+                            Parameters::Get<Parameters::EndStep>());
 
             if (this->output_cout_) {
                 std::ostringstream oss;

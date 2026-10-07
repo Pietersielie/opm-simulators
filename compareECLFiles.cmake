@@ -81,6 +81,7 @@ function(add_test_compareECLFiles)
     FILENAME
     DEV_SIMULATOR
     SIMULATOR
+    REFERENCE_SIMULATOR
     ABS_TOL
     REL_TOL
     DIR
@@ -89,7 +90,7 @@ function(add_test_compareECLFiles)
     RESTART_STEP
     RESTART_SCHED
   )
-  set(multiValueArgs TEST_ARGS)
+  set(multiValueArgs TEST_ARGS TEST_ARGS_REPLAY)
   cmake_parse_arguments(PARAM "$" "${oneValueArgs}" "${multiValueArgs}" ${ARGN} )
   if(NOT PARAM_DIR)
     set(PARAM_DIR ${PARAM_CASENAME})
@@ -112,10 +113,17 @@ function(add_test_compareECLFiles)
   if(PARAM_RESTART_SCHED STREQUAL "false" OR PARAM_RESTART_SCHED STREQUAL "true")
     list(APPEND DRIVER_ARGS -h ${PARAM_RESTART_SCHED})
   endif()
-  list(APPEND DRIVER_ARGS -u ${PARAM_SIMULATOR})
+  set(reference_simulator ${PARAM_SIMULATOR})
+  if(PARAM_REFERENCE_SIMULATOR)
+    set(reference_simulator ${PARAM_REFERENCE_SIMULATOR})
+  endif()
+  list(APPEND DRIVER_ARGS -u ${reference_simulator})
   if(USE_DEV_SIMULATOR_IN_TESTS AND PARAM_DEV_SIMULATOR)
     set(PARAM_SIMULATOR ${PARAM_DEV_SIMULATOR})
   endif()
+  foreach(arg IN LISTS PARAM_TEST_ARGS_REPLAY)
+    list(APPEND DRIVER_ARGS -y ${arg})
+  endforeach()
   opm_add_test(${PARAM_PREFIX}_${PARAM_SIMULATOR}+${PARAM_FILENAME}
     EXE_TARGET
       ${PARAM_SIMULATOR}
@@ -151,6 +159,7 @@ function(add_test_compareSeparateECLFiles)
     DIR2
     DEV_SIMULATOR
     SIMULATOR
+    REFERENCE_SIMULATOR
     ABS_TOL
     REL_TOL
     IGNORE_EXTRA_KW
@@ -283,6 +292,7 @@ function(add_test_compare_parallel_simulation)
     DIR
     POSTFIX
     MPI_PROCS
+    COMPARE_MODE
   )
   set(multiValueArgs TEST_ARGS)
   cmake_parse_arguments(PARAM "$" "${oneValueArgs}" "${multiValueArgs}" ${ARGN} )
@@ -307,6 +317,18 @@ function(add_test_compare_parallel_simulation)
     set(PARAM_SIMULATOR ${PARAM_DEV_SIMULATOR})
   endif()
 
+  # COMPARE_MODE "init": dry-run, compares EGRID+INIT only (parallel INIT-file regressions,
+  # e.g. parallel LGR transmissibility). Default (unset): full run, compares SMRY+UNRST as
+  # well as EGRID+INIT.
+  if(PARAM_COMPARE_MODE STREQUAL "init")
+    set(TEST_NAME_PREFIX compareParallelInitSim_)
+  elseif(PARAM_COMPARE_MODE)
+    message(FATAL_ERROR "add_test_compare_parallel_simulation(${PARAM_CASENAME}): "
+                        "unknown COMPARE_MODE '${PARAM_COMPARE_MODE}' (expected 'init' or unset)")
+  else()
+    set(TEST_NAME_PREFIX compareParallelSim_)
+  endif()
+
   if(MPIEXEC_MAX_NUMPROCS GREATER_EQUAL MPI_PROCS)
     # Local computer system has at least ${MPI_PROCS} CPUs. Register test.
     set(RESULT_PATH ${BASE_RESULT_PATH}/parallel/${PARAM_SIMULATOR}+${PARAM_CASENAME})
@@ -319,9 +341,12 @@ function(add_test_compare_parallel_simulation)
                     -t ${PARAM_REL_TOL}
                     -c $<TARGET_FILE:compareECL>
                     -n ${MPI_PROCS})
+    if(PARAM_COMPARE_MODE STREQUAL "init")
+      list(APPEND DRIVER_ARGS -m init)
+    endif()
 
     # Add test that runs flow_mpi and outputs the results to file
-    opm_add_test(compareParallelSim_${PARAM_SIMULATOR}+${PARAM_FILENAME}${PARAM_POSTFIX}
+    opm_add_test(${TEST_NAME_PREFIX}${PARAM_SIMULATOR}+${PARAM_FILENAME}${PARAM_POSTFIX}
       EXE_TARGET
         ${PARAM_SIMULATOR}
       DRIVER_ARGS
@@ -329,7 +354,7 @@ function(add_test_compare_parallel_simulation)
       TEST_ARGS
         ${TEST_ARGS}
     )
-    set_tests_properties(compareParallelSim_${PARAM_SIMULATOR}+${PARAM_FILENAME}${PARAM_POSTFIX}
+    set_tests_properties(${TEST_NAME_PREFIX}${PARAM_SIMULATOR}+${PARAM_FILENAME}${PARAM_POSTFIX}
                          PROPERTIES PROCESSORS ${MPI_PROCS})
   endif()
 endfunction()
@@ -676,6 +701,16 @@ add_test_runSimulator(
     --enable-vtk-output=true
 )
 
+add_test_runSimulator(CASENAME 1dcompositional_flowexp_comp3_2p
+                      FILENAME 1D_COMP
+                      SIMULATOR flowexp_comp3_2p
+                      DIR compositional)
+
+add_test_runSimulator(CASENAME 1dcompositional_flow_comp3_2p
+                      FILENAME 1D_COMP
+                      SIMULATOR flow_comp3_2p
+                      DIR compositional)
+
 # Tests that are run based on simulator results, but not necessarily direct comparison to reference results
 add_test_runSimulator(
   CASENAME
@@ -739,6 +774,7 @@ endif ()
 include (${CMAKE_CURRENT_SOURCE_DIR}/regressionTests.cmake)
 include (${CMAKE_CURRENT_SOURCE_DIR}/comparisonTests.cmake)
 include (${CMAKE_CURRENT_SOURCE_DIR}/restartTests.cmake)
+include (${CMAKE_CURRENT_SOURCE_DIR}/rollbackTests.cmake)
 
 # PORV test
 opm_set_test_driver(${PROJECT_SOURCE_DIR}/tests/run-porv-acceptanceTest.sh "")

@@ -21,11 +21,19 @@
 #include "config.h"
 #endif // HAVE_CONFIG_H
 
+#include <cstddef>
 #include <string>
+#include <utility>
+#include <vector>
+
+#include <opm/simulators/flow/KeywordValidation.hpp>
+#include <opm/simulators/flow/ValidationFunctions.hpp>
+#include <opm/simulators/utils/FullySupportedFlowKeywords.hpp>
+#include <opm/simulators/utils/PartiallySupportedFlowKeywords.hpp>
+#include <opm/simulators/utils/UnsupportedFlowKeywords.hpp>
 
 #include <opm/input/eclipse/Deck/Deck.hpp>
 #include <opm/input/eclipse/Parser/Parser.hpp>
-#include <opm/simulators/flow/KeywordValidation.hpp>
 
 #define BOOST_TEST_MODULE KeywordValidatorTest
 
@@ -633,4 +641,292 @@ EQUIL
     BOOST_CHECK_EQUAL(errors.size(), 1);
     BOOST_CHECK(errors[0].item_number == 10);
     BOOST_CHECK(errors[0].item_value == "1");
+}
+
+
+namespace
+{
+
+// The validator built exactly as readDeckFile() builds it, so that the tests
+// below exercise the production tables rather than the synthetic ones above.
+KeywordValidator
+flowKeywordValidator()
+{
+    return KeywordValidator {
+        FlowKeywordValidation::unsupportedKeywords(),
+        SupportedKeywords {FlowKeywordValidation::partiallySupported<std::string>(),
+                           FlowKeywordValidation::partiallySupported<int>(),
+                           FlowKeywordValidation::partiallySupported<double>()},
+        SupportedKeywords {FlowKeywordValidation::fullySupported<std::string>(),
+                           FlowKeywordValidation::fullySupported<int>(),
+                           FlowKeywordValidation::fullySupported<double>()},
+        specialValidation()};
+}
+
+} // namespace
+
+
+BOOST_AUTO_TEST_CASE(compositional_keywords_are_not_flagged_as_unsupported)
+{
+    // These are consumed by the compositional simulator: COMPS and NCOMPS set
+    // the component count, and WELLSTRE/WINJGAS supply the injection stream
+    // composition. The production tables must not report them.
+    const auto keywords_string = std::string {R"(
+RUNSPEC
+COMPS
+  3 /
+PROPS
+NCOMPS
+  3 /
+SCHEDULE
+WELLSTRE
+  ISTR 1.0 0.0 0.0 /
+/
+WINJGAS
+  INJ STREAM ISTR /
+/
+)"};
+    const auto deck = Parser {}.parseString(keywords_string);
+    const auto validator = flowKeywordValidator();
+    std::vector<ValidationError> errors;
+    for (const auto* name : {"COMPS", "NCOMPS", "WELLSTRE", "WINJGAS"}) {
+        validator.validateDeckKeyword(deck[name].back(), errors);
+    }
+    BOOST_CHECK(get_error_report(errors, true, true).empty());
+}
+
+BOOST_AUTO_TEST_CASE(compositional_equil_item_11_validation)
+{
+    const auto validator = flowKeywordValidator();
+    const auto validateItem11 = [&validator](const std::string& item11) {
+        const auto keywords = std::string {R"(
+RUNSPEC
+COMPS
+  3 /
+EQLDIMS
+  1 /
+SOLUTION
+EQUIL
+  2000.0 200.0 2200.0 0.0 1500.0 0.0 3* 3 )"}
+            + item11 + " /\n";
+        const auto deck = Parser {}.parseString(keywords);
+        std::vector<ValidationError> errors;
+        validator.validateDeckKeyword(deck["EQUIL"].back(), errors);
+        return errors;
+    };
+
+    BOOST_CHECK(validateItem11("").empty());
+    BOOST_CHECK(validateItem11("1*").empty());
+    BOOST_CHECK(validateItem11("0").empty());
+    BOOST_CHECK(validateItem11("1").empty());
+
+    const auto errors = validateItem11("2");
+    BOOST_REQUIRE_EQUAL(errors.size(), 1);
+    BOOST_CHECK(errors.front().item_number == 11);
+    BOOST_REQUIRE(errors.front().user_message);
+    BOOST_CHECK_EQUAL(*errors.front().user_message,
+                      "EQUIL(COMP_NOT_SET_SAT_PRESSURE): must be defaulted/omitted or set to "
+                      "0 (reset when needed) or 1 (keep datum pressure)");
+}
+
+BOOST_AUTO_TEST_CASE(compositional_solution_method_keywords)
+{
+    const auto validator = flowKeywordValidator();
+
+    for (const auto* method : {"AIM", "IMPES"}) {
+        const auto deck = Parser {}.parseString(std::string{"RUNSPEC\n"} + method + "\n");
+        std::vector<ValidationError> errors;
+        validator.validateDeckKeyword(deck[method].back(), errors);
+
+        BOOST_REQUIRE_EQUAL(errors.size(), 1);
+        BOOST_CHECK(!errors.front().critical);
+        BOOST_CHECK_EQUAL(*errors.front().user_message,
+                          "Flow only supports the fully implicit method and will use it instead");
+    }
+
+    const auto deck = Parser {}.parseString("RUNSPEC\nFULLIMP\n");
+    std::vector<ValidationError> errors;
+    validator.validateDeckKeyword(deck["FULLIMP"].back(), errors);
+    BOOST_CHECK(errors.empty());
+}
+
+BOOST_AUTO_TEST_CASE(licenses_is_warned_about_but_not_critical)
+{
+    // Flow has no licence management, so LICENSES is ignored: every record
+    // shape must parse, and must be reported as a warning rather than stopping
+    // the run. Note that a bare terminator yields no records at all -- a
+    // slash-terminated keyword cannot hold an empty record.
+    const auto cases = std::vector<std::pair<std::string, std::vector<std::size_t>>> {
+        {"LICENSES\n/\n", {}},
+        {"LICENSES\n 'A' /\n/\n", {1}},
+        {"LICENSES\n 'A' /\n 'B' 'C' /\n 'D' 'E' 'F' /\n 'G' /\n/\n", {1, 2, 3, 1}},
+    };
+
+    const auto validator = flowKeywordValidator();
+    for (const auto& [keyword_string, feature_counts] : cases) {
+        BOOST_TEST_CONTEXT(keyword_string)
+        {
+            const auto deck = Parser {}.parseString("RUNSPEC\n" + keyword_string);
+            const auto& keyword = deck["LICENSES"].back();
+
+            BOOST_REQUIRE_EQUAL(keyword.size(), feature_counts.size());
+            for (std::size_t record = 0; record < feature_counts.size(); ++record) {
+                BOOST_CHECK_EQUAL(keyword.getRecord(record).getItem("FEATURES").data_size(),
+                                  feature_counts[record]);
+            }
+
+            std::vector<ValidationError> errors;
+            validator.validateDeckKeyword(keyword, errors);
+
+            BOOST_REQUIRE_EQUAL(errors.size(), 1);
+            BOOST_CHECK(!errors.front().critical);
+            BOOST_CHECK_EQUAL(*errors.front().user_message,
+                              "Flow does not check out licences, LICENSES is ignored");
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(cvcrit_is_warned_about_but_not_critical)
+{
+    const auto deck = Parser {}.parseString(R"(
+SCHEDULE
+CVCRIT
+  0.5 6 0.000001 20 /
+)");
+    std::vector<ValidationError> errors;
+    flowKeywordValidator().validateDeckKeyword(deck["CVCRIT"].back(), errors);
+
+    BOOST_REQUIRE_EQUAL(errors.size(), 1);
+    BOOST_CHECK(!errors.front().critical);
+}
+
+BOOST_AUTO_TEST_CASE(winjgas_makeup_gas_and_stage_items_are_flagged)
+{
+    // The WINJGAS handler ignores MAKEUPGAS and STAGE, so supplying them
+    // explicitly must still be reported.
+    const auto keywords_string = std::string {R"(
+SCHEDULE
+WINJGAS
+  INJ STREAM ISTR GASA 2 /
+/
+)"};
+    const auto deck = Parser {}.parseString(keywords_string);
+    const auto validator = flowKeywordValidator();
+    std::vector<ValidationError> errors;
+    validator.validateDeckKeyword(deck["WINJGAS"].back(), errors);
+    BOOST_CHECK_EQUAL(errors.size(), 2);
+}
+
+BOOST_AUTO_TEST_CASE(ginjgas_is_warned_about_but_not_critical)
+{
+    const auto deck = Parser {}.parseString(R"(
+SCHEDULE
+GINJGAS
+  'GI*' STREAM ISTR /
+/
+)");
+    std::vector<ValidationError> errors;
+    flowKeywordValidator().validateDeckKeyword(deck["GINJGAS"].back(), errors);
+
+    BOOST_REQUIRE_EQUAL(errors.size(), 1);
+    BOOST_CHECK(!errors.front().critical);
+}
+
+
+// PARACHOR is sized by TABDIMS, so a deck carrying it needs TABDIMS too.
+Deck compositionalPropsDeck(const std::string& props)
+{
+    return Parser {}.parseString(std::string {R"(
+RUNSPEC
+TABDIMS
+/
+PROPS
+)"} + props);
+}
+
+BOOST_AUTO_TEST_CASE(parachor_severity_follows_miscible)
+{
+    const auto validateParachor = [](const Deck& deck) {
+        std::vector<ValidationError> errors;
+        specialValidation().at("PARACHOR")(deck, deck["PARACHOR"].back(), errors);
+        return errors;
+    };
+
+    const auto body = std::string {"PARACHOR\n  74.92 192.74 390.4 /\n"};
+
+    // Without MISCIBLE the keyword is reported as a warning.
+    {
+        const auto errors = validateParachor(compositionalPropsDeck(body));
+        BOOST_REQUIRE_EQUAL(errors.size(), 1);
+        BOOST_CHECK(!errors[0].critical);
+        BOOST_REQUIRE(errors[0].user_message.has_value());
+        BOOST_CHECK(errors[0].user_message->find("not specified") != std::string::npos);
+    }
+
+    // A deck that also specifies MISCIBLE is the more likely to lean on the
+    // parachors, so there it is a critical error.
+    {
+        const auto deck = Parser {}.parseString(std::string {R"(
+RUNSPEC
+MISCIBLE
+/
+TABDIMS
+/
+PROPS
+)"} + body);
+        const auto errors = validateParachor(deck);
+        BOOST_REQUIRE_EQUAL(errors.size(), 1);
+        BOOST_CHECK(errors[0].critical);
+        BOOST_REQUIRE(errors[0].user_message.has_value());
+        BOOST_CHECK(errors[0].user_message->find("not supported") != std::string::npos);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(only_the_neutral_factli_multiplier_is_accepted)
+{
+    const auto validateFactli = [](const Deck& deck) {
+        std::vector<ValidationError> errors;
+        specialValidation().at("FACTLI")(deck, deck["FACTLI"].back(), errors);
+        return errors;
+    };
+
+    // The neutral multiplier is what flow already does, however it is spelled,
+    // and over however many equilibration regions.
+    for (const auto* body : {"FACTLI\n  1.0 /\n",
+                             "FACTLI\n  1*1.0 /\n",
+                             "FACTLI\n  1* /\n",
+                             "FACTLI\n  15*1.0 /\n",
+                             "FACTLI\n  15* /\n",
+                             "FACTLI\n  3*1.0 2* 4*1.0 /\n"}) {
+        BOOST_TEST_CONTEXT(body)
+        {
+            BOOST_CHECK(validateFactli(compositionalPropsDeck(body)).empty());
+        }
+    }
+
+    // Any other multiplier moves the oil/gas label of single phase cells, so it
+    // is a critical error rather than a warning - in whichever region it sits.
+    for (const auto* body : {"FACTLI\n  0.8 /\n",
+                             "FACTLI\n  0.8 14*1.0 /\n",
+                             "FACTLI\n  14*1.0 0.8 /\n",
+                             "FACTLI\n  7*1.0 1.3 7*1.0 /\n"}) {
+        BOOST_TEST_CONTEXT(body)
+        {
+            const auto errors = validateFactli(compositionalPropsDeck(body));
+            BOOST_REQUIRE_EQUAL(errors.size(), 1);
+            BOOST_CHECK(errors[0].critical);
+        }
+    }
+
+    // Each offending region is reported with its own value and region number,
+    // so a multiplier buried in a long list can still be found.
+    {
+        const auto errors = validateFactli(compositionalPropsDeck("FACTLI\n  7*1.0 1.3 6*1.0 0.8 /\n"));
+        BOOST_REQUIRE_EQUAL(errors.size(), 2);
+        BOOST_REQUIRE(errors[0].user_message.has_value());
+        BOOST_CHECK(errors[0].user_message->find("region 8") != std::string::npos);
+        BOOST_REQUIRE(errors[1].user_message.has_value());
+        BOOST_CHECK(errors[1].user_message->find("region 15") != std::string::npos);
+        BOOST_CHECK(errors[0].item_value.has_value());
+    }
 }

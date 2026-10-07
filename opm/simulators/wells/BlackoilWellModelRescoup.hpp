@@ -32,13 +32,17 @@
 
 namespace Opm {
     class DeferredLogger;
+    enum class Phase;
     class Schedule;
+    class SummaryState;
     template<class TypeTag> class BlackoilWellModel;
     template<class Scalar, class IndexTraits> class GroupStateHelper;
     template<class Scalar, class IndexTraits> class WellState;
     template<class Scalar> class ReservoirCouplingMaster;
     template<class Scalar> class ReservoirCouplingSlave;
 }
+
+namespace Opm::ReservoirCoupling { class CouplingInfo; }
 
 namespace Opm {
 
@@ -99,6 +103,13 @@ public:
 
     // === Rescoup flow methods ===
 
+    /// \brief Slave-side: evaluate the group and field level UDQs now, so that
+    ///   a UDQ that reads a target the master just imposed is current before
+    ///   the wells are solved, instead of one step behind.  Well and segment
+    ///   level UDQs, and any "UPDATE NEXT" DEFINE, are left to the ordinary
+    ///   end-of-step evaluation.
+    void evalGroupAndFieldUDQs();
+
     /// \brief True if the most recent sendMasterGroupNodePressuresToSlaves
     ///   carried is_final = true (or if no send has happened yet).  Used
     ///   to gate redundant sends and to decide whether a trailing-final
@@ -140,7 +151,9 @@ public:
     /// Blocking receive of the per-master-group production targets and
     /// injection limits computed by the master.  The received values are
     /// written into the slave's group state via the receiver helper.
-    /// Called from the slave's beginTimeStep first-substep handshake.
+    /// Called from the slave's beginTimeStep first-substep handshake, and
+    /// once per network iteration from maybeSendSlaveGroupFlowToMaster_(),
+    /// where the master sends injection targets only.
     void receiveGroupConstraintsFromMaster();
 
     /// \brief Receive master-computed network-leaf node pressures and
@@ -156,6 +169,14 @@ public:
     /// Called from the master's beginTimeStep first-substep handshake and
     /// from rescoupSyncSummaryData() when a slave has fresh data to deliver.
     void receiveSlaveGroupData();
+
+    /// \brief Slave-side: recompute the injection targets and production
+    ///   limits in force for each slave group from the constraints just
+    ///   received, and re-evaluate the group and field level UDQs that may
+    ///   read them.  Called after every receive of group constraints: the
+    ///   handshake at the start of a sync step and the replacement targets a
+    ///   master sends back during the cross-rescoup network iteration.
+    void refreshSlaveGroupTargets();
 
     /// \brief End-of-substep summary-data synchronisation.
     ///
@@ -233,7 +254,45 @@ public:
     /// Replaces the previous BlackoilWellModel::setupRescoupScopedLogger().
     std::optional<ReservoirCoupling::ScopedLoggerGuard> setupScopedLogger(DeferredLogger& local_logger);
 
+    /// \brief Slave-side: store each slave group's effective injection target
+    ///   as its GGIRT/GWIRT summary value, so that UDQs and the summary output
+    ///   can use it.  The effective target is the master's, the deck's own, or
+    ///   the smaller of the two, as the group's GRUPSLAV flag says; when the
+    ///   deck's own applies, or no master target exists, the entry is erased.
+    void storeSlaveGroupInjectionTargets();
+
+    /// \brief Slave-side: store each slave group's production limits in force
+    ///   as its GOPRT, GWPRT, GGPRT and GLPRT summary values, so that UDQs and
+    ///   the summary output can use them.  The limit in force for a rate type
+    ///   is the master's, the deck's own, or the smaller of the two, as the
+    ///   group's GRUPSLAV flag says; when the deck's own applies, or the
+    ///   master has no limit of that type, the entry is erased.
+    void storeSlaveGroupProductionTargets();
+
 private:
+    /// \brief The injection target in force for a slave group and phase, in SI:
+    ///   the master's, the deck's, or the smaller of the two, as the GRUPSLAV
+    ///   flag says.  Empty when the deck's own limit applies or no surface-rate
+    ///   master target exists -- the summary evaluator then reads the schedule.
+    std::optional<Scalar>
+    effectiveSlaveGroupInjectionTarget_(const std::string& gname,
+                                        const Phase phase,
+                                        const int reportStepIdx,
+                                        const ReservoirCoupling::CouplingInfo& rescoup,
+                                        const SummaryState& summary_state) const;
+
+    /// \brief The production limit in force for a slave group and rate type
+    ///   (ORAT, WRAT, GRAT or LRAT), in SI: the master's, the deck's, or the
+    ///   smaller of the two, as the GRUPSLAV flag says.  Empty when the
+    ///   deck's own limit applies or the master has no limit of that type --
+    ///   the summary evaluator then reads the schedule.
+    std::optional<Scalar>
+    effectiveSlaveGroupProductionTarget_(const std::string& gname,
+                                         const Group::ProductionCMode cmode,
+                                         const int reportStepIdx,
+                                         const ReservoirCoupling::CouplingInfo& rescoup,
+                                         const SummaryState& summary_state) const;
+
     /// \brief Per-slave variant of masterNetworkHasMasterGroupLeaves():
     ///   true iff at least one of the given slave's master groups is a
     ///   leaf node in the master's extended network.  This is what
@@ -241,6 +300,50 @@ private:
     ///   network exchange; the (public) global version is the OR over all
     ///   activated slaves and gates the master's own iteration.
     bool masterNetworkHasMasterGroupLeavesForSlave_(std::size_t slave_idx) const;
+
+    /// \brief Master-side: recompute the master's group state from the slave
+    ///   rates just received and send the resulting injection targets on.
+    ///
+    /// Called immediately after each non-final receiveSlaveGroupData() inside
+    /// the network iteration, so that a target derived from slave production
+    /// (GCONINJE REIN, SALE or VREP) keeps up with the production the slaves
+    /// report as the network iteration proceeds.  Its slave-side counterpart
+    /// is the receiveGroupConstraintsFromMaster() in
+    /// BlackoilWellModel::maybeSendSlaveGroupFlowToMaster_().
+    void refreshAndSendInjectionTargets_();
+
+    /// \brief The surface injection rate target the slave's own schedule gives
+    ///   a group for a phase (SI), 0 when the group has no injection control
+    ///   for that phase.  What the summary evaluator reports for a group
+    ///   without a target in force from the master.
+    Scalar scheduleInjectionTarget_(const std::string& gname,
+                                    const Phase phase,
+                                    const int reportStepIdx,
+                                    const SummaryState& summary_state) const;
+
+    /// \brief The production rate limit the slave's own schedule gives a
+    ///   group for a rate type (SI), as the summary evaluator reads it.  What
+    ///   is reported for a group without a limit in force from the master.
+    Scalar scheduleProductionTarget_(const std::string& gname,
+                                     const Group::ProductionCMode cmode,
+                                     const int reportStepIdx,
+                                     const SummaryState& summary_state) const;
+
+    /// \brief Send injection targets to each activated slave, replacing the
+    ///   ones the slaves are currently holding.  Production constraints are
+    ///   not resent.  Only called by refreshAndSendInjectionTargets_().
+    void sendMasterGroupInjectionTargetsToSlaves_();
+
+    /// \brief Slave-side: true iff this slave's own deck put the named group
+    ///   into its own surface network as a fixed-pressure node.
+    ///
+    /// This is the condition under which a master-supplied node pressure may
+    /// be imposed on the group at all: the pressure is the fixed pressure of
+    /// the slave group's node in the *slave's* network, so the deck must have
+    /// declared such a node (GRUPNET item 2, or NODEPROP item 2 for an
+    /// extended network).  A slave that declares no network keeps its wells
+    /// on their WCONPROD THP limits.
+    bool slaveGroupIsFixedPressureNodeInOwnNetwork_(const std::string& group_name) const;
 
     BlackoilWellModel<TypeTag>& well_model_;
     BlackoilWellModelNetwork<TypeTag>& network_;

@@ -55,6 +55,8 @@
 #include <initializer_list>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -118,10 +120,116 @@ Transmissibility(const EclipseState& eclState,
 }
 
 template<class Grid, class GridView, class ElementMapper, class CartesianIndexMapper, class Scalar>
+bool Transmissibility<Grid,GridView,ElementMapper,CartesianIndexMapper,Scalar>::
+gridJoins_(unsigned elemIdx1, unsigned elemIdx2) const
+{
+    using Ix = typename ElementMapper::Index;
+
+    ElementMapper elemMapper(gridView_, Dune::mcmgElementLayout());
+
+    for (const auto& elem : elements(gridView_)) {
+        if (elemMapper.index(elem) != static_cast<Ix>(elemIdx1)) {
+            continue;
+        }
+
+        for (const auto& intersection : intersections(gridView_, elem)) {
+            if (intersection.neighbor() &&
+                (elemMapper.index(intersection.outside()) == static_cast<Ix>(elemIdx2)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    return false;
+}
+
+template<class Grid, class GridView, class ElementMapper, class CartesianIndexMapper, class Scalar>
+std::string Transmissibility<Grid,GridView,ElementMapper,CartesianIndexMapper,Scalar>::
+describeCell_(unsigned elemIdx) const
+{
+    auto text = fmt::format("cell {}", elemIdx);
+
+    if (elemIdx >= static_cast<unsigned>(gridView_.size(/*codim=*/0))) {
+        return text + " (out of range)";
+    }
+
+    const auto cartIdx = cartMapper_.cartesianIndex(elemIdx);
+    std::array<int,dimWorld> ijk{};
+    cartMapper_.cartesianCoordinate(elemIdx, ijk);
+
+    text += fmt::format(" (Cartesian {} = [{},{},{}]", cartIdx, ijk[0], ijk[1], ijk[2]);
+
+    if constexpr (requires { grid_.maxLevel(); }) {
+        if (grid_.maxLevel() > 0) {
+            using Ix = typename ElementMapper::Index;
+
+            // Which grid the cell belongs to is the first thing worth knowing:
+            // a pair spanning a refinement boundary, or two cells refining one
+            // coarse cell, is where these lookups go wrong. Found through the
+            // mapper -- iteration order is not index order.
+            ElementMapper elemMapper(gridView_, Dune::mcmgElementLayout());
+            for (const auto& elem : elements(gridView_)) {
+                if (elemMapper.index(elem) == static_cast<Ix>(elemIdx)) {
+                    text += fmt::format(", level {}", elem.level());
+                    break;
+                }
+            }
+        }
+    }
+
+    return text + ")";
+}
+
+template<class Grid, class GridView, class ElementMapper, class CartesianIndexMapper, class Scalar>
+Scalar Transmissibility<Grid,GridView,ElementMapper,CartesianIndexMapper,Scalar>::
+lookupTrans_(const std::unordered_map<std::uint64_t, Scalar>& map,
+             unsigned elemIdx1, unsigned elemIdx2, std::string_view what) const
+{
+    const auto entry = map.find(details::isId(elemIdx1, elemIdx2));
+    if (entry == map.end()) {
+        // "unordered_map::at: key not found" on its own says nothing about
+        // which connection the model asked for.
+        // Whether the pair is Cartesian-adjacent says which kind of connection
+        // went missing: a face the grid should have, or a non-neighbour one.
+        const auto& cartDims = cartMapper_.cartesianDimensions();
+        const auto gc1 = cartMapper_.cartesianIndex(std::min(elemIdx1, elemIdx2));
+        const auto gc2 = cartMapper_.cartesianIndex(std::max(elemIdx1, elemIdx2));
+        const auto delta = gc2 - gc1;
+        const auto kind =
+            (delta == 0)                          ? "same coarse cell (refined siblings)" :
+            (delta == 1)                          ? "neighbours in I" :
+            (delta == cartDims[0])                ? "neighbours in J" :
+            (delta == cartDims[0]*cartDims[1])    ? "neighbours in K" :
+            ((delta % (cartDims[0]*cartDims[1])) == 0) ? "same column, several layers apart (a pinch-out or vertical NNC)"
+                                                  : "not Cartesian neighbours (a non-neighbour connection)";
+
+        // Does the grid actually join these two cells? That separates a caller
+        // asking about a connection that does not exist from this calculation
+        // having missed one that does.
+        const auto joined = this->gridJoins_(elemIdx1, elemIdx2);
+
+        OPM_THROW(std::out_of_range,
+                  fmt::format("No {} between {} and {}: {}. {}",
+                              what, this->describeCell_(elemIdx1), this->describeCell_(elemIdx2), kind,
+                              joined
+                              ? "The grid does join them, so the transmissibility "
+                                "calculation skipped a face it should have computed."
+                              : "The grid does not join them either, so the caller asked "
+                                "about a connection that does not exist -- the cell "
+                                "indices it used are not the ones this grid knows."));
+    }
+
+    return entry->second;
+}
+
+template<class Grid, class GridView, class ElementMapper, class CartesianIndexMapper, class Scalar>
 Scalar Transmissibility<Grid,GridView,ElementMapper,CartesianIndexMapper,Scalar>::
 transmissibility(unsigned elemIdx1, unsigned elemIdx2) const
 {
-    return trans_.at(details::isId(elemIdx1, elemIdx2));
+    return this->lookupTrans_(trans_, elemIdx1, elemIdx2, "transmissibility");
 }
 
 template<class Grid, class GridView, class ElementMapper, class CartesianIndexMapper, class Scalar>
@@ -136,6 +244,24 @@ Scalar Transmissibility<Grid,GridView,ElementMapper,CartesianIndexMapper,Scalar>
 thermalHalfTrans(unsigned insideElemIdx, unsigned outsideElemIdx) const
 {
     return thermalHalfTrans_.at(details::directionalIsId(insideElemIdx, outsideElemIdx));
+}
+
+template<class Grid, class GridView, class ElementMapper, class CartesianIndexMapper, class Scalar>
+Scalar Transmissibility<Grid,GridView,ElementMapper,CartesianIndexMapper,Scalar>::
+halfTransmissibility(unsigned insideElemIdx, unsigned outsideElemIdx) const
+{
+    if (!storeHalfTrans_) {
+        // Without this the caller gets a bare std::out_of_range from the empty
+        // map.  One branch on a bool, and this is not a hot path: only the
+        // adjoint code asks for these today.
+        OPM_THROW(std::logic_error,
+                  "One-sided half transmissibilities were not stored. "
+                  "Call setStoreHalfTrans(true) before update() to have them "
+                  "computed; they are off by default because only the adjoint "
+                  "code needs them.");
+    }
+
+    return halfTrans_.at(details::directionalIsId(insideElemIdx, outsideElemIdx));
 }
 
 template<class Grid, class GridView, class ElementMapper, class CartesianIndexMapper, class Scalar>
@@ -159,7 +285,7 @@ diffusivity(unsigned elemIdx1, unsigned elemIdx2) const
     if (diffusivity_.empty())
         return 0.0;
 
-    return diffusivity_.at(details::isId(elemIdx1, elemIdx2));
+    return this->lookupTrans_(diffusivity_, elemIdx1, elemIdx2, "diffusivity");
 }
 
 template<class Grid, class GridView, class ElementMapper, class CartesianIndexMapper, class Scalar>
@@ -169,7 +295,7 @@ dispersivity(unsigned elemIdx1, unsigned elemIdx2) const
     if (dispersivity_.empty())
         return 0.0;
 
-    return dispersivity_.at(details::isId(elemIdx1, elemIdx2));
+    return this->lookupTrans_(dispersivity_, elemIdx1, elemIdx2, "dispersivity");
 }
 
 template<class Grid, class GridView, class ElementMapper, class CartesianIndexMapper, class Scalar>
@@ -211,6 +337,13 @@ update(bool global, const TransUpdateQuantities update_quantities,
     }
 
     transBoundary_.clear();
+
+    if (storeHalfTrans_) {
+        halfTrans_.clear();
+        if (num_threads == 1) {
+            halfTrans_.reserve(numElements*6*1.05);
+        }
+    }
 
     // if energy is enabled, let's do the same for the "thermal half transmissibilities"
     if ( enableEnergy_ && !onlyTrans) {
@@ -312,6 +445,8 @@ update(bool global, const TransUpdateQuantities update_quantities,
                                                   MapBuilderInsertionMode::Insert_Or_Assign);
     ThreadSafeMapBuilder thermalHalfTrans(thermalHalfTrans_, num_threads,
                                           MapBuilderInsertionMode::Insert_Or_Assign);
+    ThreadSafeMapBuilder halfTransMap(halfTrans_, num_threads,
+                                      MapBuilderInsertionMode::Insert_Or_Assign);
     ThreadSafeMapBuilder diffusivity(diffusivity_, num_threads,
                                      MapBuilderInsertionMode::Insert_Or_Assign);
     ThreadSafeMapBuilder dispersivity(dispersivity_, num_threads,
@@ -457,6 +592,22 @@ update(bool global, const TransUpdateQuantities update_quantities,
 
                 Scalar trans = computeHalfMean(computeHalfTrans_, permeability_);
 
+                if (storeHalfTrans_) {
+                    // one-sided half transmissibilities (NTG applied),
+                    // for the adjoint permeability chain rule
+                    auto onesided = computeHalf(computeHalfTrans_,
+                                                permeability_[inside.elemIdx],
+                                                permeability_[outside.elemIdx]);
+                    applyNtg_(onesided[0], inside, ntg);
+                    applyNtg_(onesided[1], outside, ntg);
+                    halfTransMap.insert_or_assign(
+                        details::directionalIsId(inside.elemIdx, outside.elemIdx),
+                        onesided[0]);
+                    halfTransMap.insert_or_assign(
+                        details::directionalIsId(outside.elemIdx, inside.elemIdx),
+                        onesided[1]);
+                }
+
                 // apply the full face transmissibility multipliers
                 // for the inside ...
                 if (!pinchActive) {
@@ -559,6 +710,10 @@ update(bool global, const TransUpdateQuantities update_quantities,
 #pragma omp section
 #endif
         dispersivity.finalize();
+#ifdef _OPENMP
+#pragma omp section
+#endif
+        halfTransMap.finalize();
     }
 
     // Potentially overwrite and/or modify transmissibilities based on input from deck

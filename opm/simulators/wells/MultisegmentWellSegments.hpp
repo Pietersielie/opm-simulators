@@ -25,6 +25,7 @@
 #include <opm/simulators/wells/MultisegmentWellPrimaryVariables.hpp>
 #include <opm/simulators/wells/ParallelWellInfo.hpp>
 
+#include <array>
 #include <cstddef>
 #include <vector>
 
@@ -53,10 +54,36 @@ public:
                              const ParallelWellInfo<Scalar>& parallel_well_info,
                              WellInterfaceGeneric<Scalar, IndexTraits>& well);
 
-    void computeFluidProperties(const EvalWell& temperature,
-                                const EvalWell& saltConcentration,
+    //! \brief The quantities taken from a segment fluid state.
+    //!
+    //! The fluid state type depends on the TypeTag, which this class does not have, so the
+    //! caller extracts the values needed here. Pressure and temperature are the same for all
+    //! phases in the wellbore, so a single value of each is stored. @p invB is indexed by
+    //! canonical phase index.
+    struct SegmentPvt
+    {
+        EvalWell pressure{0.};
+        EvalWell temperature{0.};
+        EvalWell saltConcentration{0.};
+        std::array<EvalWell, FluidSystem::numPhases> invB{};
+        EvalWell Rs{0.};
+        EvalWell Rv{0.};
+    };
+
+    //! \brief Compute per-segment fluid properties from the pre-computed segment PVT values.
+    //!
+    //! Reuses the inverse formation volume factors and dissolution/vaporization ratios where
+    //! applicable, and evaluates the remaining PVT properties. Also updates the cached segment
+    //! volume ratios.
+    void computeFluidProperties(const std::vector<SegmentPvt>& segment_pvt,
                                 const PrimaryVariables& primary_variables,
                                 DeferredLogger& deferred_logger);
+
+    //! \brief Volume ratio of a segment from its PVT values and composition.
+    EvalWell computeVolumeRatio(const int seg,
+                                const SegmentPvt& pvt,
+                                const PrimaryVariables& primary_variables,
+                                DeferredLogger& deferred_logger) const;
 
     //! \brief Update upwinding segments.
     void updateUpwindingSegments(const PrimaryVariables& primary_variables);
@@ -67,12 +94,6 @@ public:
     //! Pressure difference between segment and perforation.
     Scalar getPressureDiffSegLocalPerf(const int seg,
                                        const int local_perf_index) const;
-
-    EvalWell getSurfaceVolume(const EvalWell& temperature,
-                              const EvalWell& saltConcentration,
-                              const PrimaryVariables& primary_variables,
-                              const int seg_idx,
-                              DeferredLogger& deferred_logger) const;
 
     EvalWell getFrictionPressureLoss(const int seg,
                                      const bool extra_reverse_flow_derivatives = false) const;
@@ -126,6 +147,14 @@ public:
         return densities_[seg];
     }
 
+    //! \brief Segment volume ratio (reservoir volume per unit surface volume).
+    //!
+    //! Set by computeFluidProperties(), like the other per-segment quantities.
+    const EvalWell& volumeRatio(const int seg) const
+    {
+        return volume_ratios_[seg];
+    }
+
     Scalar local_perforation_depth_diff(const int local_perf_index) const
     {
         return local_perforation_depth_diffs_[local_perf_index];
@@ -164,6 +193,10 @@ private:
     // we should not have this member variable
     std::vector<EvalWell> densities_;
 
+    // Segment volume ratios (reservoir volume per unit surface volume), derived from the fluid
+    // state and surface composition.
+    std::vector<EvalWell> volume_ratios_;
+
     // the mass rate of the segments
     std::vector<EvalWell> mass_rates_;
 
@@ -187,33 +220,29 @@ private:
     Scalar mixtureDensityWithExponents(const int seg) const;
     Scalar mixtureDensityWithExponents(const AutoICD& aicd, const int seg) const;
 
-    // this class is used to store the result of phase property calculation
-    struct PhaseCalcResult {
-        explicit PhaseCalcResult(const std::size_t num_quantities)
+    // Intermediate PVT properties used to calculate segment fluid properties and volume ratios.
+    struct PhaseState
+    {
+        explicit PhaseState(const std::size_t num_quantities)
             : b(num_quantities, 0.0)
             , mix(num_quantities, 0.0)
-            , mix_s(num_quantities, 0.0)
-            , phase_viscosities(num_quantities, 0.0)
-            , phase_densities(num_quantities, 0.0)
         {}
-
-        void clear();
 
         std::vector<EvalWell> b;
         std::vector<EvalWell> mix;
-        std::vector<EvalWell> mix_s;
-        std::vector<EvalWell> phase_viscosities;
-        std::vector<EvalWell> phase_densities;
+        EvalWell rs{0.};
+        EvalWell rv{0.};
         EvalWell vol_ratio{0.};
     };
 
-    void calculatePhaseProperties(PhaseCalcResult& result,
-                                  const EvalWell& temperature,
-                                  const EvalWell& saltConcentration,
-                                  const PrimaryVariables& primary_variables,
-                                  int seg,
-                                  bool update_visc_and_den,
-                                  DeferredLogger& deferred_logger) const;
+    //! \brief Fill @p state from the segment PVT values and surface composition @p mix_s.
+    //!
+    //! Reuses the PVT properties where they represent the requested composition, and
+    //! evaluates the required saturated properties for single-phase cases.
+    void calculatePhaseState(const SegmentPvt& pvt,
+                             const std::vector<EvalWell>& mix_s,
+                             PhaseState& state,
+                             DeferredLogger& deferred_logger) const;
 };
 
 } // namespace Opm

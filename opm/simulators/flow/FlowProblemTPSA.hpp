@@ -35,6 +35,7 @@
 
 #include <opm/material/common/MathToolbox.hpp>
 #include <opm/material/materialstates/MaterialStateTPSA.hpp>
+#include <opm/material/thermal/EnergyModuleType.hpp>
 
 #include <opm/models/io/vtktpsamodule.hpp>
 #include <opm/models/tpsa/tpsabaseproperties.hpp>
@@ -82,15 +83,28 @@ public:
     enum { numEq = getPropValue<TypeTag, Properties::NumEqTPSA>() };
     enum { numPhases = FluidSystem::numPhases };
 
+    static constexpr EnergyModules energyModuleType =
+        getPropValue<TypeTag, Properties::EnergyModuleType>();
+
     enum { contiRotEqIdx = Indices::contiRotEqIdx };
     enum { contiSolidPresEqIdx = Indices::contiSolidPresEqIdx };
     enum { solidPres0Idx = Indices::solidPres0Idx };
 
     using CartesianIndexMapper = Dune::CartesianIndexMapper<Grid>;
     using DimVector = Dune::FieldVector<Scalar, dimWorld>;
+    using EvalDimVector = Dune::FieldVector<Evaluation, dimWorld>;
     using FaceProperties = FacePropertiesTPSA<Grid, GridView, ElementMapper, CartesianIndexMapper, Scalar>;
     using InitialMaterialState = MaterialStateTPSA<Scalar>;
     using Toolbox = MathToolbox<Evaluation>;
+
+    // Boundary condition helper struct
+    struct MechBCData
+    {
+        BCMECHType type;
+        EvalDimVector displacement;
+        Scalar distance;
+        Scalar shearModulus;
+    };
 
     // ///
     // Public functions
@@ -120,6 +134,12 @@ public:
                                   "TPSA keyword!";
                 OpmLog::error(msg);
                 throw std::runtime_error(msg);
+            }
+
+            // Warn against using aquifers with TPSA
+            if (simulator.vanguard().eclState().aquifer().active()) {
+                OpmLog::warning("TPSA geomechanics does not handle numerical or analytical "
+                                "aquifers, hence results may be inaccurate!");
             }
         }
         else {
@@ -222,12 +242,13 @@ public:
         Scalar avgSmodulus = 0.0;
         const auto& gridView = this->gridView();
         ElementContext elemCtx(this->simulator());
+        unsigned numDof = 0;
         for(const auto& elem: elements(gridView, Dune::Partitions::interior)) {
             elemCtx.updatePrimaryStencil(elem);
             int elemIdx = elemCtx.globalSpaceIndex(/*spaceIdx=*/0, /*timeIdx=*/0);
             avgSmodulus += this->shearModulus(elemIdx);
+            ++numDof;
         }
-        std::size_t numDof = this->model().numGridDof();
         const auto& comm = this->simulator().vanguard().grid().comm();
         avgSmodulus = comm.sum(avgSmodulus);
         Scalar numTotalDof = comm.sum(numDof);
@@ -260,6 +281,19 @@ public:
     }
 
     /*!
+     * \brief Called by simulator at the end of each timestep
+     */
+    void endTimeStep() override
+    {
+        // Update info for mechanics output
+        // OBS: Must be done before ParentClass::endTimeStep!
+        geoMechModel().linearizer().updateStressInfo();
+
+        // Call parent class endTimeStep()
+        ParentType::endTimeStep();
+    }
+
+    /*!
     * \brief Organize mechanics boundary conditions
     *
     * \param globalSpaceIdx Cell index
@@ -268,32 +302,38 @@ public:
     *
     * Output from this function is used in LocalResidual::computeBoundaryTerm
     *
-    * \note Only BCMECHTYPE = FREE and NONE implemented. FIXED will/should throw an error when computed in local
-    * residual!
+    * \note Only BCMECH TYPE = FREE, SPRING and NONE implemented
     */
-    std::pair<BCMECHType, Dune::FieldVector<Evaluation, 3>>
+    MechBCData
     mechBoundaryCondition(const unsigned int globalSpaceIdx, const int directionId)
     {
-        // Default boundary conditions if BCCON/BCPROP not defined
+        // Default boundary conditions if BCCON/BCMECH not defined
         if (!this->nonTrivialBoundaryConditions()) {
-            return { BCMECHType::NONE, Dune::FieldVector<Evaluation, 3>{0.0, 0.0, 0.0} };
+            return {BCMECHType::NONE, EvalDimVector{0.0, 0.0, 0.0}, 0.0, 0.0};
         }
 
-        // Default for BCPROP index = 0 or no BCPROP defined at current episode
+        // Default for BCMECH index = 0 or no BCMECH defined at current episode
         FaceDir::DirEnum dir = FaceDir::FromIntersectionIndex(directionId);
         const auto& schedule = this->simulator().vanguard().schedule();
-        if (this->bcindex_(dir)[globalSpaceIdx] == 0 || schedule[this->episodeIndex()].bcprop.size() == 0) {
-            return { BCMECHType::NONE, Dune::FieldVector<Evaluation, 3>{0.0, 0.0, 0.0} };
+        if (this->bcindex_(dir)[globalSpaceIdx] == 0
+            || schedule[this->episodeIndex()].bcstate.size() == 0) {
+            return {BCMECHType::NONE, EvalDimVector{0.0, 0.0, 0.0}, 0.0, 0.0};
         }
 
         // Get current BC
-        const auto& bc = schedule[this->episodeIndex()].bcprop[this->bcindex_(dir)[globalSpaceIdx]];
+        const auto& bc =
+            schedule[this->episodeIndex()].bcstate[this->bcindex_(dir)[globalSpaceIdx]];
         if (bc.bcmechtype == BCMECHType::FREE) {
-            return { BCMECHType::FREE, Dune::FieldVector<Evaluation, 3>{0.0, 0.0, 0.0} };
+            return {BCMECHType::FREE, EvalDimVector{0.0, 0.0, 0.0}, 0.0, 0.0};
         }
-        else {
-            return { bc.bcmechtype, Dune::FieldVector<Evaluation, 3>{0.0, 0.0, 0.0} };
+        if (bc.bcmechtype == BCMECHType::SPRING) {
+            const auto& mechbcval = bc.mechbcvalue;
+            return {BCMECHType::SPRING, EvalDimVector{0.0, 0.0, 0.0},
+                    mechbcval.distance, mechbcval.shearmodulus};
         }
+
+        // Default return
+        return {bc.bcmechtype, EvalDimVector{0.0, 0.0, 0.0}, 0.0, 0.0};
     }
 
     /*!
@@ -319,9 +359,26 @@ public:
         const auto& fs = iq.fluidState();
         const auto pres = decay<Scalar>(fs.pressure(this->refPressurePhaseIdx_()));
         const auto initPres = this->initialFluidState(globalSpaceIdx).pressure(this->refPressurePhaseIdx_());
+        const auto dPres = biot * (pres - initPres);
 
-        auto sourceFromFlow = -biot / lameParam * (pres - initPres);
+        auto sourceFromFlow = -dPres / lameParam;
+
+        if constexpr (energyModuleType == EnergyModules::FullyImplicitThermal) {
+            const auto biotTemp = this->biotTemp(globalSpaceIdx);
+            const auto temp = decay<Scalar>(fs.temperature(0));
+            const auto initTemp = this->initialFluidState(globalSpaceIdx).temperature(0);
+            const auto dTemp = biotTemp * (temp - initTemp);
+            sourceFromFlow += -dTemp / lameParam;
+
+            // Store potential temperature force for output
+            geoMechModel_.setMechPotentialTempForce(globalSpaceIdx, dTemp);
+        }
+
+        // Add calculated source terms to output
         sourceTerm[contiSolidPresEqIdx] += sourceFromFlow;
+
+        // Store potential pressure force for output
+        geoMechModel_.setMechPotentialPressForce(globalSpaceIdx, dPres);
     }
 
     /*!
@@ -344,6 +401,16 @@ public:
         const auto lameParam = this->lame(elementIdx);
 
         return biot / lameParam * solidPres;
+    }
+
+    /*!
+    * \brief Reference temperature for thermoelasticity
+    *
+    * \returns Standard condition temperature (STCOND), in Kelvin
+    */
+    Scalar rockReferenceTemperature() const
+    {
+        return this->simulator().vanguard().eclState().getTableManager().stCond().temperature;
     }
 
     // ///

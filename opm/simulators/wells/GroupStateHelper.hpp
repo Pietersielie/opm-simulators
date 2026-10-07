@@ -319,6 +319,18 @@ public:
     ///   unaffected.
     bool isMasterGroupEligibleForGuideRate(const std::string& group_name) const;
 
+    /// @brief Whether a reservoir-coupling master group is *eligible* to participate in
+    ///   its parent's injection guide-rate distribution for one phase.
+    /// @details The injection counterpart of isMasterGroupEligibleForGuideRate(): the group
+    ///   must have an injection control for the phase (GCONINJE) that is available for
+    ///   higher-level control (GCONINJE item 8 = YES).  As on the production side this is
+    ///   necessary but not sufficient: an eligible group only contributes to the guide-rate
+    ///   sum while its effective injection GCW for the phase is > 0 (see
+    ///   ReservoirCouplingMaster::effectiveInjectionGCW()).  Returns false for any
+    ///   non-master group, so non-rescoup runs are unaffected.
+    bool isMasterGroupEligibleForInjectionGuideRate(const std::string& group_name,
+                                                    Phase injection_phase) const;
+
     bool isRank0() const
     {
         return this->well_state_->isRank0();
@@ -517,6 +529,28 @@ public:
                                              bool is_injector,
                                              WellState<Scalar, IndexTraits>& well_state) const;
 
+    /// \brief The contribution of a single well to a group rate sum.
+    ///
+    /// Applies the filters, the efficiency factor and the sign convention that
+    /// sumWellPhaseRates() uses, so a caller that needs to add or remove one well's
+    /// share of such a sum stays consistent with it.  Returns zero when the well does
+    /// not contribute at all: not present in this rank's well state, not owned by this
+    /// rank (each well is counted once), of the wrong type for the sum, or shut.
+    ///
+    /// Being owner-filtered, the result is rank-local, exactly like sumWellPhaseRates();
+    /// a caller that compares it against an already-reduced quantity must reduce it too.
+    ///
+    /// \param well_name Name of the well
+    /// \param phase_pos Active phase index
+    /// \param res_rates Use reservoir rates instead of surface rates
+    /// \param is_injector Sum injectors rather than producers
+    /// \param network Use the network efficiency factors (GEFAC/WEFAC item 3)
+    Scalar wellRateContributionToGroup(const std::string& well_name,
+                                       const int phase_pos,
+                                       const bool res_rates,
+                                       const bool is_injector,
+                                       const bool network = false) const;
+
     /// Returns the name of the worst offending well and its fraction (i.e. violated_phase / preferred_phase)
     std::pair<std::optional<std::string>, Scalar>
     worstOffendingWell(const Group& group,
@@ -636,10 +670,10 @@ private:
 
     Scalar satelliteProductionRate_(const ScheduleState& sched,
                                     const Group& group,
-                                    const GSatProd::GSatProdGroupProp::Rate rate_comp,
+                                    const GSatProd::Rate rate_comp,
                                     bool res_rates) const;
 
-    std::optional<GSatProd::GSatProdGroupProp::Rate> selectRateComponent_(const int phase_pos) const;
+    std::optional<GSatProd::Rate> selectRateComponent_(const int phase_pos) const;
 
     //! \brief Subtract other-phase reservoir injection rates from a base rate.
     //!
@@ -707,12 +741,18 @@ private:
     ///   - Otherwise (RESPOND_TO_PARENT = NO): the group uses only its own limit and
     ///     is excluded from guide-rate distribution, so GCW = 0.  Being on FLD/NONE
     ///     control in that case is contradictory and throws.
-    ///   The injection path is not yet handled and returns 1.
+    ///   For injection the same rule is applied per phase: a group eligible for the
+    ///   phase (see isMasterGroupEligibleForInjectionGuideRate()) returns the effective
+    ///   injection GCW maintained by the rescoup master (see
+    ///   ReservoirCouplingMaster::effectiveInjectionGCW()); any other master group
+    ///   returns 1, as before.
     /// @param group_name Name of the reservoir-coupling master group.
     /// @param is_production_group True for the production GCW, false for injection.
+    /// @param injection_phase The injection phase; only used when is_production_group is false.
     /// @return The effective GCW (0 or 1) for the master group.
     int getMasterGroupEffectiveGCW_(const std::string& group_name,
-                                    bool is_production_group) const;
+                                    bool is_production_group,
+                                    Phase injection_phase) const;
 
     /// @brief Get the effective production limit for a group and rate type,
     /// combining master limit, slave-local target, and GRUPSLAV filter flag.

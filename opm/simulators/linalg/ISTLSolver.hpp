@@ -323,9 +323,22 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             element_chunks_ = std::make_unique<ElementChunksType>(simulator_.vanguard().gridView(), Dune::Partitions::all, ThreadManager::maxThreads());
         }
 
-        // nothing to clean here
+        // Drop the cached matrix pointer so initPrepare() sees the next matrix
+        // as a new object.  Callers that rebuild the linear system mid-run rely
+        // on this - opm-flowgeomechanics does it from FlowProblemMech when
+        // fracture connections change.
         void eraseMatrix() override
         {
+            matrix_ = nullptr;
+            rhs_ = nullptr;
+            iterations_ = 0;
+            solveCount_ = 0;
+
+            for (auto& solverInfo : flexibleSolver_) {
+                solverInfo.pre_ = nullptr;
+                solverInfo.solver_.reset();
+                solverInfo.op_.reset();
+            }
         }
 
         void setActiveSolver(const int num) override
@@ -347,10 +360,14 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
         void initPrepare(const Matrix& M, Vector& b)
         {
-            const bool firstcall = (matrix_ == nullptr);
+            // matrix_ starts out null, so this also covers the first call.
+            const bool matrix_changed = &M != matrix_;
 
-            // update matrix entries for solvers.
-            if (firstcall) {
+            if (matrix_changed) {
+                // The matrix object is no longer the one the solver was built
+                // for, so the solver has to be rebuilt rather than updated.
+                force_recreate_ = true;
+
                 // model will not change the matrix object. Hence simply store a pointer
                 // to the original one with a deleter that does nothing.
                 // Outch! We need to be able to scale the linear system! Hence const_cast
@@ -358,12 +375,6 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
                 useWellConn_ = Parameters::Get<Parameters::MatrixAddWellContributions>();
                 // setup sparsity pattern for jacobi matrix for preconditioner (only used for openclSolver)
-            } else {
-                // Pointers should not change
-                if ( &M != matrix_ ) {
-                        OPM_THROW(std::logic_error,
-                                  "Matrix objects are expected to be reused when reassembling!");
-                }
             }
             rhs_ = &b;
 
@@ -388,7 +399,15 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 initPrepare(M,b);
 
                 prepareFlexibleSolver();
-            } OPM_CATCH_AND_RETHROW_AS_CRITICAL_ERROR("This is likely due to a faulty linear solver JSON specification. Check for errors related to missing nodes.");
+            }
+            catch (const Dune::MatrixBlockError&) {
+                // A singular matrix block found while building the
+                // preconditioner is recoverable: rethrow it unchanged so that
+                // the adaptive time stepping can chop the time step instead of
+                // aborting the run.
+                throw;
+            }
+            OPM_CATCH_AND_RETHROW_AS_CRITICAL_ERROR("This is likely due to a faulty linear solver JSON specification. Check for errors related to missing nodes.");
         }
 
 
@@ -510,6 +529,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                                                          weightCalculator,
                                                          forceSerial_,
                                                          comm_.get());
+                numWellEquations_ = this->numWellEquations();
             }
             else
             {
@@ -519,16 +539,38 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         }
 
 
+        /// Number of extra equations the well operator contributes.
+        int numWellEquations() const
+        {
+            return useWellConn_
+                ? 0
+                : simulator_.problem().wellModel().numLocalWellsEnd();
+        }
+
         /// Return true if we should (re)create the whole solver,
         /// instead of just calling update() on the preconditioner.
         bool shouldCreateSolver() const
         {
             // Decide if we should recreate the solver or just do
             // a minimal preconditioner update.
+            if (force_recreate_) {
+                force_recreate_ = false; // one-shot trigger set by initPrepare
+                return true;
+            }
+
             if (flexibleSolver_.empty()) {
                 return true;
             }
+
             if (!flexibleSolver_[activeSolverNum_].solver_) {
+                return true;
+            }
+
+            // The CPRW coarse system reserves a row per well, so its size is
+            // fixed when the solver is built.  A well drilled by an ACTIONX
+            // block changes the well count mid-run; updating in place would
+            // then write past the end of the coarse matrix.
+            if (this->numWellEquations() != numWellEquations_) {
                 return true;
             }
 
@@ -669,6 +711,10 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
         int domainIndex_ = -1;
 
+        // Number of well equations the current solver was built for, or -1 if
+        // no solver has been built yet.  See shouldCreateSolver().
+        int numWellEquations_ = -1;
+
         bool useWellConn_;
 
         std::vector<FlowLinearSolverParameters> parameters_;
@@ -677,6 +723,9 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
         std::shared_ptr< CommunicationType > comm_;
         std::unique_ptr<ElementChunksType> element_chunks_;
+        // set when initPrepare detects a different matrix object; cleared by
+        // shouldCreateSolver() (hence mutable in an otherwise const query)
+        mutable bool force_recreate_ = false;
     }; // end ISTLSolver
 
 } // namespace Opm

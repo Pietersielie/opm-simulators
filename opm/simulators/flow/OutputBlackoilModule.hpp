@@ -29,6 +29,9 @@
 
 #include <dune/common/fvector.hh>
 
+#include <opm/grid/CpGrid.hpp>
+#include <opm/grid/LookUpData.hh>
+
 #include <opm/simulators/utils/moduleVersion.hpp>
 
 #include <opm/common/Exceptions.hpp>
@@ -49,12 +52,15 @@
 #include <opm/models/utils/propertysystem.hh>
 
 #include <opm/output/data/Cells.hpp>
+#include <opm/output/data/RegionVariableMapping.hpp>
+
 #include <opm/output/eclipse/EclipseIO.hpp>
 #include <opm/output/eclipse/Inplace.hpp>
+#include <opm/output/eclipse/RegionVariableCollection.hpp>
 
 #include <opm/simulators/flow/CollectDataOnIORank.hpp>
 #include <opm/simulators/flow/FlowBaseVanguard.hpp>
-#include <opm/simulators/flow/GenericOutputBlackoilModule.hpp>
+#include <opm/simulators/flow/GenericOutputModule.hpp>
 #include <opm/simulators/flow/OutputExtractor.hpp>
 
 #include <algorithm>
@@ -63,6 +69,9 @@
 #include <cstddef>
 #include <functional>
 #include <limits>
+#include <map>
+#include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -88,7 +97,7 @@ namespace detail {
  *        ECL binary format.
  */
 template <class TypeTag>
-class OutputBlackOilModule : public GenericOutputBlackoilModule<GetPropType<TypeTag, Properties::FluidSystem>>
+class OutputBlackOilModule : public GenericOutputModule<GetPropType<TypeTag, Properties::FluidSystem>>
 {
     using Simulator = GetPropType<TypeTag, Properties::Simulator>;
     using Discretization = GetPropType<TypeTag, Properties::Discretization>;
@@ -103,7 +112,7 @@ class OutputBlackOilModule : public GenericOutputBlackoilModule<GetPropType<Type
     using GridView = GetPropType<TypeTag, Properties::GridView>;
     using Element = typename GridView::template Codim<0>::Entity;
     using ElementIterator = typename GridView::template Codim<0>::Iterator;
-    using BaseType = GenericOutputBlackoilModule<FluidSystem>;
+    using BaseType = GenericOutputModule<FluidSystem>;
     using Indices = GetPropType<TypeTag, Properties::Indices>;
     using Dir = FaceDir::DirEnum;
     using BlockExtractor = detail::BlockExtractor<TypeTag>;
@@ -170,6 +179,12 @@ public:
         , simulator_(simulator)
         , collectOnIORank_(collectOnIORank)
     {
+        // The region arrays arrive on the (unrefined) input grid, but everything
+        // downstream indexes them by leaf cell.  With an LGR the leaf has more
+        // cells, so map each onto it here - a refined cell inherits its parent's
+        // region - before anything looks at them.  Identity without LGRs.
+        this->mapRegionsOntoLeaf_();
+
         for (auto& region_pair : this->regions_) {
             this->createLocalRegion_(region_pair.second);
         }
@@ -179,6 +194,36 @@ public:
         };
 
         this->setupBlockData(isCartIdxOnThisRank);
+
+        // Allocate slots for LB* summary nodes that name a cell inside an LGR.
+        // Runs per-rank (serial and parallel): each rank allocates only the LGR
+        // leaf cells it owns, so lgrBlockData_ is per-rank disjoint and the
+        // gather to the I/O rank is a clean union.  Ownership is taken from the
+        // same InteriorEntity leaf-level decision the fill walk uses, collected
+        // here once.  Empty for runs without LB* requests (zero non-LGR cost);
+        // constexpr-elided on non-CpGrid builds (LGRs are CpGrid-only).
+        std::set<std::pair<int, int>> ownedLgrCells;
+        std::map<std::string, int> lgrNameToLevel;
+        if constexpr (std::is_same_v<Grid, Dune::CpGrid>) {
+            // CpGrid name->level map is replicated on every rank (unlike the
+            // root-only EclipseState input grid).
+            lgrNameToLevel = simulator.vanguard().grid().getLgrNameToLevel();
+            for (const auto& element : elements(simulator.gridView())) {
+                const int level = element.level();
+                if (level > 0 && element.partitionType() == Dune::InteriorEntity) {
+                    const int levelCompressed = element.getLevelElem().index();
+                    const int levelCart = simulator.vanguard()
+                                              .levelCartesianIndexMapper()
+                                              .cartesianIndex(levelCompressed, level);
+                    ownedLgrCells.emplace(level, levelCart);
+                }
+            }
+        }
+        this->setupLgrBlockData(
+            lgrNameToLevel,
+            [&ownedLgrCells](const int level, const int levelCart) {
+                return ownedLgrCells.count(std::make_pair(level, levelCart)) > 0;
+            });
 
         if (! Parameters::Get<Parameters::OwnerCellsFirst>()) {
             const std::string msg = "The output code does not support --owner-cells-first=false.";
@@ -192,15 +237,27 @@ public:
             auto rset = this->eclState_.fieldProps().fip_regions();
             rset.push_back("PVTNUM");
 
-            // Note: We explicitly use decltype(auto) here because the
-            // default scheme (-> auto) will deduce an undesirable type.  We
-            // need the "reference to vector" semantics in this instance.
+            // RegionPhasePoreVolAverage indexes by leaf cell.  The FIP entries of
+            // regions_ are already on the leaf (mapRegionsOntoLeaf_ does that), so
+            // serve those directly.  PVTNUM is not an FIP region and is deliberately
+            // kept out of regions_, so it needs its own leaf-mapped copy - with LGRs
+            // a refined cell inherits its parent's PVTNUM; identity without.
+            // decltype(auto) keeps the required "reference to vector" semantics.
+            const LookUpData<Grid, GridView> lookUpData(this->simulator_.gridView());
+            auto pvtnum = lookUpData.template assignFieldPropsIntOnLeaf<int>(
+                this->eclState_.fieldProps(), "PVTNUM", /*needsTranslation=*/false);
+
             this->regionAvgDensity_
                 .emplace(this->simulator_.gridView().comm(),
                          FluidSystem::numPhases, rset,
-                         [fp = std::cref(this->eclState_.fieldProps())]
+                         [&regions = std::as_const(this->regions_),
+                          pvtnum = std::move(pvtnum)]
                          (const std::string& rsetName) -> decltype(auto)
-                         { return fp.get().get_int(rsetName); });
+                         {
+                             return (rsetName == "PVTNUM")
+                                 ? static_cast<const std::vector<int>&>(pvtnum)
+                                 : static_cast<const std::vector<int>&>(regions.at(rsetName));
+                         });
         }
     }
 
@@ -213,7 +270,7 @@ public:
                  const unsigned reportStepNum,
                  const bool     substep,
                  const bool     log,
-                 const bool     isRestart)
+                 const bool     forceRestartFieldAllocation)
     {
         if (! std::is_same<Discretization, EcfvDiscretization<TypeTag>>::value) {
             return;
@@ -225,7 +282,7 @@ public:
                              reportStepNum,
                              substep,
                              log,
-                             isRestart,
+                             forceRestartFieldAllocation,
                              &problem.materialLawManager()->hysteresisConfig(),
                              problem.eclWriter().getOutputNnc().front().size());
     }
@@ -244,6 +301,49 @@ public:
         this->extractors_.clear();
         this->blockExtractors_.clear();
         this->extraBlockExtractors_.clear();
+        this->lgrBlockExtractors_.clear();
+    }
+
+    /*!
+     * \brief Move all buffers to data::Solution.
+     */
+    void assignToSolution(data::Solution& sol) override
+    {
+        BaseType::assignToSolution(sol);
+
+        // Quantities that only the black-oil formulation reports.
+        using M = UnitSystem::measure;
+        this->assignBuffer(sol, "1OVERBO", M::oil_inverse_formation_volume_factor,
+                           this->invB_[oilPhaseIdx], oilPhaseIdx);
+        this->assignBuffer(sol, "1OVERBG", M::gas_inverse_formation_volume_factor,
+                           this->invB_[gasPhaseIdx], gasPhaseIdx);
+        this->assignBuffer(sol, "OILKR", M::identity,
+                           this->relativePermeability_[oilPhaseIdx], oilPhaseIdx);
+        this->assignBuffer(sol, "GASKR", M::identity,
+                           this->relativePermeability_[gasPhaseIdx], gasPhaseIdx);
+        this->assignBuffer(sol, "PBUB", M::pressure, this->bubblePointPressure_);
+        this->assignBuffer(sol, "PDEW", M::pressure, this->dewPointPressure_);
+        this->assignBuffer(sol, "RS",   M::gas_oil_ratio, this->rs_);
+        this->assignBuffer(sol, "RV",   M::oil_gas_ratio, this->rv_);
+
+        // avoid output with generic fluid system and disabled water phase
+        if constexpr (numPhases > 2) {
+            this->assignBuffer(sol, "1OVERBW", M::water_inverse_formation_volume_factor,
+                               this->invB_[waterPhaseIdx], waterPhaseIdx);
+            this->assignBuffer(sol, "WATKR", M::identity,
+                               this->relativePermeability_[waterPhaseIdx], waterPhaseIdx);
+        }
+
+        // The phase densities and viscosities are named by the emitting
+        // module: these are the black-oil array names.
+        this->assignPhaseProperties(sol, typename BaseType::PhasePropertyNames {
+            .oilDensity     = "OIL_DEN",
+            .gasDensity     = "GAS_DEN",
+            .waterDensity   = "WAT_DEN",
+            .oilViscosity   = "OIL_VISC",
+            .gasViscosity   = "GAS_VISC",
+            .waterViscosity = "WAT_VISC",
+        });
     }
 
     /*!
@@ -263,34 +363,35 @@ public:
 
         const auto& matLawManager = simulator_.problem().materialLawManager();
 
-        typename Extractor::HysteresisParams hysterParams;
         for (unsigned dofIdx = 0; dofIdx < elemCtx.numPrimaryDof(/*timeIdx=*/0); ++dofIdx) {
             const auto& intQuants = elemCtx.intensiveQuantities(dofIdx, /*timeIdx=*/0);
             const auto& fs = intQuants.fluidState();
+            const auto globalDofIdx = elemCtx.globalSpaceIndex(dofIdx, /*timeIdx=*/0);
+
+            typename Extractor::HysteresisParams hysterParams;
+            if (matLawManager->enableHysteresis()) {
+                if (FluidSystem::phaseIsActive(oilPhaseIdx) && FluidSystem::phaseIsActive(waterPhaseIdx)) {
+                    matLawManager->oilWaterHysteresisParams(hysterParams.somax,
+                                                            hysterParams.swmax,
+                                                            hysterParams.swmin,
+                                                            globalDofIdx);
+                }
+                if (FluidSystem::phaseIsActive(oilPhaseIdx) && FluidSystem::phaseIsActive(gasPhaseIdx)) {
+                    matLawManager->gasOilHysteresisParams(hysterParams.sgmax,
+                                                          hysterParams.shmax,
+                                                          hysterParams.somin,
+                                                          globalDofIdx);
+                }
+            }
 
             const typename Extractor::Context ectx{
-                elemCtx.globalSpaceIndex(dofIdx, /*timeIdx=*/0),
+                globalDofIdx,
                 elemCtx.primaryVars(dofIdx, /*timeIdx=*/0).pvtRegionIndex(),
                 elemCtx.simulator().episodeIndex(),
                 fs,
                 intQuants,
                 hysterParams
             };
-
-            if (matLawManager->enableHysteresis()) {
-                if (FluidSystem::phaseIsActive(oilPhaseIdx) && FluidSystem::phaseIsActive(waterPhaseIdx)) {
-                    matLawManager->oilWaterHysteresisParams(hysterParams.somax,
-                                                            hysterParams.swmax,
-                                                            hysterParams.swmin,
-                                                            ectx.globalDofIdx);
-                }
-                if (FluidSystem::phaseIsActive(oilPhaseIdx) && FluidSystem::phaseIsActive(gasPhaseIdx)) {
-                    matLawManager->gasOilHysteresisParams(hysterParams.sgmax,
-                                                          hysterParams.shmax,
-                                                          hysterParams.somin,
-                                                          ectx.globalDofIdx);
-                }
-            }
 
             Extractor::process(ectx, extractors_);
         }
@@ -303,19 +404,66 @@ public:
             return;
         }
 
-        if (this->blockExtractors_.empty() && this->extraBlockExtractors_.empty()) {
+        if (this->blockExtractors_.empty() &&
+            this->extraBlockExtractors_.empty() &&
+            this->lgrBlockExtractors_.empty())
+        {
             return;
         }
 
-        for (unsigned dofIdx = 0; dofIdx < elemCtx.numPrimaryDof(/*timeIdx=*/0); ++dofIdx) {
-            // Adding block data
-            const auto globalDofIdx = elemCtx.globalSpaceIndex(dofIdx, /*timeIdx=*/0);
-            const auto cartesianIdx = elemCtx.simulator().vanguard().cartesianIndex(globalDofIdx);
+        // For EcfvDiscretization there is one degree of freedom per
+        // element, so the element's level determines whether the cell
+        // sits in the global grid (level == 0) or inside a local grid
+        // refinement (level > 0).  Branching here keeps the global B*
+        // lookup off the LGR-cell path and vice versa; non-LGR runs
+        // never enter the LGR branch.
+        const auto& element = elemCtx.element();
+        const int   level   = element.level();
 
-            const auto be_it = this->blockExtractors_.find(cartesianIdx);
-            const auto bee_it = this->extraBlockExtractors_.find(cartesianIdx);
-            if (be_it == this->blockExtractors_.end() &&
-                bee_it == this->extraBlockExtractors_.end())
+        for (unsigned dofIdx = 0; dofIdx < elemCtx.numPrimaryDof(/*timeIdx=*/0); ++dofIdx) {
+            const auto globalDofIdx = elemCtx.globalSpaceIndex(dofIdx, /*timeIdx=*/0);
+
+            const std::vector<typename BlockExtractor::Exec>* be_extractors  = nullptr;
+            const std::vector<typename BlockExtractor::Exec>* bee_extractors = nullptr;
+            const std::vector<typename BlockExtractor::Exec>* lgr_extractors = nullptr;
+
+            if (level == 0) {
+                const auto cartesianIdx = elemCtx.simulator().vanguard().cartesianIndex(globalDofIdx);
+                const auto be_it  = this->blockExtractors_.find(cartesianIdx);
+                const auto bee_it = this->extraBlockExtractors_.find(cartesianIdx);
+                if (be_it  != this->blockExtractors_.end())      { be_extractors  = &be_it->second; }
+                if (bee_it != this->extraBlockExtractors_.end()) { bee_extractors = &bee_it->second; }
+            }
+            else if constexpr (std::is_same_v<Grid, Dune::CpGrid>) {
+                // Cells inside a local grid refinement.  LGRs are a
+                // CpGrid-only feature today; ALU and Polyhedral grids
+                // keep element.level() at 0 and never enter this
+                // branch, but the constexpr if filters it out at
+                // compile time on those builds so the CpGrid-specific
+                // getLevelElem() call never has to be instantiated
+                // for an unsupported entity type.  Ownership at the
+                // leaf level is decided by Dune::InteriorEntity; the
+                // global-Cartesian isCartIdxOnThisRank predicate used
+                // at setup time does not apply to LGR cells (they do
+                // not inhabit the global Cartesian space).
+                const auto level_it = this->lgrBlockExtractors_.find(level);
+                if (level_it != this->lgrBlockExtractors_.end() &&
+                    element.partitionType() == Dune::InteriorEntity)
+                {
+                    const int levelCompressed = element.getLevelElem().index();
+                    const int levelCart       = elemCtx.simulator().vanguard()
+                                                    .levelCartesianIndexMapper()
+                                                    .cartesianIndex(levelCompressed, level);
+                    const auto cell_it = level_it->second.find(levelCart);
+                    if (cell_it != level_it->second.end()) {
+                        lgr_extractors = &cell_it->second;
+                    }
+                }
+            }
+
+            if (be_extractors  == nullptr &&
+                bee_extractors == nullptr &&
+                lgr_extractors == nullptr)
             {
                 continue;
             }
@@ -331,12 +479,9 @@ public:
                 elemCtx,
             };
 
-            if (be_it != this->blockExtractors_.end()) {
-                BlockExtractor::process(be_it->second, ectx);
-            }
-            if (bee_it != this->extraBlockExtractors_.end()) {
-                BlockExtractor::process(bee_it->second, ectx);
-            }
+            if (be_extractors  != nullptr) { BlockExtractor::process(*be_extractors,  ectx); }
+            if (bee_extractors != nullptr) { BlockExtractor::process(*bee_extractors, ectx); }
+            if (lgr_extractors != nullptr) { BlockExtractor::process(*lgr_extractors, ectx); }
         }
     }
 
@@ -649,7 +794,69 @@ public:
         this->updateFluidInPlace_(globalDofIdx, intQuants, totVolume);
     }
 
+    //! \brief Restore the buffers this module owns from a restart file.
+    void setRestart(const data::Solution& sol,
+                    const unsigned elemIdx,
+                    const unsigned globalDofIndex) override
+    {
+        BaseType::setRestart(sol, elemIdx, globalDofIndex);
+
+        auto assign = [&sol, elemIdx, globalDofIndex](const std::string& name,
+                                                      ScalarBuffer& data)
+        {
+            if (!data.empty() && sol.has(name)) {
+                data[elemIdx] = sol.data<double>(name)[globalDofIndex];
+            }
+        };
+
+        assign("RS", rs_);
+        assign("RV", rv_);
+    }
+
+protected:
+    //! \brief Allocate the buffers of the quantities only the black-oil
+    //!        formulation produces, keyed on their restart mnemonics.
+    void allocFormulationBuffers(std::map<std::string, int>& rstKeywords,
+                                 const unsigned bufferSize) override
+    {
+        // RS and RV are allocated whenever the fluid system supports them,
+        // not only when the restart keyword asks for them.
+        BaseType::allocBufferIfRequested(rstKeywords, bufferSize, rs_, "RS",
+                                         FluidSystem::enableDissolvedGas(), true);
+        BaseType::allocBufferIfRequested(rstKeywords, bufferSize, rv_, "RV",
+                                         FluidSystem::enableVaporizedOil(), true);
+
+        // PBPD requests the bubble and the dew point pressure together.
+        if (BaseType::allocBufferIfRequested(rstKeywords, bufferSize,
+                                             bubblePointPressure_, "PBPD", true)) {
+            dewPointPressure_.resize(bufferSize, 0.0);
+        }
+
+        // "WOG" ordering, as used by the shared module's keyword naming.
+        constexpr auto phaseChar = std::string_view{"WOG"};
+        for (unsigned phase = 0; phase < numPhases; ++phase) {
+            if (!FluidSystem::phaseIsActive(phase)) {
+                continue;
+            }
+            // The black-oil phase ordering is the one the keyword names assume,
+            // so no reordering is needed here.
+            BaseType::allocBufferIfRequested(rstKeywords, bufferSize, invB_[phase],
+                                             std::string("B")  + phaseChar[phase], true);
+            BaseType::allocBufferIfRequested(rstKeywords, bufferSize, relativePermeability_[phase],
+                                             std::string("KR") + phaseChar[phase], true);
+        }
+    }
+
 private:
+
+    // Buffers of the quantities only the black-oil formulation produces.
+    using ScalarBuffer = typename BaseType::ScalarBuffer;
+    ScalarBuffer rs_;
+    ScalarBuffer rv_;
+    ScalarBuffer bubblePointPressure_;
+    ScalarBuffer dewPointPressure_;
+    std::array<ScalarBuffer, numPhases> invB_;
+    std::array<ScalarBuffer, numPhases> relativePermeability_;
     template <typename T>
     using RemoveCVR = std::remove_cv_t<std::remove_reference_t<T>>;
 
@@ -704,20 +911,38 @@ private:
     {
         OPM_TIMEBLOCK_LOCAL(updateFluidInPlace, Subsystem::Output);
 
-        this->updateTotalVolumesAndPressures_(globalDofIdx, intQuants, totVolume);
+        this->updateTotalVolumesAndPressures_(globalDofIdx,
+                                              intQuants,
+                                              totVolume,
+                                              intQuants.referencePorosity());
 
         if (this->computeFip_) {
             this->updatePhaseInplaceVolumes_(globalDofIdx, intQuants, totVolume);
         }
     }
 
+    /// \brief Put every region array on the leaf grid.
+    ///
+    /// Called once, before the arrays are used.  A refined cell inherits its
+    /// parent's region; without LGRs this is the identity.
+    void mapRegionsOntoLeaf_()
+    {
+        const LookUpData<Grid, GridView> lookUpData(simulator_.gridView());
+        const auto numLeaf = simulator_.gridView().size(0);
+
+        std::vector<int> onLeaf(numLeaf, 0);
+        for (auto& [name, region] : this->regions_) {
+            std::size_t elemIdx = 0;
+            for (const auto& elem : elements(simulator_.gridView())) {
+                onLeaf[elemIdx++] = lookUpData(elem, region);
+            }
+
+            region = onLeaf;
+        }
+    }
+
     void createLocalRegion_(std::vector<int>& region)
     {
-        // For CpGrid with LGRs, where level zero grid has been distributed,
-        // resize region is needed, since in this case the total amount of
-        // element - per process - in level zero grid and leaf grid do not
-        // coincide, in general.
-        region.resize(simulator_.gridView().size(0));
         std::size_t elemIdx = 0;
         for (const auto& elem : elements(simulator_.gridView())) {
             if (elem.partitionType() != Dune::InteriorEntity) {
@@ -842,72 +1067,6 @@ private:
         }
 
         return rates;
-    }
-
-    template <typename FluidState>
-    Scalar hydroCarbonFraction(const FluidState& fs) const
-    {
-        if (this->eclState_.runspec().co2Storage()) {
-            // CO2 storage: Hydrocarbon volume is full pore-volume.
-            return 1.0;
-        }
-
-        // Common case.  Hydrocarbon volume is fraction occupied by actual
-        // hydrocarbons.
-        auto hydrocarbon = Scalar {0};
-        if (FluidSystem::phaseIsActive(oilPhaseIdx)) {
-            hydrocarbon += getValue(fs.saturation(oilPhaseIdx));
-        }
-
-        if (FluidSystem::phaseIsActive(gasPhaseIdx)) {
-            hydrocarbon += getValue(fs.saturation(gasPhaseIdx));
-        }
-
-        return hydrocarbon;
-    }
-
-    void updateTotalVolumesAndPressures_(const unsigned             globalDofIdx,
-                                         const IntensiveQuantities& intQuants,
-                                         const double               totVolume)
-    {
-        const auto& fs = intQuants.fluidState();
-
-        const double pv = totVolume * intQuants.porosity().value();
-        const auto hydrocarbon = this->hydroCarbonFraction(fs);
-
-        if (! this->hydrocarbonPoreVolume_.empty()) {
-            this->fipC_.assignPoreVolume(globalDofIdx,
-                                         totVolume * intQuants.referencePorosity());
-
-            this->dynamicPoreVolume_[globalDofIdx] = pv;
-            this->hydrocarbonPoreVolume_[globalDofIdx] = pv * hydrocarbon;
-        }
-
-        if (!this->pressureTimesHydrocarbonVolume_.empty() &&
-            !this->pressureTimesPoreVolume_.empty())
-        {
-            assert(this->hydrocarbonPoreVolume_.size() == this->pressureTimesHydrocarbonVolume_.size());
-            assert(this->fipC_.get(Inplace::Phase::PoreVolume).size() == this->pressureTimesPoreVolume_.size());
-
-            if (FluidSystem::phaseIsActive(oilPhaseIdx)) {
-                this->pressureTimesPoreVolume_[globalDofIdx] =
-                    getValue(fs.pressure(oilPhaseIdx)) * pv;
-
-                this->pressureTimesHydrocarbonVolume_[globalDofIdx] =
-                    this->pressureTimesPoreVolume_[globalDofIdx] * hydrocarbon;
-            }
-            else if (FluidSystem::phaseIsActive(gasPhaseIdx)) {
-                this->pressureTimesPoreVolume_[globalDofIdx] =
-                    getValue(fs.pressure(gasPhaseIdx)) * pv;
-
-                this->pressureTimesHydrocarbonVolume_[globalDofIdx] =
-                    this->pressureTimesPoreVolume_[globalDofIdx] * hydrocarbon;
-            }
-            else if (FluidSystem::phaseIsActive(waterPhaseIdx)) {
-                this->pressureTimesPoreVolume_[globalDofIdx] =
-                    getValue(fs.pressure(waterPhaseIdx)) * pv;
-            }
-        }
     }
 
     void updatePhaseInplaceVolumes_(const unsigned             globalDofIdx,
@@ -1641,6 +1800,21 @@ private:
                                                      stdVolGas * rhoG / stdMassTotal,
                                                      stdVolOil * rhoO / stdMassTotal,
                                                      stdVolCo2 * rhoCO2 / stdMassTotal);
+
+                          if (extboC.phaseMassFractionsRequested()) {
+                              const auto [oil, gas] = extboC.phaseSolventMassFractions({
+                                  .oilSaturation = getValue(ectx.fs.saturation(oilPhaseIdx)),
+                                  .gasSaturation = getValue(ectx.fs.saturation(gasPhaseIdx)),
+                                  .rs = getValue(ectx.fs.Rs()),
+                                  .rv = getValue(ectx.fs.Rv()),
+                                  .xVolume = ectx.intQuants.xVolume().value(),
+                                  .yVolume = ectx.intQuants.yVolume().value(),
+                                  .oilDensity = rhoO,
+                                  .gasDensity = rhoG,
+                                  .solventDensity = rhoCO2,
+                              });
+                              extboC.assignPhaseMassFractions(ectx.globalDofIdx, oil, gas);
+                          }
                       }
                     }, this->extboC_.allocated()
             },
@@ -1676,7 +1850,20 @@ private:
                   {
                       const auto cartesianIdx = vanguard.cartesianIndex(ectx.globalDofIdx);
                       rftC.assign(cartesianIdx,
-                                  [&fs = ectx.fs]() { return getValue(fs.pressure(oilPhaseIdx)); },
+                                  [&fs = ectx.fs]()
+                                  {
+                                      // Reference phase pressure, as for PRESSURE/BPR:
+                                      // oil if present, otherwise gas, otherwise water.
+                                      if (FluidSystem::phaseIsActive(oilPhaseIdx)) {
+                                          return getValue(fs.pressure(oilPhaseIdx));
+                                      }
+                                      else if (FluidSystem::phaseIsActive(gasPhaseIdx)) {
+                                          return getValue(fs.pressure(gasPhaseIdx));
+                                      }
+                                      else {
+                                          return getValue(fs.pressure(waterPhaseIdx));
+                                      }
+                                  },
                                   [&fs = ectx.fs]() { return getValue(fs.saturation(waterPhaseIdx)); },
                                   [&fs = ectx.fs]() { return getValue(fs.saturation(gasPhaseIdx)); });
                    }
@@ -1931,6 +2118,25 @@ private:
                         // Total stress is not stored but calculated result is Voigt notation
                         mech.assignStress(ectx.globalDofIdx,
                                           model.stress(ectx.globalDofIdx, /*include_fracture*/true));
+
+                        // Only assign traction if TRACT/TRACT- is requested
+                        if (mech.enableTraction()) {
+                            mech.assignTraction(ectx.globalDofIdx,
+                                                model.traction(ectx.globalDofIdx));
+                        }
+                    },
+                    true
+                );
+            }
+            if (this->tpsaC_.allocated()) {
+                this->extractors_.emplace_back(
+                    [&tpsaC = this->tpsaC_,
+                        &model = simulator_.problem().geoMechModel()](const Context& ectx) {
+                        tpsaC.assignRotation(ectx.globalDofIdx,
+                                             model.rotation(ectx.globalDofIdx));
+
+                        tpsaC.assignSolidPressure(ectx.globalDofIdx,
+                                                  model.solidPressure(ectx.globalDofIdx));
                     },
                     true
                 );
@@ -1946,6 +2152,7 @@ private:
         using Context = typename BlockExtractor::Context;
         using PhaseEntry = typename BlockExtractor::PhaseEntry;
         using ScalarEntry = typename BlockExtractor::ScalarEntry;
+        using TensorEntry = typename BlockExtractor::TensorEntry;
 
         using namespace std::string_view_literals;
 
@@ -3093,7 +3300,31 @@ private:
             },
         };
 
-        this->blockExtractors_ = BlockExtractor::setupExecMap(this->blockData_, handlers);
+        auto blockHandlers = std::span<const Entry>{handlers};
+        auto mechHandlers = std::vector<Entry>{};
+        if constexpr (getPropValue<TypeTag, Properties::EnableMech>()) {
+            if (this->mech_.allocated()) {
+                mechHandlers.assign(handlers.begin(), handlers.end());
+                mechHandlers.push_back(
+                    Entry{TensorEntry{"BSTRSS",
+                                      [&model = this->simulator_.problem().geoMechModel()]
+                                      (const VoigtIndex index, const Context& ectx)
+                                      {
+                                          return model.stress(ectx.globalDofIdx, /*include_fracture*/true)[index];
+                                      }
+                          }
+                    });
+                blockHandlers = mechHandlers;
+            }
+        }
+
+        this->blockExtractors_ = BlockExtractor::setupExecMap(this->blockData_, blockHandlers);
+
+        // The LGR-cell extractors reuse the same handler list -- the
+        // physics is identical, only the cell identification differs.
+        // Empty for runs without LB* requests (zero non-LGR cost).
+        this->lgrBlockExtractors_ =
+            BlockExtractor::setupLgrExecMap(this->lgrBlockData_, blockHandlers);
 
         this->extraBlockData_.clear();
         if (reportStepNum > 0 && !isSubStep) {
@@ -3118,6 +3349,12 @@ private:
     std::vector<typename Extractor::Entry> extractors_;
     typename BlockExtractor::ExecMap blockExtractors_;
     typename BlockExtractor::ExecMap extraBlockExtractors_;
+
+    // Per-LGR-cell extractor executor map.  Outer key is the grid level,
+    // inner key is the level-local linearised Cartesian cell index, so
+    // the per-DOF lookup in processElementBlockData short-circuits O(1)
+    // on levels with no LB* requests.  Empty for non-LGR runs.
+    typename BlockExtractor::LgrExecMap lgrBlockExtractors_;
 };
 
 } // namespace Opm

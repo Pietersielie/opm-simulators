@@ -47,7 +47,9 @@
 #include <opm/input/eclipse/EclipseState/Grid/EclipseGrid.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/FieldData.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/GridDims.hpp>
+#include <opm/input/eclipse/EclipseState/Runspec.hpp>
 #include <opm/input/eclipse/EclipseState/SummaryConfig/SummaryConfig.hpp>
+#include <opm/input/eclipse/EclipseState/Tables/Tabdims.hpp>
 
 #include <opm/input/eclipse/Parser/ErrorGuard.hpp>
 #include <opm/input/eclipse/Parser/InputErrorAction.hpp>
@@ -147,8 +149,8 @@ namespace {
         // optional<EclipseGrid> is too expensive however since doing so
         // will create a copy of the grid inside the optional<>.
         const auto rst_state = Opm::RestartIO::RstState::
-            load(std::move(rst_view),
-                 eclipseState.runspec(), parser,
+            load(std::move(rst_view), parser,
+                 static_cast<int>(eclipseState.runspec().tabdims().getNumPVTTables()),
                  &eclipseState.getInputGrid());
 
         eclipseState.loadRestartAquifers(rst_state.aquifers);
@@ -162,8 +164,9 @@ namespace {
         if (schedule == nullptr) {
             schedule = std::make_shared<Opm::Schedule>
                 (deck, eclipseState, parseContext, errorGuard,
-                 std::move(python), lowActionParsingStrictness,  /*slaveMode=*/false,
-                 keepKeywords, outputInterval, init_state);
+                 std::move(python), lowActionParsingStrictness,
+                 /* slaveMode = */ false, keepKeywords,
+                 outputInterval, init_state);
         }
 
         // Read network pressures from restart
@@ -196,9 +199,11 @@ namespace {
     {
         if (schedule == nullptr) {
             schedule = std::make_shared<Opm::Schedule>
-                (deck, eclipseState, parseContext,
-                 errorGuard, std::move(python), lowActionParsingStrictness, slaveMode, keepKeywords);
+                (deck, eclipseState, parseContext, errorGuard,
+                 std::move(python), lowActionParsingStrictness,
+                 slaveMode, keepKeywords);
         }
+
         udqState = std::make_unique<Opm::UDQState>
             ((*schedule)[0].udq().params().undefinedValue());
 
@@ -380,17 +385,31 @@ namespace {
             eclipseState = createEclipseState(comm, deck);
         }
 
+        const auto& runspec = eclipseState->runspec();
+        if (runspec.compositional() && !runspec.solutionMethodSpecified()) {
+            Opm::OpmLog::warning("No solution method was specified for this compositional case. "
+                                 "Flow uses and only supports the fully implicit method. Add FULLIMP "
+                                 "to make the intended method explicit.");
+        }
+
+        // A fracture model reads its seeds out of the deck during the run, not
+        // only at setup, so a FRAC run has to retain the Schedule keywords
+        // whatever the general setting says.  Decided here rather than by the
+        // caller because it needs the parsed RUNSPEC.
+        const auto keepScheduleKeywords =
+            keepKeywords || eclipseState->runspec().frac();
+
         if (eclipseState->getInitConfig().restartRequested()) {
             loadObjectsFromRestart(deck, parser, *parseContext,
                                    initFromRestart, outputInterval,
-                                   lowActionParsingStrictness, keepKeywords,
+                                   lowActionParsingStrictness, keepScheduleKeywords,
                                    *eclipseState, std::move(python),
                                    schedule, udqState, actionState, wtestState,
                                    errorGuard);
         }
         else {
             createNonRestartDynamicObjects(deck, *eclipseState, *parseContext,
-                                           lowActionParsingStrictness, keepKeywords,
+                                           lowActionParsingStrictness, keepScheduleKeywords,
                                            std::move(python),
                                            schedule, udqState, actionState, wtestState,
                                            errorGuard, slaveMode);
@@ -592,6 +611,32 @@ void Opm::prepareResultOutputDirectory(const std::string&           baseName,
         R"(\.(F?(INIT|RFT|SMSPEC|UNSMRY|UNRST)|([ABCFGHSTUXYZ]\d{4})|PRT|DBG|INFO(STEP|ITER)|OPMRST|ESMRY))"
     };
 
+    // Outputs from geo-mechanical runs with or without fracturing.
+    //
+    // We match filenames of the form
+    //
+    //     s000n-baseName-0000n.pvtu
+    //     s000n-p000n-baseName-0000n.vtu
+    //     baseName.pvd
+    //     baseName-0000n.pvd
+    //     baseNameFracture_on_<well>_perf_<n>_nr.pvd
+    //     baseNameFracture_on_<well>_perf_<n>_nr-0000n.vtu
+    //
+    // some of which are specific to parallel runs while others are specific
+    // to sequential runs.  Note that we remove both parallel and sequential
+    // output files here, irrespective of the current run being parallel.
+    const auto geomechPrefix = std::string {
+        R"((s\d{4}-(p\d{4}-)?)?)"
+    };
+
+    const auto geomechSuffix = std::string {
+        R"((-\d{5}\.p?vtu)|(Fracture_on_[A-Z0-9]{1,8}_perf_\d+_nr(-\d{5})?\.(pvd|vtu))|(\.pvd))"
+    };
+
+    const auto geomechRegEx = std::regex {
+        '(' + geomechPrefix + ")(" + baseName + ")(" + geomechSuffix + ')'
+    };
+
     // We collect a list of files to remove in order that the directory
     // traversal not be disturbed by remove() calls.  The downside to this
     // approach is that it opens up the common race window between the "time
@@ -600,7 +645,7 @@ void Opm::prepareResultOutputDirectory(const std::string&           baseName,
 
     std::for_each(fs::directory_iterator { outputDir },
                   fs::directory_iterator {}, // End iterator
-                  [&baseName, &extensionRegEx, &fileRemovalList]
+                  [&baseName, &extensionRegEx, &geomechRegEx, &fileRemovalList]
                   (const fs::directory_entry& dirEntry)
     {
         if (! dirEntry.is_regular_file()) {
@@ -611,8 +656,9 @@ void Opm::prepareResultOutputDirectory(const std::string&           baseName,
 
         // Note: Normal string matching for the stem() since 'baseName'
         // might contain regular expression metacharacters like '+' or '-'.
-        if ((file.stem() == baseName) &&
-            std::regex_match(file.extension().string(), extensionRegEx))
+        if (((file.stem() == baseName) &&
+             std::regex_match(file.extension().string(), extensionRegEx)) ||
+            std::regex_match(file.filename().string(), geomechRegEx))
         {
             fileRemovalList.push_back(file);
         }
@@ -775,6 +821,7 @@ void Opm::readDeck(Opm::Parallel::Communication    comm,
             }
             if (treatCriticalAsNonCritical) { // Continue with invalid names if parsing strictness is set to low
                 parseContext->update(ParseContext::SCHEDULE_INVALID_NAME, InputErrorAction::WARN);
+                parseContext->update(ParseContext::SCHEDULE_GCONSALE_INVALID_INJECTION, InputErrorAction::WARN);
             }
             parseContext->setInputSkipMode(inputSkipMode);
             readOnIORank(comm, deckFilename, parseContext.get(),

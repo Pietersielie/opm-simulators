@@ -24,11 +24,16 @@
 #ifndef OPM_WELLINTERFACE_GENERIC_HEADER_INCLUDED
 #define OPM_WELLINTERFACE_GENERIC_HEADER_INCLUDED
 
+#include <dune/common/timer.hh>
+
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/simulators/flow/BlackoilModelParameters.hpp>
 #include <opm/simulators/wells/RuntimePerforation.hpp>
+#include <opm/simulators/wells/WellIndexFracture.hpp>
 
+#include <ctime>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -38,6 +43,7 @@ namespace Opm
 
 class DeferredLogger;
 class GuideRate;
+class UnitSystem;
 template<class Scalar> class ParallelWellInfo;
 template<class Scalar> struct PerforationData;
 class SummaryState;
@@ -151,6 +157,12 @@ public:
 
     const std::vector<Scalar>& wellIndex() const { return well_index_; }
 
+    //! \brief Mutable per-perforation well indices (connection transmissibility
+    //!        factors). Adjoint hook: the dJ/dperm well-coupling gradient
+    //!        perturbs the CTF here and re-linearizes. Not used in the forward
+    //!        path.
+    std::vector<Scalar>& wellIndex() { return well_index_; }
+
     const std::map<int,std::vector<int>>& getCompletions() const { return completions_; }
 
     Scalar getTHPConstraint(const SummaryState& summaryState) const;
@@ -177,14 +189,50 @@ public:
 
     bool changedToOpenThisStep() const { return this->changed_to_open_this_step_; }
 
+    //! \param ws Well state
+    //! \param simulationTime Simulation time
+    //! \param writeMessageToOPMLog True to write message to the OPM log
+    //! \param during_well_test  true when called from WTEST re-open testing,
+    //!        which re-solves the well after every completion closure; false for
+    //!        the regular timestep update. See
+    //!        WellTest::updateWellTestStateEconomic().
+    //! \param zero_group_target True if the group has no target
+    //! \param wellTestState Well test state
+    //! \param unit_system Unit system to use
+    //! \param start_time Starting time
+    //! \param deferred_logger Deferred logging helper
+    //! \param closure_reason  when non-null, receives the reason a limit closed
+    //!        the well instead of it being logged here. Used by the WTEST re-open
+    //!        testing, where no shut-in actually happens.
     void updateWellTestState(const SingleWellState<Scalar, IndexTraits>& ws,
                              const double& simulationTime,
                              const bool& writeMessageToOPMLog,
+                             const bool during_well_test,
                              const bool zero_group_target,
                              WellTestState& wellTestState,
-                             DeferredLogger& deferred_logger) const;
+                             const UnitSystem& unit_system,
+                             const std::time_t start_time,
+                             DeferredLogger& deferred_logger,
+                             std::string* closure_reason = nullptr) const;
 
     bool isPressureControlled(const WellStateType& well_state) const;
+
+    /// Impose a WELDRAW-derived maximum production rate as an additional
+    /// LRAT or GRAT constraint on \p controls. No-op when
+    /// \p weldraw_max_rate is unset. Static so that components without a
+    /// well interface (e.g. gas lift optimization) can apply the same limit.
+    static void applyWeldrawRateLimit(const Well& well_ecl,
+                                      const std::optional<Scalar>& weldraw_max_rate,
+                                      Well::ProductionControls& controls);
+
+    /// The well's production controls with the WELDRAW-derived rate limit
+    /// (stored in \p ws.weldraw_max_rate) applied. Constraint checking and
+    /// target computations should obtain controls through this method so
+    /// the drawdown limit cannot be missed; potential calculations use the
+    /// unadjusted Well::productionControls() (WELDRAW item 4 is NO).
+    Well::ProductionControls
+    productionControlsWithWeldraw(const SummaryState& summary_state,
+                                  const SingleWellState<Scalar, IndexTraits>& ws) const;
 
     Scalar wellEfficiencyFactor() const { return well_efficiency_factor_; }
 
@@ -209,9 +257,126 @@ public:
     virtual Scalar connectionDensity(const int globalConnIdx,
                                      const int openConnIdx) const = 0;
 
+    //! \brief The total reservoir voidage rate for the given surface phase rates
+    //!        (or potentials), using the region average PVT properties that also
+    //!        produce the voidage rates in the well state.
+    virtual Scalar totalReservoirVoidageRate(const std::vector<Scalar>& surface_rates) const = 0;
+
     void addPerforations(const std::vector<RuntimePerforation>& perfs);
 
+    /// Record (or update in place) the fracture contribution to the
+    /// connection transmissibility of existing perforations.  Perforations
+    /// referring to cells that are not part of this well's local structure
+    /// are skipped with a (deduplicated) log message.  Storage is allocated
+    /// on first use; wells without fractures carry no extra state.
+    void addFracturePerforations(const std::vector<RuntimePerforation>& perfs);
+
+    /// Fracture contributions per local perforation; empty unless
+    /// addFracturePerforations() has been called.
+    const std::vector<WellIndexFracture>& wellIndexFracture() const
+    { return well_index_fracture_; }
+
+    /// Statistics for the separate (standalone) well solves, i.e. the local
+    /// nonlinear solves of the single well equations done outside the global
+    /// linearizations (prepareTimeStep, well testing) and during the well
+    /// potential calculations.
+    struct WellSolveStats
+    {
+        double solve_time{0.0};            //!< time used by normal well solves
+        double potential_solve_time{0.0};  //!< time used by well potential solves
+        double assemble_time{0.0};         //!< assembly time in the well solves
+        double linear_solve_time{0.0};     //!< linear solve time in the well solves
+        unsigned int iterations{0};            //!< well iterations in normal solves
+        unsigned int potential_iterations{0};  //!< well iterations in potential solves
+    };
+
+    const WellSolveStats& solveStats() const { return *solve_stats_; }
+    void resetSolveStats() const { *solve_stats_ = WellSolveStats{}; }
+
 protected:
+    /// RAII helper marking a standalone well solve. Accumulates the elapsed
+    /// time and the number of well iterations into the solve statistics on
+    /// scope exit, attributing them to the well potential calculations if
+    /// such a calculation is in progress.
+    class WellSolveScope
+    {
+    public:
+        WellSolveScope(const WellInterfaceGeneric& well, const int& iterations)
+            : well_(well), iterations_(iterations)
+        {
+            well_.in_well_solve_ = true;
+            timer_.start();
+        }
+        ~WellSolveScope()
+        {
+            well_.in_well_solve_ = false;
+            auto& stats = *well_.solve_stats_;
+            if (well_.computing_well_potentials_) {
+                stats.potential_solve_time += timer_.stop();
+                stats.potential_iterations += iterations_;
+            } else {
+                stats.solve_time += timer_.stop();
+                stats.iterations += iterations_;
+            }
+        }
+    private:
+        const WellInterfaceGeneric& well_;
+        const int& iterations_;
+        Dune::Timer timer_{};
+    };
+
+    /// RAII helper accumulating the elapsed time into the given part of the
+    /// solve statistics, but only when inside a standalone well solve.
+    class SolvePartTimer
+    {
+    public:
+        SolvePartTimer(const WellInterfaceGeneric& well, double& target)
+            : well_(well), target_(target)
+        {
+            timer_.start();
+        }
+        ~SolvePartTimer()
+        {
+            if (well_.in_well_solve_) {
+                target_ += timer_.stop();
+            }
+        }
+    private:
+        const WellInterfaceGeneric& well_;
+        double& target_;
+        Dune::Timer timer_{};
+    };
+
+    /// RAII helper marking that a well potential calculation is in progress.
+    class PotentialCalculationScope
+    {
+    public:
+        explicit PotentialCalculationScope(const WellInterfaceGeneric& well)
+            : well_(well), previous_(well.computing_well_potentials_)
+        {
+            well_.computing_well_potentials_ = true;
+        }
+        ~PotentialCalculationScope()
+        {
+            well_.computing_well_potentials_ = previous_;
+        }
+    private:
+        const WellInterfaceGeneric& well_;
+        bool previous_;
+    };
+
+    WellSolveScope solveScope(const int& iterations) const
+    { return WellSolveScope(*this, iterations); }
+
+    SolvePartTimer solveAssembleTimer() const
+    { return SolvePartTimer(*this, solve_stats_->assemble_time); }
+
+    SolvePartTimer solveLinearSolveTimer() const
+    { return SolvePartTimer(*this, solve_stats_->linear_solve_time); }
+
+    PotentialCalculationScope potentialCalculationScope() const
+    { return PotentialCalculationScope(*this); }
+
     bool getAllowCrossFlow() const;
 
     Scalar wmicrobes_() const;
@@ -316,6 +481,8 @@ protected:
     // We assume a well to not penetrate more than one pvt region.
     const int pvtRegionIdx_;
 
+    // TODO: with energy conservation joins, we probably should change this to be num_mass_conservation_quantities_
+    // or something like that. Energy term calculate somehow differently from the mass term
     const int num_conservation_quantities_;
 
     // number of phases
@@ -340,6 +507,10 @@ protected:
 
     // well index for each perforation
     std::vector<Scalar> well_index_;
+
+    // fracture contribution to the well index per perforation; empty when no
+    // fracture model has registered contributions (see addFracturePerforations)
+    std::vector<WellIndexFracture> well_index_fracture_;
 
     // number of the perforations for this well on this process
     int number_of_local_perforations_;
@@ -407,6 +578,14 @@ protected:
     std::vector<std::string> well_control_log_;
 
     bool changed_to_open_this_step_ = true;
+
+    // statistics for standalone well solves; shared so that well copies used
+    // during e.g. potential calculations contribute to the same statistics
+    std::shared_ptr<WellSolveStats> solve_stats_ = std::make_shared<WellSolveStats>();
+    // true while a well potential calculation is in progress
+    mutable bool computing_well_potentials_ = false;
+    // true while a standalone well solve is in progress
+    mutable bool in_well_solve_ = false;
 };
 
 }

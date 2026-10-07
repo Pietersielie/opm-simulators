@@ -18,17 +18,26 @@
 */
 #ifndef OPM_GPUBUFFER_HEADER_HPP
 #define OPM_GPUBUFFER_HEADER_HPP
+
+#include <opm/simulators/linalg/gpuistl/GpuView.hpp>
+#include <opm/simulators/linalg/gpuistl/detail/gpu_constants.hpp>
+#include <opm/simulators/linalg/gpuistl/detail/gpu_memcpy.hpp>
+#include <opm/simulators/linalg/gpuistl/detail/gpu_pointer_attributes.hpp>
+#include <opm/simulators/linalg/gpuistl/detail/gpu_safe_call.hpp>
+
+#include <opm/common/ErrorMacros.hpp>
+
+#include <cuda_runtime.h>
 #include <dune/common/fvector.hh>
 #include <dune/istl/bvector.hh>
-#include <exception>
-#include <fmt/core.h>
-#include <opm/common/ErrorMacros.hpp>
-#include <opm/simulators/linalg/gpuistl/detail/gpu_safe_call.hpp>
-#include <opm/simulators/linalg/gpuistl/detail/safe_conversion.hpp>
-#include <opm/simulators/linalg/gpuistl/GpuView.hpp>
+#include <fmt/format.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <stdexcept>
+#include <type_traits>
 #include <vector>
-#include <string>
-#include <cuda_runtime.h>
 
 
 namespace Opm::gpuistl
@@ -81,10 +90,7 @@ public:
         if (m_numberOfElements == 0) {
             return;
         }
-        OPM_GPU_SAFE_CALL(cudaMemcpy(m_dataOnDevice,
-                                    other.m_dataOnDevice,
-                                    m_numberOfElements * sizeof(T),
-                                    cudaMemcpyDeviceToDevice));
+        detail::gpuMemcpyDeviceToDevice(m_dataOnDevice, other.m_dataOnDevice, m_numberOfElements);
     }
 
     /**
@@ -162,8 +168,7 @@ public:
     GpuBuffer(const T* dataOnHost, const size_t numberOfElements)
         : GpuBuffer(numberOfElements)
     {
-        OPM_GPU_SAFE_CALL(cudaMemcpy(
-            m_dataOnDevice, dataOnHost, m_numberOfElements * sizeof(T), cudaMemcpyHostToDevice));
+        detail::gpuMemcpyHostToDevice(m_dataOnDevice, dataOnHost, m_numberOfElements);
     }
 
 
@@ -201,14 +206,14 @@ public:
     template <int BlockDimension>
     void copyFromHost(const Dune::BlockVector<Dune::FieldVector<T, BlockDimension>>& bvector)
     {
-        // TODO: [perf] vector.size() can be replaced by bvector.N() * BlockDimension
-        if (m_numberOfElements != bvector.size()) {
+        if (m_numberOfElements != bvector.dim()) {
             OPM_THROW(std::runtime_error,
-                      fmt::format("Given incompatible vector size. GpuBuffer has size {}, \n"
-                                  "however, BlockVector has N() = {}, and size = {}.",
-                                  m_numberOfElements,
-                                  bvector.N(),
-                                  bvector.size()));
+                fmt::format("Given incompatible vector size. GpuBuffer has size {},\n however, the BlockVector "
+                    "has dim() = {} (N() = {}, and size() = {}).",
+                    m_numberOfElements,
+                    bvector.dim(),
+                    bvector.N(),
+                    bvector.size()));
         }
         const auto dataPointer = static_cast<const T*>(&(bvector[0][0]));
         copyFromHost(dataPointer, m_numberOfElements);
@@ -224,12 +229,12 @@ public:
     template <int BlockDimension>
     void copyToHost(Dune::BlockVector<Dune::FieldVector<T, BlockDimension>>& bvector) const
     {
-        // TODO: [perf] vector.size() can be replaced by bvector.N() * BlockDimension
-        if (m_numberOfElements != bvector.size()) {
+        if (m_numberOfElements != bvector.dim()) {
             OPM_THROW(std::runtime_error,
                       fmt::format("Given incompatible vector size. GpuBuffer has size {},\n however, the BlockVector "
-                                  "has has N() = {}, and size() = {}.",
+                                  "has dim() = {} (N() = {}, and size() = {}).",
                                   m_numberOfElements,
+                                  bvector.dim(),
                                   bvector.N(),
                                   bvector.size()));
         }
@@ -242,22 +247,21 @@ public:
      * @param dataPointer raw pointer to CPU memory
      * @param numberOfElements number of elements to copy
      * @note This does synchronous transfer.
-     * @note assumes that this buffer has numberOfElements elements
+     * @note assumes that this buffer has at least numberOfElements elements
      */
     void copyFromHost(const T* dataPointer, size_t numberOfElements)
     {
         if (numberOfElements > size()) {
             OPM_THROW(std::runtime_error,
-                    fmt::format(fmt::runtime("Requesting to copy too many elements. "
-                                             "buffer has {} elements, while {} was requested."),
+                    fmt::format("Requesting to copy too many elements. Buffer has {} elements, while {} was requested.",
                                 size(),
                                 numberOfElements));
         }
-        OPM_GPU_SAFE_CALL(cudaMemcpy(data(), dataPointer, numberOfElements * sizeof(T), cudaMemcpyHostToDevice));
+        detail::gpuMemcpyHostToDevice(data(), dataPointer, numberOfElements);
     }
 
     /**
-     * @brief copyFromHost copies numberOfElements to the CPU memory dataPointer
+     * @brief copyToHost copies numberOfElements to the CPU memory dataPointer
      * @param dataPointer raw pointer to CPU memory
      * @param numberOfElements number of elements to copy
      * @note This does synchronous transfer.
@@ -266,7 +270,7 @@ public:
     void copyToHost(T* dataPointer, size_t numberOfElements) const
     {
         assertSameSize(numberOfElements);
-        OPM_GPU_SAFE_CALL(cudaMemcpy(dataPointer, data(), numberOfElements * sizeof(T), cudaMemcpyDeviceToHost));
+        detail::gpuMemcpyDeviceToHost(dataPointer, data(), numberOfElements);
     }
 
     /**
@@ -327,6 +331,44 @@ public:
     }
 
     /**
+     * @brief copyFromHostAsync copies numberOfElements from the CPU memory dataPointer asynchronously.
+     * @param dataPointer raw pointer to CPU memory
+     * @param numberOfElements number of elements to copy
+     * @param stream CUDA stream to use for the asynchronous copy (defaults to default stream).
+     * @note This does asynchronous transfer. If the memory region pointed to by dataPointer
+     *       has been previously registered (e.g., using cudaHostRegister by an external mechanism
+     *       like PinnedMemoryHolder), the transfer may be faster.
+     * @note assumes that this buffer has at least numberOfElements elements
+     */
+    void copyFromHostAsync(const T* dataPointer, size_t numberOfElements, cudaStream_t stream = detail::DEFAULT_STREAM)
+    {
+        if (numberOfElements > size()) {
+            OPM_THROW(std::runtime_error,
+                    fmt::format("Requesting to copy too many elements. Buffer has {} elements, while {} was requested.",
+                                size(),
+                                numberOfElements));
+        }
+        // Asynchronous copy. CUDA runtime will use pinned memory if dataPointer is in a registered region.
+        detail::gpuMemcpyHostToDeviceAsync(data(), dataPointer, numberOfElements, stream);
+    }
+
+    /**
+     * @brief copyToHostAsync copies numberOfElements to the CPU memory dataPointer asynchronously.
+     * @param dataPointer raw pointer to CPU memory
+     * @param numberOfElements number of elements to copy
+     * @param stream CUDA stream to use for the asynchronous copy (defaults to default stream).
+     * @note This does asynchronous transfer. If the memory region pointed to by dataPointer
+     *       has been previously registered (e.g., using cudaHostRegister by an external mechanism
+     *       like PinnedMemoryHolder), the transfer may be faster.
+     * @note assumes that this buffer has numberOfElements elements
+     */
+    void copyToHostAsync(T* dataPointer, size_t numberOfElements, cudaStream_t stream = detail::DEFAULT_STREAM) const
+    {
+        assertSameSize(numberOfElements);
+        detail::gpuMemcpyDeviceToHostAsync(dataPointer, data(), numberOfElements, stream);
+    }
+
+    /**
      * @brief size returns the size (number of T elements) in the buffer
      * @return number of elements
      */
@@ -345,6 +387,10 @@ public:
             OPM_THROW(std::invalid_argument, "Setting a GpuBuffer size to a non-positive number is not allowed");
         }
 
+        if (newSize == m_numberOfElements) {
+            return;
+        }
+
         if (m_numberOfElements == 0) {
             // We have no data, so we can just allocate new memory
             OPM_GPU_SAFE_CALL(cudaMalloc(&m_dataOnDevice, sizeof(T) * newSize));
@@ -352,14 +398,11 @@ public:
         else {
             // Allocate memory for temporary buffer
             T* tmpBuffer = nullptr;
-            OPM_GPU_SAFE_CALL(cudaMalloc(&tmpBuffer, sizeof(T) * m_numberOfElements));
+            OPM_GPU_SAFE_CALL(cudaMalloc(&tmpBuffer, sizeof(T) * newSize));
 
             // Move the data from the old to the new buffer with truncation
             size_t sizeOfMove = std::min({m_numberOfElements, newSize});
-            OPM_GPU_SAFE_CALL(cudaMemcpy(tmpBuffer,
-                                        m_dataOnDevice,
-                                        sizeOfMove * sizeof(T),
-                                        cudaMemcpyDeviceToDevice));
+            detail::gpuMemcpyDeviceToDevice(tmpBuffer, m_dataOnDevice, sizeOfMove);
 
             // free the old buffer
             OPM_GPU_SAFE_CALL(cudaFree(m_dataOnDevice));

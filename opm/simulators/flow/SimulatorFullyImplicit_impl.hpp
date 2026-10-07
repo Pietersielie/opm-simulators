@@ -37,6 +37,7 @@
 #include <fmt/format.h>
 
 #include <filesystem>
+#include <limits>
 #include <sstream>
 
 namespace Opm {
@@ -77,6 +78,19 @@ template<class TypeTag>
 SimulatorFullyImplicit<TypeTag>::
 ~SimulatorFullyImplicit()
 {
+    // Flush any convergence reports that were never written because the
+    // run terminated before completing its report step -- exactly the
+    // failed runs whose convergence history is most valuable.  write() is
+    // idempotent for already-reported steps and a no-op when convergence
+    // output is not active.
+    if (this->solver_ != nullptr) {
+        try {
+            this->convergence_output_.write(this->solver_->model().stepReports());
+        } catch (...) {
+            // Never let diagnostics output escape a destructor.
+        }
+    }
+
     // Safe to call on all ranks, not just the I/O rank.
     convergence_output_.endThread();
 }
@@ -129,10 +143,16 @@ run(SimulatorTimer& timer)
         this->reservoirCouplingMaster_->sendTerminateAndDisconnect();
     }
     else if (this->reservoirCouplingSlave_ && !this->reservoirCouplingSlave_->terminated()) {
-        // TODO: Implement GECON item 8: stop master process when a slave finishes
+        // We got here by running out of report steps of our own. If the master is still
+        // running, notifyEndOfRunAndDisconnect() tells it so, and the master then continues
+        // with no flow from this slave.
+        //
+        // TODO: Implement GECON item 8, which lets a master deck ask for the opposite: stop
+        //   the master run when one of its slaves finishes, rather than continuing without it.
+        //
         // Only call if not already terminated via maybeReceiveTerminateSignalFromMaster()
         // (which happens when master finishes before slave reaches end of its loop)
-        this->reservoirCouplingSlave_->receiveTerminateAndDisconnect();
+        this->reservoirCouplingSlave_->notifyEndOfRunAndDisconnect();
     }
 #endif
 
@@ -230,6 +250,15 @@ init(const SimulatorTimer& timer)
             // For restarts the simulator may have gotten some information
             // about the next timestep size from the OPMEXTRA field
             adaptiveTimeStepping_->setSuggestedNextStep(simulator_.timeStepSize());
+
+            // The time stepper above is initialised from the TUNING settings at
+            // the restart step, so apply the Newton settings from the same
+            // TUNING as well. These come from the restart file, or from the deck
+            // when the restart runs with --sched-restart=true (no TUNING_CHANGE
+            // event is raised at the restart step then).
+            if (enableTUNING) {
+                this->updateTUNING(sched_state.tuning());
+            }
         }
     }
 }
@@ -299,7 +328,7 @@ runStep(SimulatorTimer& timer)
     }
 
     // write the inital state at the report stage
-    if (timer.initialStep()) {
+    if (timer.initialStep() && !serializer_.shouldLoad()) {
         Dune::Timer perfTimer;
         perfTimer.start();
 
@@ -312,13 +341,6 @@ runStep(SimulatorTimer& timer)
         report_.success.output_write_time += perfTimer.stop();
     }
 
-    // Run a multiple steps of the solver depending on the time step control.
-    solverTimer_->start();
-
-    if (!solver_) {
-        solver_ = createSolver(wellModel_());
-    }
-
     simulator_.startNextEpisode(
         simulator_.startTime()
            + schedule().seconds(timer.currentStepNum()),
@@ -329,6 +351,27 @@ runStep(SimulatorTimer& timer)
         wellModel_().prepareDeserialize(serializer_.loadStep() - 1);
         serializer_.loadState();
         simulator_.model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+        simulator_.model().rebuildStorageCache(/*timeIdx=*/0);
+        if (simulator_.problem().intensiveQuantityHistorySize() > 1) {
+            simulator_.model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/1);
+            simulator_.model().rebuildStorageCache(/*timeIdx=*/1);
+        }
+        wellModel_().beginReportStep(timer.currentStepNum());
+    }
+
+    // Run a multiple steps of the solver depending on the time step control.
+    solverTimer_->start();
+
+    if (!solver_) {
+        solver_ = createSolver(wellModel_());
+    }
+
+    // Same position as the OPMRST restore above -- after the episode has been
+    // set up and before the solve -- for callers that keep their own state
+    // store. Used by the adjoint's checkpoint/recompute driver, which restores
+    // from its own archive rather than from an .OPMRST file. Off unless set.
+    if (restoreStateHook_) {
+        restoreStateHook_(timer.currentStepNum());
     }
 
     this->solver_->model().beginReportStep();
@@ -349,12 +392,30 @@ runStep(SimulatorTimer& timer)
             auto& schedule = this->simulator_.vanguard().schedule();
             auto& events = this->schedule()[reportStep].events();
 
-            bool result = false;
+            // The problem may cap the next time step (e.g. a geomechanical
+            // fracture model limiting steps while the fracture grows).
+            const double problem_max_next_tstep =
+                this->simulator_.problem().maxNextTimeStepSize();
+            const bool problem_caps =
+                problem_max_next_tstep < std::numeric_limits<double>::max();
+
+            bool result = problem_caps;
+            if (problem_caps) {
+                this->adaptiveTimeStepping_->updateNEXTSTEP(problem_max_next_tstep);
+            }
             if (events.hasEvent(ScheduleEvents::TUNING_CHANGE)) {
                 // Unset the event to not trigger it again on the next sub step
                 schedule.clear_event(ScheduleEvents::TUNING_CHANGE, reportStep);
                 const auto& sched_state = schedule[reportStep];
-                const auto& max_next_tstep = sched_state.max_next_tstep(enableTUNING);
+                double max_next_tstep = sched_state.max_next_tstep(enableTUNING);
+                // Both are upper bounds on the next step, so the effective cap is
+                // the smaller one.  max_next_tstep() is -1 when the schedule sets
+                // no limit at all, and then the problem's limit stands alone.
+                if (problem_caps) {
+                    max_next_tstep = (max_next_tstep > 0.0)
+                        ? std::min(max_next_tstep, problem_max_next_tstep)
+                        : problem_max_next_tstep;
+                }
                 const auto& tuning = sched_state.tuning();
 
                 if (enableTUNING) {
@@ -556,6 +617,7 @@ serializeOp(Serializer& serializer)
     serializer(simulator_);
     serializer(report_);
     serializer(adaptiveTimeStepping_);
+    serializer(modelParam_);
 }
 
 template<class TypeTag>

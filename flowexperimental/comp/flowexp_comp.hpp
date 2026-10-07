@@ -27,6 +27,7 @@
 
 #include <opm/simulators/flow/FlowProblemComp.hpp>
 #include <opm/simulators/flow/FlowProblemCompProperties.hpp>
+#include <opm/simulators/flow/NewTranFluxModule.hpp>
 
 #include <opm/simulators/linalg/parallelbicgstabbackend.hh>
 
@@ -131,6 +132,10 @@ struct TracerModel<TypeTag, TTag::FlowExpCompProblem<NumComp, EnableWater>> {
     using type = EmptyModel<TypeTag>;
 };
 
+//! Fluxes from the transmissibilities, so multipliers and edits apply
+template<class TypeTag, int NumComp, bool EnableWater>
+struct FluxModule<TypeTag, TTag::FlowExpCompProblem<NumComp, EnableWater>>
+{ using type = NewTranFluxModule<TypeTag>; };
 
 template <class TypeTag, int NumComp, bool EnableWater>
 struct FlashSolver<TypeTag, TTag::FlowExpCompProblem<NumComp, EnableWater>> {

@@ -38,6 +38,7 @@
 #include <opm/input/eclipse/EclipseState/SummaryConfig/SummaryConfig.hpp>
 
 #include <opm/output/eclipse/Inplace.hpp>
+#include <opm/output/eclipse/RegionVariableCollection.hpp>
 #include <opm/output/eclipse/RestartValue.hpp>
 
 #include <opm/models/blackoil/blackoilproperties.hh> // Properties::EnableMech, EnableSolvent
@@ -59,6 +60,9 @@
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 
+#include <algorithm>
+#include <cstddef>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -141,6 +145,9 @@ class EclWriter : public EclGenericWriter<GetPropType<TypeTag, Properties::Grid>
 
 public:
 
+    using DynamicConns =
+        std::vector<std::pair<std::string, std::vector<std::size_t>>>;
+
     static void registerParameters()
     {
         OutputModule::registerParameters();
@@ -203,6 +210,13 @@ public:
         return simulator_.vanguard().equilGrid();
     }
 
+    void recordNewDynamicWellConns(const DynamicConns& newConns)
+    {
+        if (this->collectOnIORank_.isIORank() && (this->eclIO_ != nullptr)) {
+            this->eclIO_->recordNewDynamicWellConns(newConns);
+        }
+    }
+
     /*!
      * \brief collect and pass data and pass it to eclIO writer
      */
@@ -238,6 +252,19 @@ public:
             simulator_.setupTimer().realTimeElapsed() +
             simulator_.vanguard().setupTime();
 
+        auto& regVars = this->outputModule_->regionVariables();
+
+        regVars.prepareValueAccumulation();
+
+        if (const auto conn_opt_ix = regVars
+            .variableIndex(this->outputModule_->regVarMapping(), "ConnOPT");
+            conn_opt_ix.has_value())
+        {
+            this->simulator_.problem()
+                .wellModel().reportIntervalConnectionOilProduction
+                (this->simulator_.timeStepSize(), *conn_opt_ix, regVars);
+        }
+
         const auto localWellData            = simulator_.problem().wellModel().wellData();
         const auto localWBP                 = simulator_.problem().wellModel().wellBlockAveragePressures();
         const auto localGroupAndNetworkData = simulator_.problem().wellModel()
@@ -265,7 +292,8 @@ public:
                                            localWellTestState,
                                            this->outputModule_->getInterRegFlows(),
                                            {},
-                                           {});
+                                           {},
+                                           this->outputModule_->getLgrBlockData());
 
             if (this->collectOnIORank_.isIORank()) {
                 auto& iregFlows = this->collectOnIORank_.globalInterRegFlows();
@@ -332,9 +360,18 @@ public:
         {
             OPM_TIMEBLOCK(evalSummary);
 
+            // Note: This statement sums one value per registered region
+            // variable per region per registered region set across all MPI
+            // ranks.
+            regVars.commitValues();
+
             const auto& blockData = this->collectOnIORank_.isParallel()
                 ? this->collectOnIORank_.globalBlockData()
                 : this->outputModule_->getBlockData();
+
+            const auto& lgrBlockData = this->collectOnIORank_.isParallel()
+                ? this->collectOnIORank_.globalLgrBlockData()
+                : this->outputModule_->getLgrBlockData();
 
             const auto& interRegFlows = this->collectOnIORank_.isParallel()
                 ? this->collectOnIORank_.globalInterRegFlows()
@@ -347,8 +384,11 @@ public:
                               localGroupAndNetworkData,
                               localAquiferData,
                               blockData,
+                              lgrBlockData,
                               miscSummaryData,
                               regionData,
+                              this->outputModule_->regVarMapping(),
+                              regVars,
                               inplace,
                               this->outputModule_->initialInplace(),
                               interRegFlows,
@@ -366,7 +406,8 @@ public:
             countLocalInteriorCellsGridView(gridView);
 
         this->outputModule_->
-            allocBuffers(num_interior, 0, false, false, /*isRestart*/ false);
+            allocBuffers(num_interior, 0, false, false,
+                         /*forceRestartFieldAllocation=*/false);
 
 #ifdef _OPENMP
 #pragma omp parallel for
@@ -501,7 +542,8 @@ public:
                                            localWellTestState,
                                            /* interRegFlows = */ {},
                                            flowsn,
-                                           floresn);
+                                           floresn,
+                                           /* lgrBlockData = */ {});
             if (this->collectOnIORank_.isIORank()) {
                 this->outputModule_->assignGlobalFieldsToSolution(this->collectOnIORank_.globalCellData());
             }
@@ -598,7 +640,7 @@ public:
                                               0,
                                               /*isSubStep = */false,
                                               /*log = */      false,
-                                              /*isRestart = */true);
+                                              /*forceRestartFieldAllocation = */true);
 
             const auto restartSolution =
                 loadParallelRestartSolution(this->eclIO_.get(),
@@ -635,7 +677,7 @@ public:
                                               restartStepIdx,
                                               /*isSubStep = */false,
                                               /*log = */      false,
-                                              /*isRestart = */true);
+                                              /*forceRestartFieldAllocation = */true);
         }
 
         {
@@ -763,8 +805,10 @@ private:
     const Schedule& schedule() const
     { return simulator_.vanguard().schedule(); }
 
-    /// Collect reservoir coupling master group rates for Summary::eval().
-    /// Returns nullopt for non-RC simulations or non-master processes.
+    /// Collect the reservoir coupling data Summary::eval() needs: on a
+    /// master, the slaves' group rates; on a slave, the injection targets and
+    /// production limits in force for its slave groups.  Returns nullopt for
+    /// non-RC simulations.
     std::optional<data::ReservoirCouplingGroupRates> collectReservoirCouplingGroupRates_()
     {
 #ifdef RESERVOIR_COUPLING_ENABLED
@@ -776,11 +820,28 @@ private:
             decltype(simulator_.problem().wellModel())>;
         if constexpr (requires(WellModelType& wm) { wm.isReservoirCouplingMaster(); }) {
             auto& wellModel = simulator_.problem().wellModel();
-            if (!wellModel.isReservoirCouplingMaster()) {
-                return std::nullopt;
+            if (wellModel.isReservoirCouplingMaster()) {
+                return wellModel.reservoirCouplingMaster()
+                    .collectGroupRatesForSummary();
             }
-            return wellModel.reservoirCouplingMaster()
-                .collectGroupRatesForSummary();
+            if (wellModel.isReservoirCouplingSlave()) {
+                auto rates = data::ReservoirCouplingGroupRates{};
+                for (const auto& [group, targets] :
+                         wellModel.reservoirCouplingSlave().effectiveInjectionTargets())
+                {
+                    for (const auto& [phase, target] : targets) {
+                        rates.injection_targets[group][phase] = static_cast<double>(target);
+                    }
+                }
+                for (const auto& [group, limits] :
+                         wellModel.reservoirCouplingSlave().effectiveProductionTargets())
+                {
+                    for (const auto& [cmode, limit] : limits) {
+                        rates.production_targets[group][cmode] = static_cast<double>(limit);
+                    }
+                }
+                return rates;
+            }
         }
 #endif
         return std::nullopt;
@@ -800,10 +861,17 @@ private:
 
         const int num_interior = detail::
             countLocalInteriorCellsGridView(gridView);
+        const bool writeAllSolutions =
+            Parameters::Get<Parameters::EnableWriteAllSolutions>();
+
+        // EclipseIO writes restart output for every positive time-step index in
+        // write-all mode, independently of the schedule's BASIC/FREQ settings.
+        const bool forceRestartFieldAllocation =
+            writeAllSolutions && (simulator_.timeStepIndex() > 0);
         this->outputModule_->
             allocBuffers(num_interior, reportStepNum,
-                         isSubStep && !Parameters::Get<Parameters::EnableWriteAllSolutions>(),
-                         log, /*isRestart*/ false);
+                         isSubStep && !writeAllSolutions,
+                         log, forceRestartFieldAllocation);
 
         ElementContext elemCtx(simulator_);
 
@@ -822,8 +890,6 @@ private:
                 this->outputModule_->processElementBlockData(elemCtx);
             }
             this->outputModule_->clearExtractors();
-
-            this->outputModule_->accumulateDensityParallel();
         }
 
         {
@@ -840,10 +906,12 @@ private:
             }
         }
 
-        this->outputModule_->validateLocalData();
-
         OPM_END_PARALLEL_TRY_CATCH("EclWriter::prepareLocalCellData() failed: ",
                                    this->simulator_.vanguard().grid().comm());
+
+        // Propagate rank-local exceptions before entering output collectives.
+        this->outputModule_->accumulateDensityParallel();
+        this->outputModule_->validateLocalData();
     }
 
     void captureLocalFluxData()

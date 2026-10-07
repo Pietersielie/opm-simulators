@@ -31,26 +31,37 @@ template <typename FluidSystem>
 void CompWellState<FluidSystem>::
 init(const std::vector<Well>& wells_ecl,
      const std::vector<Scalar>& cell_pressures,
-     const Scalar temperature,
+     const std::vector<Scalar>& well_temperatures,
      const std::vector<std::vector<Scalar>>& cell_mole_fractions,
      const std::vector<std::vector<CompConnectionData> >& well_connection_data,
      const SummaryState& summary_state,
-     const CompWellState* /*prev_well_state*/)
+     const std::vector<bool>& locally_owned_wells,
+     const CompWellState* prev_well_state)
 {
-    this->base_init(wells_ecl, cell_pressures, temperature, cell_mole_fractions, well_connection_data, summary_state);
+    this->base_init(wells_ecl, cell_pressures, well_temperatures, cell_mole_fractions,
+                    well_connection_data, summary_state,
+                    locally_owned_wells);
 
-    // TODO: for the simple case we have, I think we can just copy from the prev_well_state
-    // let us see how we gonna use it though
+    if (!prev_well_state) {
+        return;
+    }
+
+    for (const auto& well_name : this->wells_.wells()) {
+        if (prev_well_state->wells_.has(well_name)) {
+            this->wells_[well_name].copyRuntimeStateFrom(prev_well_state->wells_[well_name]);
+        }
+    }
 }
 
 template <typename FluidSystem>
 void CompWellState<FluidSystem>::
 base_init(const std::vector<Well>& wells_ecl,
           const std::vector<Scalar>& cell_pressures,
-          const Scalar temperature,
+          const std::vector<Scalar>& well_temperatures,
           const std::vector<std::vector<Scalar>>& cell_mole_fractions,
           const std::vector<std::vector<CompConnectionData>>& well_connection_data,
-          const SummaryState& summary_state)
+          const SummaryState& summary_state,
+          const std::vector<bool>& locally_owned_wells)
 {
     this->wells_.clear();
 
@@ -59,7 +70,11 @@ base_init(const std::vector<Well>& wells_ecl,
     for (auto w = 0*num_wells; w < num_wells; ++w) {
         const Well& well = wells_ecl[w];
         const auto& conn_data = well_connection_data[w];
-        initSingleWell(well, cell_pressures, temperature, cell_mole_fractions, conn_data, summary_state);
+        if (!locally_owned_wells[w]) {
+            continue;
+        }
+        initSingleWell(well, cell_pressures, well_temperatures[w], cell_mole_fractions,
+                       conn_data, summary_state);
     }
 
 }
@@ -68,15 +83,15 @@ template <typename FluidSystem>
 void CompWellState<FluidSystem>::
 initSingleWell(const Well& well,
                const std::vector<Scalar>& cell_pressures,
-               const Scalar tempearture,
+               const Scalar temperature,
                const std::vector<std::vector<Scalar>>& cell_mole_fractions,
                const std::vector<CompConnectionData>& conn_data,
                const SummaryState& summary_state)
 {
     if (well.isInjector()) {
-        initSingleInjector(well, cell_pressures, tempearture, conn_data, summary_state);
+        initSingleInjector(well, cell_pressures, temperature, conn_data, summary_state);
     } else {
-        initSingleProducer(well, cell_pressures, tempearture, cell_mole_fractions, conn_data, summary_state);
+        initSingleProducer(well, cell_pressures, temperature, cell_mole_fractions, conn_data, summary_state);
     }
 
 }
@@ -95,7 +110,10 @@ initSingleInjector(const Well& well,
                                     temperature,
                                     conn_data,
                                     false) );
-    ws.update_injector_targets(well, summary_state);
+    ws.status = well.getStatus();
+    if (ws.status != WellStatus::SHUT) {
+        ws.update_injector_targets(well, summary_state);
+    }
 }
 
 template <typename FluidSystem>
@@ -113,7 +131,10 @@ initSingleProducer(const Well& well,
                                     temperature,
                                     conn_data,
                                     true) );
-    ws.update_producer_targets(well, cell_mole_fractions, summary_state);
+    ws.status = well.getStatus();
+    if (ws.status != WellStatus::SHUT) {
+        ws.update_producer_targets(well, cell_mole_fractions, summary_state);
+    }
 }
 
 template <typename FluidSystem>

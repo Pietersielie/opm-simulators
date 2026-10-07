@@ -144,6 +144,13 @@ public:
     /// @return Production reservoir rate for the specified phase
     Scalar getMasterGroupProductionReservoirRate(const std::string &group_name, ReservoirCoupling::Phase phase) const;
 
+    /// @brief Get the injection potentials for a slave group
+    /// @param master_group_name Name of the master group
+    /// @return Reference to the injection potentials data for the specified group
+    /// @note Used to cap a master group's injection target at what its slave group can
+    ///   inject, see RescoupConstraintsCalculator::capAndRedistributeInjectionTargets_().
+    const Potentials& getSlaveGroupInjectionPotentials(const std::string &master_group_name) const;
+
     /// @brief Get the production potentials for a slave group
     /// @param master_group_name Name of the master group
     /// @return Reference to the potentials data for the specified group
@@ -260,10 +267,12 @@ public:
     /// @return ReservoirCouplingGroupRates struct with per-group rates.
     data::ReservoirCouplingGroupRates collectGroupRatesForSummary() const;
 
-    /// @brief Check if a specific slave process has been activated
+    /// @brief Check if a specific slave process currently takes part in the coupling
+    /// @details True only for a slave that has activated and has not ended. A slave that is
+    ///   not coupled sends no data, and its groups contribute zero rates.
     /// @param index Index of the slave process
-    /// @return true if the slave is activated, false otherwise
-    bool slaveIsActivated(int index) const { return this->master_.slaveIsActivated(index); }
+    /// @return true if the slave is coupled, false otherwise
+    bool slaveIsCoupled(int index) const { return this->master_.slaveIsCoupled(index); }
 
     /// @brief Get the name of a specific slave process
     /// @param index Index of the slave process

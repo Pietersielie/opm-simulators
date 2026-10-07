@@ -35,7 +35,7 @@ struct bsr_matrix
  *
  * @return Pointer to bsr matrix.
  */
-bsr_matrix* bsr_alloc();
+bsr_matrix* bsr_alloc(void);
 
 /**
  * @brief Delete bsr matrix.
@@ -64,12 +64,30 @@ void bsr_init(bsr_matrix *A, int nrows, int nnz, int b);
  * @param x Pointer to input vector.
  * @param y Pointer to output vector.
  */
+void bsr_vmspumv2(bsr_matrix *A, const double *x, double *y, double alpha);
+void bsr_vmspumv3(bsr_matrix *A, const double *x, double *y, double alpha);
+void bsr_vmspumv4(bsr_matrix *A, const double *x, double *y, double alpha);
+
+/**
+ * @brief Sparse matrix-vector multiplication in mixed precision.
+ *
+ * @note Function is specialized for 3x3 block-sparse matrices.
+ * @note The dense 3x3 blocks are assumed to be column-major
+ * @note Function uses AVX2 intrinsics.
+ *
+ * @param A Pointer to bsr matrix.
+ * @param x Pointer to input vector.
+ * @param y Pointer to output vector.
+ */
+void bsr_vmspmv2(bsr_matrix *A, const double *x, double *y);
 void bsr_vmspmv3(bsr_matrix *A, const double *x, double *y);
+void bsr_vmspmv4(bsr_matrix *A, const double *x, double *y);
 
 /**
  * @brief Sparse matrix-vector multiplication in double precision.
  *
  * @note Function is specialized for 3x3 block-sparse matrices.
+ * @note The dense 3x3 blocks are assumed to be column-major
  * @note Function uses AVX2 intrinsics.
  *
  * @param A Pointer to bsr matrix.

@@ -35,6 +35,7 @@
 #include <opm/grid/cpgrid/GridHelpers.hpp>
 #include <opm/grid/cpgrid/LevelCartesianIndexMapper.hpp>
 
+#include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/input/eclipse/Schedule/Schedule.hpp>
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/input/eclipse/Schedule/Well/WellConnections.hpp>
@@ -221,12 +222,20 @@ doLoadBalance_(const Dune::EdgeWeightMethod             edgeWeightsMethod,
             : std::vector<Well>{};
 
         const auto& possibleFutureConnections = schedule.getPossibleFutureConnections();
+                // Mechanics couples cells across zero-transmissibility faces,
+                // so the overlap layer must not be pruned by transmissibility
+                // in mechanical runs (same reasoning as for thermal runs).
+                const bool useTransToFilterOverlap =
+                        !(eclState1.getSimulationConfig().isThermal() ||
+                            eclState1.getSimulationConfig().isTemp() ||
+                            eclState1.runspec().mech());
         // Distribute the grid and switch to the distributed view.
         if (mpiSize > 1) {
             this->distributeGrid(edgeWeightsMethod, ownersFirst,
                                  addCorners, numOverlap, partitionMethod,
                                  serialPartitioning, enableDistributedWells,
-                                 imbalanceTol, loadBalancerSet != 0,
+                                                                 imbalanceTol, loadBalancerSet != 0,
+                                                                 useTransToFilterOverlap,
                                  faceTrans, wells,
                                  possibleFutureConnections,
                                  eclState1, parallelWells);
@@ -250,7 +259,9 @@ doLoadBalance_(const Dune::EdgeWeightMethod             edgeWeightsMethod,
                         break;
                     }
                 }
-                if (!well_on_rank[well_idx]) parallelWells.emplace_back(well_name, false);
+                if (well_on_rank[well_idx] == 0) {
+                    parallelWells.emplace_back(well_name, false);
+                }
                 ++well_idx;
             }
 
@@ -264,8 +275,10 @@ doLoadBalance_(const Dune::EdgeWeightMethod             edgeWeightsMethod,
                 well_idx = 0;
                 for (const auto& well_name : inactive_well_names) {
                     std::string msg = fmt::format("Well {} is inactive, with perforations on ranks: ", well_name);
-                    for (int i=0; i<nranks; ++i) {
-                        if (well_on_rank_global[i*num_wells + well_idx]) msg += fmt::format("{} ", i);
+                    for (int i = 0; i < nranks; ++i) {
+                        if (well_on_rank_global[i*num_wells + well_idx] != 0) {
+                            msg += fmt::format("{} ", i);
+                        }
                     }
                     OpmLog::info(msg);
                     ++well_idx;
@@ -365,6 +378,7 @@ distributeGrid(const Dune::EdgeWeightMethod                          edgeWeights
                const bool                                            enableDistributedWells,
                const double                                          imbalanceTol,
                const bool                                            loadBalancerSet,
+               const bool                                            useTransToFilterOverlap,
                const std::vector<double>&                            faceTrans,
                const std::vector<Well>&                              wells,
                const std::unordered_map<std::string, std::set<int>>& possibleFutureConnections,
@@ -377,7 +391,8 @@ distributeGrid(const Dune::EdgeWeightMethod                          edgeWeights
         this->distributeGrid(edgeWeightsMethod, ownersFirst, addCorners,
                              numOverlap, partitionMethod,
                              serialPartitioning, enableDistributedWells,
-                             imbalanceTol, loadBalancerSet, faceTrans,
+                             imbalanceTol, loadBalancerSet,
+                             useTransToFilterOverlap, faceTrans,
                              wells, possibleFutureConnections,
                              eclState, parallelWells);
     }
@@ -407,6 +422,7 @@ distributeGrid(const Dune::EdgeWeightMethod                          edgeWeights
                const bool                                            enableDistributedWells,
                const double                                          imbalanceTol,
                const bool                                            loadBalancerSet,
+               const bool                                            useTransToFilterOverlap,
                const std::vector<double>&                            faceTrans,
                const std::vector<Well>&                              wells,
                const std::unordered_map<std::string, std::set<int>>& possibleFutureConnections,
@@ -442,7 +458,8 @@ distributeGrid(const Dune::EdgeWeightMethod                          edgeWeights
                                       faceTrans.data(), ownersFirst,
                                       addCornerCells, overlapLayers,
                                       partitionMethod, imbalanceTol,
-                                      enableDistributedWells));
+                                      enableDistributedWells,
+                                      useTransToFilterOverlap));
     }
 }
 
@@ -567,7 +584,7 @@ doCreateGrids_(const bool edge_conformal, EclipseState& eclState)
             removed_cells.resize(size);
         }
 
-        this->grid_->comm().broadcast(removed_cells.data(), size, 0);
+        this->grid_->comm().broadcast(removed_cells.data(), static_cast<int>(size), 0);
     }
 
     // Inform the aquifer object that we might have removed/deactivated

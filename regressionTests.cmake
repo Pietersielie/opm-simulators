@@ -23,10 +23,14 @@ add_test_compareECLFiles(
 
 add_test_compareECLFiles(
   CASENAME
-    1dcompositional
+    1dcompositional_flowexp_comp
   FILENAME
     1D_COMP
   SIMULATOR
+    flowexp_comp
+  DEV_SIMULATOR
+    flowexp_comp3_2p
+  REFERENCE_SIMULATOR
     flowexp_comp
   ABS_TOL
     ${abs_tol}
@@ -34,6 +38,201 @@ add_test_compareECLFiles(
     ${rel_tol}
   DIR
     compositional
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    1dcompositional
+  FILENAME
+    1D_COMP
+  SIMULATOR
+    flow_comp
+  DEV_SIMULATOR
+    flow_comp3_2p
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    oil_into_water_zone_compositional
+  FILENAME
+    OIL_INTO_WATER_ZONE
+  SIMULATOR
+    flow_comp
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    sshift_compositional
+  FILENAME
+    SIMPLE_COMP_SSHIFT
+  SIMULATOR
+    flow_comp
+  DEV_SIMULATOR
+    flow_comp3_2p
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    1e-3
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    multz_barrier_compositional
+  FILENAME
+    MULTZ_BARRIER
+  SIMULATOR
+    flow_comp
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional/transmissibility
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    thpres_50bar_compositional
+  FILENAME
+    THPRES_50BAR
+  SIMULATOR
+    flow_comp
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional/thpres
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    thpres_default_compositional
+  FILENAME
+    THPRES_DEFAULT
+  SIMULATOR
+    flow_comp
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional/thpres
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    equil_1d_zmfvd
+  FILENAME
+    EQUIL_1D_ZMFVD
+  SIMULATOR
+    flow_comp
+  DEV_SIMULATOR
+    flow_comp3_2p
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional/equilibration
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    equil_1d_zmfvd_oil
+  FILENAME
+    EQUIL_1D_ZMFVD_OIL
+  SIMULATOR
+    flow_comp
+  DEV_SIMULATOR
+    flow_comp3_2p
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional/equilibration
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    equil_1d_compvd_water
+  FILENAME
+    EQUIL_1D_COMPVD_WATER
+  SIMULATOR
+    flow_comp
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional/equilibration
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    equil_1d_compvd_water_gascap
+  FILENAME
+    EQUIL_1D_COMPVD_WATER_GASCAP
+  SIMULATOR
+    flow_comp
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional/equilibration
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    equil_1d_compvd_oil
+  FILENAME
+    EQUIL_1D_COMPVD_OIL
+  SIMULATOR
+    flow_comp
+  REFERENCE_SIMULATOR
+    flow_comp
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    compositional/equilibration
 )
 
 add_test_compareECLFiles(
@@ -128,6 +327,7 @@ add_test_compareECLFiles(
 set(_spe1_tests_energy
   SPE1CASE2_THERMAL
   SPE1CASE2_THERMAL_WATVISC
+  SPE1CASE2_MSW_THERMAL
 )
 
 add_multiple_tests(
@@ -560,6 +760,57 @@ add_test_compareECLFiles(
 
 add_test_compareECLFiles(
   CASENAME
+    aquct_02_gaswater
+  FILENAME
+    AQUCT-02
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_gaswater
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    aquifers
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    aquct_03_onephase
+  FILENAME
+    AQUCT-03
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_onephase
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    aquifers
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    aquflux_03_gaswater
+  FILENAME
+    AQUFLUX-03
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_gaswater
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    aquifers
+)
+
+add_test_compareECLFiles(
+  CASENAME
     spe3
   FILENAME
     SPE3CASE1
@@ -735,6 +986,8 @@ add_test_compareECLFiles(
     ${abs_tol}
   REL_TOL
     ${coarse_rel_tol}
+  TEST_ARGS
+    --enable-opm-rst-file=true
 )
 
 add_test_compareECLFiles(
@@ -1040,6 +1293,101 @@ add_test_compareECLFiles(
     ${rel_tol}
   DIR
     wecon_wtest
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    wecon_pluscon_complump
+  FILENAME
+    WECON_PLUSCON_COMPLUMP
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_oilwater
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    wecon_wtest
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    wecon_item_14
+  FILENAME
+    WECON-02
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    wecon_wtest
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    weldraw_01
+  FILENAME
+    WELDRAW-01
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    weldraw
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    weldraw_01_msw
+  FILENAME
+    WELDRAW-01-MSW
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    weldraw
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    weldraw_02_gas
+  FILENAME
+    WELDRAW-02-GAS
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    weldraw
+  TEST_ARGS
+    --enable-tuning=true
 )
 
 add_test_compareECLFiles(
@@ -1557,6 +1905,8 @@ add_test_compareECLFiles(
 set(_tpsa_cases
   TPSA_LAGGED
   TPSA_FIXEDSTRESS
+  TPSA_BC
+  TPSA_SPRING_BC
 )
 
 add_multiple_tests(
@@ -1574,6 +1924,28 @@ add_multiple_tests(
     tpsa
   TEST_ARGS
     --enable-opm-rst-file=1
+)
+
+set(_tpsa_energy
+    TPSA_THERMAL
+)
+
+add_multiple_tests(
+  _tpsa_energy
+  ""
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_onephase_energy_tpsa
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    tpsa
+  TEST_ARGS
+    --enable-opm-rst-file=1
+    --initial-time-step-in-days=0.1
 )
 
 add_test_compareECLFiles(
@@ -1657,6 +2029,7 @@ set(_model2_tests
   9_3D_GINJ_GAS_MAX_EXPORT_MSW
   9_3E_GAS_MIN_EXPORT_STW
   9_3E_GAS_MIN_EXPORT_MSW
+  9_3F_GINJ_GAS_REIN_CAP_STW
   9_4A_WINJ_MAXWRATES_MAXBHP_GCONPROD_1L_STW
   9_4A_WINJ_MAXWRATES_MAXBHP_GCONPROD_1L_MSW
   9_4B_WINJ_VREP-W_STW
@@ -1665,6 +2038,8 @@ set(_model2_tests
   9_4C_WINJ_GINJ_VREP-W_REIN-G_MSW
   9_4D_WINJ_GINJ_GAS_EXPORT_STW
   9_4D_WINJ_GINJ_GAS_EXPORT_MSW
+  GUIDERAT_DEFAULT_WGRUPCON
+  GUIDERAT_POTENTIAL_FALLBACK
 )
 
 add_multiple_tests(
@@ -2684,6 +3059,177 @@ add_test_compareECLFiles(
     gecon
   TEST_ARGS
     --solver-max-time-step-in-days=15
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    cecon_01
+  FILENAME
+    CECON-01
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    cecon
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    cecon_02
+  FILENAME
+    CECON-02
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    cecon
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    cecon_03
+  FILENAME
+    CECON-03
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    cecon
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    wpwe_complump_connection_count
+  FILENAME
+    WPWE-COMPLUMP-CONNECTION-COUNT
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    wpwe
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    wpwe_deck_connection_changes
+  FILENAME
+    WPWE-DECK-CONNECTION-CHANGES
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    wpwe
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    wpwe_deck_status_conversion
+  FILENAME
+    WPWE-DECK-STATUS-CONVERSION
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    wpwe
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    wpwe_mixed_closure_causes
+  FILENAME
+    WPWE-MIXED-CLOSURE-CAUSES
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    wpwe
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    wpwe_workover_shut_stop
+  FILENAME
+    WPWE-WORKOVER-SHUT-STOP
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    wpwe
+  TEST_ARGS
+    --enable-tuning=true
+)
+
+add_test_compareECLFiles(
+  CASENAME
+    wconprod_13
+  FILENAME
+    WCONPROD-13
+  SIMULATOR
+    flow
+  DEV_SIMULATOR
+    flow_blackoil
+  ABS_TOL
+    ${abs_tol}
+  REL_TOL
+    ${rel_tol}
+  DIR
+    wconprod
+  TEST_ARGS
+    --enable-tuning=true
 )
 
 if(BUILD_FLOW_POLY_GRID)

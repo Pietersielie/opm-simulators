@@ -188,11 +188,10 @@ void WellState<Scalar, IndexTraits>::
 initSingleProducer(const Well& well,
                    const ParallelWellInfo<Scalar>& well_info,
                    Scalar pressure_first_connection,
+                   Scalar temperature_first_connection,
                    const std::vector<PerforationData<Scalar>>& well_perf_data,
                    const SummaryState& summary_state)
 {
-    const Scalar temp = 273.15 + 15.56;
-
     auto& ws = this->wells_.add(well.name(),
                                 SingleWellState<Scalar, IndexTraits>{well.name(),
                                                 well_info,
@@ -200,7 +199,7 @@ initSingleProducer(const Well& well,
                                                 true,
                                                 pressure_first_connection,
                                                 well_perf_data,
-                                                temp});
+                                                temperature_first_connection});
 
     // the rest of the code needs to executed even if ws.perf_data is empty
     // as this does not say anything for the whole well if it is distributed.
@@ -221,14 +220,14 @@ initSingleInjector(const Well& well,
                    const std::vector<PerforationData<Scalar>>& well_perf_data,
                    const SummaryState& summary_state)
 {
-    const Scalar temp = well.hasInjTemperature() ? well.inj_temperature() : temperature_first_connection;
+    const Scalar temperature = well.hasInjTemperature() ? well.inj_temperature() : temperature_first_connection;
     auto& ws = this->wells_.add(well.name(), SingleWellState<Scalar, IndexTraits>{well.name(),
                                              well_info,
                                              this->phaseUsageInfo(),
                                              false,
                                              pressure_first_connection,
                                              well_perf_data,
-                                             temp});
+                                             temperature});
 
     // the rest of the code needs to executed even if ws.perf_data is empty
     // as this does not say anything for the whole well if it is distributed.
@@ -250,23 +249,21 @@ initSingleWell(const std::vector<Scalar>& cellPressures,
                const SummaryState& summary_state)
 {
     Scalar pressure_first_connection = -1;
+    Scalar temperature_first_connection = -1;
     if (!well_perf_data.empty()) {
-        pressure_first_connection = cellPressures[well_perf_data[0].cell_index];
+        const auto first_cell_index = well_perf_data[0].cell_index;
+        pressure_first_connection = cellPressures[first_cell_index];
+        temperature_first_connection = cellTemperatures[first_cell_index];
     }
     // The following call is necessary to ensure that processes that do not contain the first perforation get the correct value
     pressure_first_connection = well_info.broadcastFirstPerforationValue(pressure_first_connection);
+    temperature_first_connection = well_info.broadcastFirstPerforationValue(temperature_first_connection);
 
     if (well.isInjector()) {
-        Scalar temperature_first_connection = -1;
-        if (!well_perf_data.empty()) {
-            temperature_first_connection = cellTemperatures[well_perf_data[0].cell_index];
-        }
-        // The following call is necessary to ensure that processes that do not contain the first perforation get the correct value
-        temperature_first_connection = well_info.broadcastFirstPerforationValue(temperature_first_connection);
         this->initSingleInjector(well, well_info, pressure_first_connection, temperature_first_connection,
                                  well_perf_data, summary_state);
     } else {
-        this->initSingleProducer(well, well_info, pressure_first_connection,
+        this->initSingleProducer(well, well_info, pressure_first_connection, temperature_first_connection,
                                  well_perf_data, summary_state);
     }
 }
@@ -338,7 +335,9 @@ init(const std::vector<Scalar>& cellPressures,
                     perf_data.phase_rates[this->numPhases()*perf + p] = ws.surface_rates[p] / Scalar(global_num_perf_this_well);
                 }
             }
-            perf_data.pressure[perf] = cellPressures[well_perf_data[w][perf].cell_index];
+            const auto cell_index = well_perf_data[w][perf].cell_index;
+            perf_data.pressure[perf] = cellPressures[cell_index];
+            perf_data.temperature[perf] = cellTemperatures[cell_index];
         }
     }
 
@@ -392,12 +391,26 @@ init(const std::vector<Scalar>& cellPressures,
             auto& new_well = this->well(w);
             new_well.init_timestep(prev_well);
 
+            // Preserve the retained limit across time steps and shut periods
+            // unless the schedule explicitly re-specifies THP or VFP controls.
+            // ACTIONX raises no event here, it is handled from
+            // thp_respecified_wells in BlackoilWellModelGeneric::updateEclWells().
+            if (prev_well.network_thp_limit.has_value() &&
+                new_well.producer == prev_well.producer && new_well.producer &&
+                !new_well.events.hasEvent(ScheduleEvents::WELL_THP_UPDATE))
+            {
+                new_well.network_thp_limit = prev_well.network_thp_limit;
+            }
+
             if (prev_well.status == Well::Status::SHUT || prev_well.was_shut_before_action_applied) {
                 // Well was shut in previous state, do not use its values.
                 continue;
             }
 
-            new_well.status = prev_well.status;
+            // A current schedule STOP/OPEN must take precedence over the previous runtime status.
+            if (!new_well.events.hasEvent(ScheduleEvents::WELL_STATUS_CHANGE)) {
+                new_well.status = prev_well.status;
+            }
 
             if (new_well.producer != prev_well.producer) {
                 // Well changed to/from injector from/to producer, do not
@@ -469,14 +482,15 @@ resize(const std::vector<Well>& wells_ecl,
        const std::size_t numCells,
        const std::vector<std::vector<PerforationData<Scalar>>>& well_perf_data,
        const SummaryState& summary_state,
-       const bool enable_distributed_wells)
+       const bool enable_distributed_wells,
+       const bool thermal)
 {
     this->enableDistributedWells_ = enable_distributed_wells;
     const std::vector<Scalar> tmp(numCells, 0.0); // <- UGLY HACK to pass the size
     init(tmp, tmp, schedule, wells_ecl, parallel_well_info, 0, nullptr, well_perf_data, summary_state, this->enableDistributedWells_);
 
     if (handle_ms_well) {
-        initWellStateMSWell(wells_ecl, nullptr);
+        initWellStateMSWell(wells_ecl, nullptr, thermal);
     }
 }
 
@@ -547,6 +561,7 @@ report(const int*                            globalCellIdxMap,
         const auto& well_potentials = ws.well_potentials;
         const auto& wpi = ws.productivity_index;
         const auto& wv = ws.surface_rates;
+        const auto frac_rate = ws.frac_rate;
         const auto& wname = this->name(well_index);
 
         auto dummyWell = data::Well{};
@@ -565,6 +580,7 @@ report(const int*                            globalCellIdxMap,
         if (pu.phaseIsActive(waterPhaseIdx)) {
             const int phase_pos = pu.canonicalToActivePhaseIdx(waterPhaseIdx);
             well.rates.set(rt::wat, wv[phase_pos]);
+            well.rates.set(rt::wat_frac, frac_rate);
             well.rates.set(rt::reservoir_water, reservoir_rates[phase_pos]);
             well.rates.set(rt::productivity_index_water, wpi[phase_pos]);
             well.rates.set(rt::well_potential_water, well_potentials[phase_pos]);
@@ -648,6 +664,12 @@ report(const int*                            globalCellIdxMap,
             curr.isProducer = ws.producer;
             curr.prod = ws.production_cmode;
             curr.inj  = ws.injection_cmode;
+
+            // A producer whose active control is the one carrying its
+            // converted drawdown limit reports drawdown control instead.
+            curr.drawdownLimited = ws.producer
+                && ws.weldraw_cmode.has_value()
+                && (ws.production_cmode == *ws.weldraw_cmode);
         }
 
         if (const auto& pwinfo = ws.parallel_info.get();
@@ -670,6 +692,50 @@ report(const int*                            globalCellIdxMap,
     }
 
     return res;
+}
+
+template<typename Scalar, typename IndexTraits>
+void WellState<Scalar, IndexTraits>::
+reportIntervalConnectionOilProduction(const double                                     dt,
+                                      const std::function<bool(const std::string&)>&   wasDynamicallyClosed,
+                                      const std::function<double(const std::string&)>& wellEffFac,
+                                      const std::function<void(int, double)>&          copt) const
+{
+    const auto& pu = this->phaseUsageInfo_;
+
+    if (! pu.phaseIsActive(oilPhaseIdx)) {
+        return;
+    }
+
+    const auto np   = static_cast<std::size_t>(this->numPhases());
+    const auto opos = pu.canonicalToActivePhaseIdx(oilPhaseIdx);
+
+    for (const auto& xw : this->wells_) {
+        if (! xw.producer ||
+            ! xw.parallel_info.get().hasLocalCells() ||
+            ((xw.status == Well::Status::SHUT) &&
+             ! wasDynamicallyClosed(xw.name)))
+        {
+            // Not a producing well, not connected to this rank, or the well
+            // is shut.  In other words, there is nothing to do for this
+            // well on this rank.
+            continue;
+        }
+
+        const auto effective_dt = dt * wellEffFac(xw.name);
+
+        if (! (effective_dt > 0.0)) {
+            continue;
+        }
+
+        const auto* qo = &xw.perf_data.phase_rates[0*np + opos];
+
+        for (const auto& cell : xw.perf_data.cell_index) {
+            // Note sign of *qo to convert from injection to production.
+            copt(cell, (- *qo) * effective_dt);
+            qo += np;
+        }
+    }
 }
 
 template<typename Scalar, typename IndexTraits>
@@ -702,6 +768,7 @@ reportConnections(std::vector<data::Connection>& connections,
 
     if (! ws.producer) {
         this->reportConnectionFilterCake(well_index, connections);
+        this->reportConnectionFracture(well_index, connections);
     }
 
     if (! perf_data.connFracStatistics.empty()) {
@@ -713,7 +780,8 @@ reportConnections(std::vector<data::Connection>& connections,
 template<typename Scalar, typename IndexTraits>
 void WellState<Scalar, IndexTraits>::
 initWellStateMSWell(const std::vector<Well>& wells_ecl,
-                    const WellState* prev_well_state)
+                    const WellState* prev_well_state,
+                    const bool thermal)
 {
     // still using the order in wells
     const auto nw = wells_ecl.size();
@@ -830,6 +898,7 @@ initWellStateMSWell(const std::vector<Well>& wells_ecl,
 
             const auto& perf_rates = perf_data.phase_rates;
             const auto& perf_press = perf_data.pressure;
+            const auto& perf_temperature = perf_data.temperature;
             // The function calculateSegmentRates as well as the loop filling the segment_pressure work
             // with *global* containers. Now we create global vectors containing the phase_rates and
             // pressures of all processes.
@@ -843,6 +912,7 @@ initWellStateMSWell(const std::vector<Well>& wells_ecl,
 
             std::vector<Scalar> perforation_rates(number_of_global_perfs * np, 0.0);
             std::vector<Scalar> perforation_pressures(number_of_global_perfs, 0.0);
+            std::vector<Scalar> perforation_temperature(number_of_global_perfs, 0.0);
 
             assert(perf_data.size() == perf_press.size());
             assert(perf_data.size() * np == perf_rates.size());
@@ -851,6 +921,7 @@ initWellStateMSWell(const std::vector<Well>& wells_ecl,
                     candidate != active_perf_index_local_to_global.end()) {
                     const int global_active_perf_index = candidate->second;
                     perforation_pressures[global_active_perf_index] = perf_press[perf];
+                    perforation_temperature[global_active_perf_index] = perf_temperature[perf];
                     for (int i = 0; i < np; i++) {
                         perforation_rates[global_active_perf_index * np + i] = perf_rates[perf * np + i];
                     }
@@ -866,27 +937,39 @@ initWellStateMSWell(const std::vector<Well>& wells_ecl,
             if (ws.parallel_info.get().communication().size() > 1) {
                 ws.parallel_info.get().communication().sum(perforation_rates.data(), perforation_rates.size());
                 ws.parallel_info.get().communication().sum(perforation_pressures.data(), perforation_pressures.size());
+                ws.parallel_info.get().communication().sum(perforation_temperature.data(), perforation_temperature.size());
             }
 
             calculateSegmentRates(ws.parallel_info, segment_inlets, segment_perforations, perforation_rates, np, 0 /* top segment */, ws.segments.rates);
 
             // for the segment pressure, the segment pressure is the same with the first perforation belongs to the segment
             // if there is no perforation associated with this segment, it uses the pressure from the outlet segment
-            // which requres the ordering is successful
+            // which requires the ordering is successful
             // Not sure what is the best way to handle the initialization, hopefully, the bad initialization can be
             // improved during the solveWellEq process
             {
                 // top segment is always the first one, and its pressure is the well bhp
                 auto& segment_pressure = ws.segments.pressure;
+                auto& segment_temperature = ws.segments.temperature;
                 segment_pressure[0] = ws.bhp;
+                segment_temperature[0] = ws.temperature;
                 for (std::size_t seg = 1; seg < well_nseg; ++seg) {
+                    const int outlet_seg = segment_set[seg].outletSegment();
+                    const int outlet_seg_index = segment_set.segmentNumberToIndex(outlet_seg);
                     if (!segment_perforations[seg].empty()) {
                         const int first_perf_global_index = segment_perforations[seg][0];
                         segment_pressure[seg] = perforation_pressures[first_perf_global_index];
+                        // TODO: temperature initialisation could be more consistent.
+                        // Thermal: per-segment temperature; isothermal: the single well temperature.
+                        segment_temperature[seg] = thermal
+                            ? (ws.producer ? perforation_temperature[first_perf_global_index]
+                                           : segment_temperature[outlet_seg_index])
+                            : ws.temperature;
                     } else {
                         // using the outlet segment pressure // it needs the ordering is correct
-                        const int outlet_seg = segment_set[seg].outletSegment();
-                        segment_pressure[seg] = segment_pressure[segment_set.segmentNumberToIndex(outlet_seg)];
+                        segment_pressure[seg] = segment_pressure[outlet_seg_index];
+                        segment_temperature[seg] = thermal ? segment_temperature[outlet_seg_index]
+                                                           : ws.temperature;
                     }
                 }
             }
@@ -1302,6 +1385,45 @@ reportConnectionFilterCake(const std::size_t well_index,
         filtrate.perm = filtrate_data.perm[i];
         filtrate.radius = filtrate_data.radius[i];
         filtrate.area_of_flow = filtrate_data.area_of_flow[i];
+        filtrate.flow_factor = filtrate_data.flow_factor[i];
+        filtrate.fracture_rate = filtrate_data.fracture_rate[i];
+    }
+}
+
+
+template<typename Scalar, typename IndexTraits>
+void WellState<Scalar, IndexTraits>::
+reportConnectionFracture(const std::size_t well_index,
+                         std::vector<data::Connection>& connections) const
+{
+    const auto& perf_data = this->well(well_index).perf_data;
+    const auto num_perf_well = perf_data.size();
+
+    const auto& data = perf_data.fracture_data;
+    if (data.area.size() != num_perf_well) {
+        // No fracture model has claimed this well, so there is nothing to
+        // report and the containers were never sized.
+        return;
+    }
+
+    for (auto i = 0*num_perf_well; i < num_perf_well; ++i) {
+        auto& fracture = connections[i].fracture;
+
+        fracture.area = data.area[i];
+        fracture.flux = data.flux[i];
+        fracture.height = data.height[i];
+        fracture.length = data.length[i];
+        fracture.WI = data.WI[i];
+        fracture.volume = data.volume[i];
+        fracture.filter_volume = data.filter_volume[i];
+        fracture.avg_width = data.avg_width[i];
+        fracture.avg_filter_width = data.avg_filter_width[i];
+        fracture.inj_pressure = data.inj_pressure[i];
+        fracture.inj_bhp = data.inj_bhp[i];
+        fracture.inj_wellrate = data.inj_wellrate[i];
+
+        connections[i].rates.set(data::Rates::opt::wat_frac,
+                                 data.water_rate[i]);
     }
 }
 

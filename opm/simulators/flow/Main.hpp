@@ -319,7 +319,7 @@ protected:
                            outputDir,
                            Parameters::Get<Parameters::OutputMode>(),
                            !Parameters::Get<Parameters::SchedRestart>(),
-                           Parameters::Get<Parameters::EnableLoggingFalloutWarning>(),
+                           detail::allRanksDebugLoggingEnabled(),
                            Parameters::Get<Parameters::ParsingStrictness>(),
                            Parameters::Get<Parameters::ActionParsingStrictness>(),
                            Parameters::Get<Parameters::InputSkipMode>(),
@@ -398,7 +398,7 @@ private:
 
     // If this process is a reservoir coupling slave, notify the master that
     // initialization failed so it does not hang waiting for the initial data exchange.
-    void notifyMasterSlaveInitFailed_();
+    void notifyMasterSlaveInitFailed_() const;
 
     /// Dispatch to actual simulation functions based on input deck's setup.
     ///
