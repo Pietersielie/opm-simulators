@@ -527,15 +527,6 @@ protected:
         if (isUpF){
             (*tr.mat)[J][I][Free][Free] += -fFlux.derivative(0);
             (*tr.mat)[I][I][Free][Free] += fFlux.derivative(0);
-            if constexpr (enableDiffusion) {
-                // Should this be the actual flux or the diffusivity derivative?
-                (*tr.mat)[J][I][Free][Free] -= diffusivity_.derivative(0);
-                (*tr.mat)[I][I][Free][Free] += diffusivity_.derivative(0);//Do we need this as well?
-                if constexpr (enableDispersion) {
-                    (*tr.mat)[J][I][Free][Free] -= dispersivity_.derivative(0);
-                    (*tr.mat)[I][I][Free][Free] += dispersivity_.derivative(0);
-                }
-            }
         }
         if (isUpS) {
             (*tr.mat)[J][I][Solution][Solution] += -sFlux.derivative(0);
